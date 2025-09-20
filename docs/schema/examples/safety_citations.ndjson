@@ -1,0 +1,6 @@
+{"schema":"gai.events.v1","type":"start","seq":0,"ts":"2025-01-01T00:00:00Z","stream_id":"s-3","provider":"gemini","model":"gemini-1.5-pro","capabilities":["text.delta","citations","safety"]}
+{"schema":"gai.events.v1","type":"text.delta","seq":1,"ts":"2025-01-01T00:00:00Z","stream_id":"s-3","text":"Photosynthesis converts light energy...","cursor":{"chars_emitted":31}}
+{"schema":"gai.events.v1","type":"citations","seq":2,"ts":"2025-01-01T00:00:01Z","stream_id":"s-3","citations":[{"uri":"https://doi.org/10.1038/nature","title":"Nature Review","snippet":"...","start":0,"end":31,"score":0.91}]}
+{"schema":"gai.events.v1","type":"safety","seq":3,"ts":"2025-01-01T00:00:01Z","stream_id":"s-3","safety":{"category":"other","action":"allow","score":0.02,"target":"output"}}
+{"schema":"gai.events.v1","type":"finish","seq":4,"ts":"2025-01-01T00:00:02Z","stream_id":"s-3","finish_reason":{"type":"stop"}}
+

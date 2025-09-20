@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gai.dev/schema/gai.events.v1.json",
+  "title": "gai Normalized Stream Events v1",
+  "description": "Normalized event schema for gai SSE/NDJSON streams. One JSON object per event line.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/event.start" },
+    { "$ref": "#/$defs/event.text_delta" },
+    { "$ref": "#/$defs/event.reasoning_delta" },
+    { "$ref": "#/$defs/event.reasoning_summary" },
+    { "$ref": "#/$defs/event.audio_delta" },
+    { "$ref": "#/$defs/event.tool_call" },
+    { "$ref": "#/$defs/event.tool_result" },
+    { "$ref": "#/$defs/event.citations" },
+    { "$ref": "#/$defs/event.safety" },
+    { "$ref": "#/$defs/event.step_start" },
+    { "$ref": "#/$defs/event.step_finish" },
+    { "$ref": "#/$defs/event.finish" },
+    { "$ref": "#/$defs/event.error" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "schema": { "const": "gai.events.v1" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "ts": { "type": "string", "format": "date-time" },
+        "stream_id": { "type": "string" },
+        "request_id": { "type": "string" },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "trace_id": { "type": "string" },
+        "span_id": { "type": "string" },
+        "prompt_id": { "$ref": "#/$defs/prompt_id" },
+        "ext": { "type": "object", "description": "Provider- or app-specific extensions (namespaced keys)." }
+      },
+      "required": ["type", "schema", "seq", "ts", "stream_id"],
+      "additionalProperties": true
+    },
+    "prompt_id": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "fingerprint": { "type": "string" }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    },
+    "stop_reason": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "stop",
+            "length",
+            "content_filter",
+            "tool_calls_exhausted",
+            "max_steps",
+            "aborted",
+            "error"
+          ]
+        },
+        "description": { "type": "string" },
+        "details": { "type": "object" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "reasoning_tokens": { "type": "integer", "minimum": 0 },
+        "total_tokens": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "citation": {
+      "type": "object",
+      "properties": {
+        "uri": { "type": "string" },
+        "title": { "type": "string" },
+        "snippet": { "type": "string" },
+        "start": { "type": "integer", "minimum": 0, "description": "Start char offset in the generated text." },
+        "end": { "type": "integer", "minimum": 0, "description": "End char offset in the generated text (exclusive)." },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "required": ["uri"],
+      "additionalProperties": false
+    },
+    "safety": {
+      "type": "object",
+      "properties": {
+        "category": { "type": "string", "enum": ["harassment", "hate", "sexual", "dangerous", "selfharm", "other"] },
+        "action": { "type": "string", "enum": ["allow", "block", "redact", "safe_completion"] },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "target": { "type": "string", "enum": ["input", "output"] },
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["category", "action"],
+      "additionalProperties": false
+    },
+    "tool_call": {
+      "type": "object",
+      "properties": {
+        "call_id": { "type": "string" },
+        "name": { "type": "string" },
+        "input": { "type": "object" },
+        "timeout_ms": { "type": "integer", "minimum": 0 },
+        "parallel_group": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["call_id", "name", "input"],
+      "additionalProperties": false
+    },
+    "tool_result": {
+      "type": "object",
+      "properties": {
+        "call_id": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "result": {},
+        "error": { "$ref": "#/$defs/error_object" },
+        "duration_ms": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["call_id"],
+      "additionalProperties": false
+    },
+    "error_object": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "rate_limited",
+            "content_filtered",
+            "bad_request",
+            "transient",
+            "provider_error",
+            "timeout",
+            "canceled",
+            "tool_error",
+            "internal"
+          ]
+        },
+        "message": { "type": "string" },
+        "status": { "type": "integer" },
+        "retryable": { "type": "boolean" },
+        "details": { "type": "object" }
+      },
+      "required": ["code", "message"],
+      "additionalProperties": false
+    },
+
+    "event.start": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "start" },
+            "capabilities": { "type": "array", "items": { "type": "string" } },
+            "policies": {
+              "type": "object",
+              "properties": {
+                "reasoning_visibility": { "type": "string", "enum": ["none", "summary", "raw"] }
+              },
+              "additionalProperties": true
+            }
+          },
+          "required": ["type"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.reasoning_delta": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "reasoning.delta" },
+            "text": { "type": "string" },
+            "partial": { "type": "boolean", "default": true },
+            "cursor": {
+              "type": "object",
+              "properties": { "tokens_emitted": { "type": "integer", "minimum": 0 } },
+              "required": ["tokens_emitted"],
+              "additionalProperties": false
+            },
+            "step_id": { "type": "integer", "minimum": 1 },
+            "visibility": { "type": "string", "enum": ["raw"], "default": "raw" },
+            "notice": { "type": "string", "description": "Compliance notice, if present, indicates the content is not for end users." }
+          },
+          "required": ["type", "text"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.reasoning_summary": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "reasoning.summary" },
+            "summary": { "type": "string" },
+            "steps": { "type": "array", "items": { "type": "string" } },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+            "tokens": { "type": "integer", "minimum": 0 },
+            "method": { "type": "string", "enum": ["model", "heuristic", "provider"] },
+            "step_id": { "type": "integer", "minimum": 1 },
+            "visibility": { "type": "string", "enum": ["summary"], "default": "summary" },
+            "signatures": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "provider": { "type": "string" },
+                  "type": { "type": "string" },
+                  "value": { "type": "string" }
+                },
+                "required": ["provider", "type", "value"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["type", "summary"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.text_delta": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "text.delta" },
+            "text": { "type": "string" },
+            "partial": { "type": "boolean", "default": true },
+            "cursor": {
+              "type": "object",
+              "properties": { "chars_emitted": { "type": "integer", "minimum": 0 } },
+              "required": ["chars_emitted"],
+              "additionalProperties": false
+            },
+            "step_id": { "type": "integer", "minimum": 1 },
+            "role": { "type": "string", "enum": ["assistant"] }
+          },
+          "required": ["type", "text"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.audio_delta": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "audio.delta" },
+            "audio_b64": { "type": "string", "contentEncoding": "base64" },
+            "format": { "type": "string" },
+            "partial": { "type": "boolean", "default": true },
+            "step_id": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["type", "audio_b64", "format"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.tool_call": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "tool.call" },
+            "tool_call": { "$ref": "#/$defs/tool_call" },
+            "step_id": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["type", "tool_call"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.tool_result": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "tool.result" },
+            "tool_result": { "$ref": "#/$defs/tool_result" },
+            "step_id": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["type", "tool_result"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.citations": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "citations" },
+            "citations": { "type": "array", "items": { "$ref": "#/$defs/citation" } },
+            "step_id": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["type", "citations"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.safety": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "safety" },
+            "safety": { "$ref": "#/$defs/safety" },
+            "step_id": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["type", "safety"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.step_start": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "step.start" },
+            "step_id": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["type", "step_id"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.step_finish": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "step.finish" },
+            "step_id": { "type": "integer", "minimum": 1 },
+            "duration_ms": { "type": "integer", "minimum": 0 },
+            "tool_calls": { "type": "integer", "minimum": 0 },
+            "text_len": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["type", "step_id"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.finish": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "finish" },
+            "finish_reason": { "$ref": "#/$defs/stop_reason" },
+            "usage": { "$ref": "#/$defs/usage" },
+            "final": { "type": "boolean", "const": true }
+          },
+          "required": ["type", "finish_reason"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event.error": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "error" },
+            "error": { "$ref": "#/$defs/error_object" },
+            "step_id": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["type", "error"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

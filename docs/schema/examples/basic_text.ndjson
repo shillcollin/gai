@@ -1,0 +1,5 @@
+{"schema":"gai.events.v1","type":"start","seq":0,"ts":"2025-01-01T00:00:00Z","stream_id":"s-1","provider":"openai","model":"gpt-4o-mini","capabilities":["text.delta"]}
+{"schema":"gai.events.v1","type":"text.delta","seq":1,"ts":"2025-01-01T00:00:00Z","stream_id":"s-1","text":"Hello ","cursor":{"chars_emitted":6}}
+{"schema":"gai.events.v1","type":"text.delta","seq":2,"ts":"2025-01-01T00:00:01Z","stream_id":"s-1","text":"world!","cursor":{"chars_emitted":12}}
+{"schema":"gai.events.v1","type":"finish","seq":3,"ts":"2025-01-01T00:00:02Z","stream_id":"s-1","finish_reason":{"type":"stop"},"usage":{"input_tokens":12,"output_tokens":6,"total_tokens":18}}
+

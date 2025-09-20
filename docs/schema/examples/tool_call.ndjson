@@ -1,0 +1,8 @@
+{"schema":"gai.events.v1","type":"start","seq":0,"ts":"2025-01-01T00:00:00Z","stream_id":"s-2","provider":"anthropic","model":"claude-sonnet-4","capabilities":["text.delta","tool.call","tool.result","step.start","step.finish"]}
+{"schema":"gai.events.v1","type":"step.start","seq":1,"ts":"2025-01-01T00:00:00Z","stream_id":"s-2","step_id":1}
+{"schema":"gai.events.v1","type":"tool.call","seq":2,"ts":"2025-01-01T00:00:00Z","stream_id":"s-2","step_id":1,"tool_call":{"call_id":"c-1","name":"get_weather","input":{"location":"SF"},"timeout_ms":10000,"parallel_group":0}}
+{"schema":"gai.events.v1","type":"tool.result","seq":3,"ts":"2025-01-01T00:00:01Z","stream_id":"s-2","step_id":1,"tool_result":{"call_id":"c-1","ok":true,"result":{"temp_f":71.3},"duration_ms":950}}
+{"schema":"gai.events.v1","type":"text.delta","seq":4,"ts":"2025-01-01T00:00:01Z","stream_id":"s-2","text":"It is 71°F and sunny in SF.","cursor":{"chars_emitted":30},"step_id":1}
+{"schema":"gai.events.v1","type":"step.finish","seq":5,"ts":"2025-01-01T00:00:02Z","stream_id":"s-2","step_id":1,"duration_ms":2000,"tool_calls":1,"text_len":30}
+{"schema":"gai.events.v1","type":"finish","seq":6,"ts":"2025-01-01T00:00:02Z","stream_id":"s-2","finish_reason":{"type":"stop"},"usage":{"input_tokens":60,"output_tokens":40,"total_tokens":100}}
+

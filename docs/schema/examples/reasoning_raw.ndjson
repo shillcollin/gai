@@ -1,0 +1,6 @@
+{"schema":"gai.events.v1","type":"start","seq":0,"ts":"2025-01-01T00:00:00Z","stream_id":"s-4","provider":"openai","model":"o4-mini","capabilities":["text.delta","reasoning.delta","reasoning.summary"],"policies":{"reasoning_visibility":"raw"}}
+{"schema":"gai.events.v1","type":"reasoning.delta","seq":1,"ts":"2025-01-01T00:00:00Z","stream_id":"s-4","text":"Plan: call get_weather; then format response.","cursor":{"tokens_emitted":9},"visibility":"raw"}
+{"schema":"gai.events.v1","type":"reasoning.summary","seq":2,"ts":"2025-01-01T00:00:01Z","stream_id":"s-4","summary":"Planned and verified with get_weather.","steps":["Plan","Call tool","Format"],"confidence":0.8,"tokens":20,"visibility":"summary","signatures":[{"provider":"gemini","type":"thought_signature","value":"sig-abc"}]}
+{"schema":"gai.events.v1","type":"text.delta","seq":3,"ts":"2025-01-01T00:00:01Z","stream_id":"s-4","text":"It is 71°F and sunny.","cursor":{"chars_emitted":24}}
+{"schema":"gai.events.v1","type":"finish","seq":4,"ts":"2025-01-01T00:00:02Z","stream_id":"s-4","finish_reason":{"type":"stop"},"usage":{"input_tokens":50,"output_tokens":30,"reasoning_tokens":20,"total_tokens":100}}
+
