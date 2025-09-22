@@ -8,23 +8,25 @@ import (
 )
 
 type chatCompletionRequest struct {
-	Model            string             `json:"model"`
-	Messages         []openAIMessage    `json:"messages"`
-	Temperature      float32            `json:"temperature,omitempty"`
-	MaxTokens        int                `json:"max_tokens,omitempty"`
-	TopP             float32            `json:"top_p,omitempty"`
-	TopK             int                `json:"top_k,omitempty"`
-	Stream           bool               `json:"stream,omitempty"`
-	Tools            []openAITool       `json:"tools,omitempty"`
-	ToolChoice       any                `json:"tool_choice,omitempty"`
-	PresencePenalty  float32            `json:"presence_penalty,omitempty"`
-	FrequencyPenalty float32            `json:"frequency_penalty,omitempty"`
-	LogitBias        map[string]float32 `json:"logit_bias,omitempty"`
-	User             string             `json:"user,omitempty"`
-	ResponseFormat   any                `json:"response_format,omitempty"`
-	Seed             *int               `json:"seed,omitempty"`
-	Stop             []string           `json:"stop,omitempty"`
-	SafetySettings   map[string]any     `json:"safety_settings,omitempty"`
+	Model               string             `json:"model"`
+	Messages            []openAIMessage    `json:"messages"`
+	Temperature         float32            `json:"temperature,omitempty"`
+	MaxTokens           int                `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                `json:"max_completion_tokens,omitempty"`
+	TopP                float32            `json:"top_p,omitempty"`
+	TopK                int                `json:"top_k,omitempty"`
+	Stream              bool               `json:"stream,omitempty"`
+	Tools               []openAITool       `json:"tools,omitempty"`
+	ToolChoice          any                `json:"tool_choice,omitempty"`
+	PresencePenalty     float32            `json:"presence_penalty,omitempty"`
+	FrequencyPenalty    float32            `json:"frequency_penalty,omitempty"`
+	LogitBias           map[string]float32 `json:"logit_bias,omitempty"`
+	User                string             `json:"user,omitempty"`
+	ResponseFormat      any                `json:"response_format,omitempty"`
+	Seed                *int               `json:"seed,omitempty"`
+	Stop                []string           `json:"stop,omitempty"`
+	SafetySettings      map[string]any     `json:"safety_settings,omitempty"`
+	ReasoningEffort     string             `json:"reasoning_effort,omitempty"`
 }
 
 type openAIMessage struct {

@@ -1,8 +1,14 @@
 package core
 
-import (
-	"errors"
-)
+import "errors"
+
+// Warning communicates non-fatal adjustments that occurred while processing a request
+// (for example, when a provider drops unsupported parameters).
+type Warning struct {
+	Code    string `json:"code"`
+	Field   string `json:"field,omitempty"`
+	Message string `json:"message"`
+}
 
 // Usage captures token accounting and costs returned by providers.
 type Usage struct {
@@ -22,6 +28,20 @@ type StopReason struct {
 	Description string         `json:"description,omitempty"`
 	Details     map[string]any `json:"details,omitempty"`
 }
+
+// Canonical stop reason types shared across runner and providers.
+const (
+	StopReasonUnknown        = "unknown"
+	StopReasonComplete       = "complete"
+	StopReasonMaxSteps       = "max_steps"
+	StopReasonNoMoreTools    = "no_more_tools"
+	StopReasonToolSeen       = "tool_seen"
+	StopReasonTextLength     = "text_length"
+	StopReasonKeywordFound   = "keyword_found"
+	StopReasonAllConditions  = "all_conditions_met"
+	StopReasonToolError      = "tool_error"
+	StopReasonProviderFinish = "provider_finish"
+)
 
 // Citation points to a supporting source reference.
 type Citation struct {
@@ -45,14 +65,16 @@ type TextResult struct {
 	FinishReason StopReason    `json:"finish_reason"`
 	LatencyMS    int64         `json:"latency_ms,omitempty"`
 	TTFBMS       int64         `json:"ttfb_ms,omitempty"`
+	Warnings     []Warning     `json:"warnings,omitempty"`
 }
 
 // ObjectResultRaw contains structured JSON output as raw bytes.
 type ObjectResultRaw struct {
-	JSON     []byte `json:"json"`
-	Model    string `json:"model"`
-	Provider string `json:"provider"`
-	Usage    Usage  `json:"usage"`
+	JSON     []byte    `json:"json"`
+	Model    string    `json:"model"`
+	Provider string    `json:"provider"`
+	Usage    Usage     `json:"usage"`
+	Warnings []Warning `json:"warnings,omitempty"`
 }
 
 // ObjectResult provides a typed representation of structured output.
@@ -62,6 +84,7 @@ type ObjectResult[T any] struct {
 	Model    string
 	Provider string
 	Usage    Usage
+	Warnings []Warning
 }
 
 // ObjectStreamRaw wraps streaming structured JSON events.
@@ -133,6 +156,9 @@ func (s *ObjectStream[T]) Final() (*ObjectResult[T], error) {
 		Model:    s.stream.meta.Model,
 		Provider: s.stream.meta.Provider,
 		Usage:    s.stream.meta.Usage,
+	}
+	if warnings := s.stream.Warnings(); len(warnings) > 0 {
+		res.Warnings = warnings
 	}
 	return res, nil
 }

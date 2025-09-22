@@ -14,13 +14,23 @@ import (
 
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/internal/httpclient"
+	"github.com/shillcollin/gai/obs"
 	"github.com/shillcollin/gai/schema"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Client implements the core.Provider interface for OpenAI's chat completions API.
 type Client struct {
 	httpClient *http.Client
 	opts       options
+}
+
+func warnDroppedParam(field, model, reason string) core.Warning {
+	return core.Warning{
+		Code:    "param_dropped",
+		Field:   field,
+		Message: fmt.Sprintf("%s ignored for model %s (%s)", field, model, reason),
+	}
 }
 
 // New constructs a new OpenAI client.
@@ -38,11 +48,24 @@ func New(opts ...Option) *Client {
 	}
 }
 
-func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.TextResult, error) {
-	payload, err := c.buildChatPayload(req, false)
+func (c *Client) GenerateText(ctx context.Context, req core.Request) (_ *core.TextResult, err error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai.GenerateText",
+		attribute.String("ai.provider", "openai"),
+		attribute.String("ai.operation", "chat.completions"),
+	)
+	var usageTokens obs.UsageTokens
+	defer func() {
+		if recorder != nil {
+			recorder.End(err, usageTokens)
+		}
+	}()
+
+	payload, warnings, err := c.buildChatPayload(req, false)
 	if err != nil {
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
+
 	body, err := c.doRequest(ctx, "POST", "/chat/completions", payload)
 	if err != nil {
 		return nil, err
@@ -59,41 +82,74 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.Text
 	choice := resp.Choices[0]
 	text := choice.Message.JoinText()
 	usage := resp.Usage.toCore()
+	usageTokens = obs.UsageFromCore(usage)
 	finish := core.StopReason{Type: choice.FinishReason}
 
-	return &core.TextResult{
+	result := &core.TextResult{
 		Text:         text,
 		Model:        resp.Model,
 		Provider:     "openai",
 		Usage:        usage,
 		FinishReason: finish,
-	}, nil
+	}
+	if len(warnings) > 0 {
+		result.Warnings = append(result.Warnings, warnings...)
+	}
+	return result, nil
 }
 
 func (c *Client) StreamText(ctx context.Context, req core.Request) (*core.Stream, error) {
-	payload, err := c.buildChatPayload(req, true)
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai.StreamText",
+		attribute.String("ai.provider", "openai"),
+		attribute.String("ai.operation", "chat.completions.stream"),
+	)
+	payload, warnings, err := c.buildChatPayload(req, true)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
+
 	body, err := c.doRequest(ctx, "POST", "/chat/completions", payload)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
 
 	stream := core.NewStream(ctx, 64)
-	go c.consumeStream(ctx, body, stream)
+	if len(warnings) > 0 {
+		stream.AddWarnings(warnings...)
+	}
+	go func() {
+		c.consumeStream(ctx, body, stream)
+		meta := stream.Meta()
+		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+	}()
 	return stream, nil
 }
 
-func (c *Client) GenerateObject(ctx context.Context, req core.Request) (*core.ObjectResultRaw, error) {
+func (c *Client) GenerateObject(ctx context.Context, req core.Request) (_ *core.ObjectResultRaw, err error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai.GenerateObject",
+		attribute.String("ai.provider", "openai"),
+		attribute.String("ai.operation", "chat.completions.json"),
+	)
+	var usageTokens obs.UsageTokens
+	defer func() {
+		if recorder != nil {
+			recorder.End(err, usageTokens)
+		}
+	}()
+
 	if req.ProviderOptions == nil {
 		req.ProviderOptions = map[string]any{}
 	}
 	req.ProviderOptions["response_format"] = map[string]any{"type": "json_object"}
-	payload, err := c.buildChatPayload(req, false)
+	payload, warnings, err := c.buildChatPayload(req, false)
 	if err != nil {
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
+
 	body, err := c.doRequest(ctx, "POST", "/chat/completions", payload)
 	if err != nil {
 		return nil, err
@@ -108,19 +164,31 @@ func (c *Client) GenerateObject(ctx context.Context, req core.Request) (*core.Ob
 		return nil, errors.New("openai: empty choices")
 	}
 	content := resp.Choices[0].Message.JoinText()
-	return &core.ObjectResultRaw{
+	usageTokens = obs.UsageFromCore(resp.Usage.toCore())
+	result := &core.ObjectResultRaw{
 		JSON:     []byte(content),
 		Model:    resp.Model,
 		Provider: "openai",
 		Usage:    resp.Usage.toCore(),
-	}, nil
+	}
+	if len(warnings) > 0 {
+		result.Warnings = append(result.Warnings, warnings...)
+	}
+	return result, nil
 }
 
 func (c *Client) StreamObject(ctx context.Context, req core.Request) (*core.ObjectStreamRaw, error) {
-	payload, err := c.buildChatPayload(req, true)
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai.StreamObject",
+		attribute.String("ai.provider", "openai"),
+		attribute.String("ai.operation", "chat.completions.json.stream"),
+	)
+	payload, warnings, err := c.buildChatPayload(req, true)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
+
 	if req.ProviderOptions == nil {
 		req.ProviderOptions = map[string]any{}
 	}
@@ -128,10 +196,18 @@ func (c *Client) StreamObject(ctx context.Context, req core.Request) (*core.Obje
 
 	body, err := c.doRequest(ctx, "POST", "/chat/completions", payload)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
 	stream := core.NewStream(ctx, 64)
-	go c.consumeStream(ctx, body, stream)
+	if len(warnings) > 0 {
+		stream.AddWarnings(warnings...)
+	}
+	go func() {
+		c.consumeStream(ctx, body, stream)
+		meta := stream.Meta()
+		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+	}()
 	return core.NewObjectStreamRaw(stream), nil
 }
 
@@ -144,39 +220,70 @@ func (c *Client) Capabilities() core.Capabilities {
 	}
 }
 
-func (c *Client) buildChatPayload(req core.Request, stream bool) (*chatCompletionRequest, error) {
+func (c *Client) buildChatPayload(req core.Request, stream bool) (*chatCompletionRequest, []core.Warning, error) {
 	messages, err := convertMessages(req.Messages)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tools, err := convertTools(req.Tools)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	model := chooseModel(req.Model, c.opts.model)
+	profile := profileForModel(model)
 	payload := &chatCompletionRequest{
-		Model:       chooseModel(req.Model, c.opts.model),
-		Messages:    messages,
-		Temperature: req.Temperature,
-		MaxTokens:   req.MaxTokens,
-		TopP:        req.TopP,
-		Stream:      stream,
+		Model:    model,
+		Messages: messages,
+		Stream:   stream,
+	}
+	warnings := make([]core.Warning, 0, 2)
+
+	if req.MaxTokens > 0 {
+		if profile.UseMaxCompletionTokens {
+			payload.MaxCompletionTokens = req.MaxTokens
+		} else {
+			payload.MaxTokens = req.MaxTokens
+		}
+	}
+	if req.Temperature != 0 {
+		if profile.AllowTemperature {
+			payload.Temperature = req.Temperature
+		} else {
+			warnings = append(warnings, warnDroppedParam("temperature", model, "temperature is managed automatically"))
+		}
+	}
+	if req.TopP != 0 {
+		if profile.AllowTopP {
+			payload.TopP = req.TopP
+		} else {
+			warnings = append(warnings, warnDroppedParam("top_p", model, "top_p is not supported"))
+		}
+	}
+	if req.TopK > 0 {
+		if profile.AllowTopK {
+			payload.TopK = req.TopK
+		} else {
+			warnings = append(warnings, warnDroppedParam("top_k", model, "top_k is not supported"))
+		}
 	}
 
 	if len(tools) > 0 {
 		payload.Tools = tools
 		payload.ToolChoice = convertToolChoice(req.ToolChoice)
 	}
-	if req.TopK > 0 {
-		payload.TopK = req.TopK
-	}
 	if req.Safety != nil {
 		payload.SafetySettings = convertSafety(req.Safety)
 	}
-	if err := applyProviderOptions(payload, req.ProviderOptions); err != nil {
-		return nil, err
+	optionWarnings, err := applyProviderOptions(payload, req.ProviderOptions, profile)
+	if err != nil {
+		return nil, nil, err
 	}
-	return payload, nil
+	if len(optionWarnings) > 0 {
+		warnings = append(warnings, optionWarnings...)
+	}
+
+	return payload, warnings, nil
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, payload any) (io.ReadCloser, error) {
@@ -217,6 +324,12 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
 	seq := 0
+	type toolAccumulator struct {
+		buf  *strings.Builder
+		id   string
+		name string
+	}
+	toolAcc := make(map[int]*toolAccumulator)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -224,6 +337,32 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			for idx, acc := range toolAcc {
+				if acc == nil || acc.buf == nil {
+					continue
+				}
+				args, err := parseArguments(acc.buf.String())
+				if err != nil || acc.name == "" {
+					continue
+				}
+				id := acc.id
+				if id == "" {
+					id = fmt.Sprintf("index_%d", idx)
+				}
+				stream.Push(core.StreamEvent{
+					Type: core.EventToolCall,
+					ToolCall: core.ToolCall{
+						ID:    id,
+						Name:  acc.name,
+						Input: args,
+					},
+					Timestamp: time.Now(),
+					Schema:    "gai.events.v1",
+					Seq:       seq,
+					StreamID:  "stream",
+					Provider:  "openai",
+				})
+			}
 			stream.Push(core.StreamEvent{Type: core.EventFinish, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq, StreamID: "stream"})
 			return
 		}
@@ -241,15 +380,39 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 			stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq, StreamID: delta.ID, Model: delta.Model, Provider: "openai"})
 		}
 		if len(choice.Delta.ToolCalls) > 0 {
-			for _, call := range choice.Delta.ToolCalls {
-				args, err := parseArguments(call.Function.Arguments)
-				if err != nil {
-					stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq, StreamID: delta.ID})
+			for i, call := range choice.Delta.ToolCalls {
+				acc, ok := toolAcc[i]
+				if !ok {
+					acc = &toolAccumulator{buf: &strings.Builder{}}
+					toolAcc[i] = acc
+				}
+				if call.ID != "" {
+					acc.id = call.ID
+				}
+				if call.Function.Name != "" {
+					acc.name = call.Function.Name
+				}
+				if call.Function.Arguments != "" {
+					acc.buf.WriteString(call.Function.Arguments)
+				}
+
+				args, err := parseArguments(acc.buf.String())
+				if err != nil || acc.name == "" {
 					continue
 				}
+
+				id := acc.id
+				if id == "" {
+					id = fmt.Sprintf("index_%d", i)
+				}
+
 				stream.Push(core.StreamEvent{
-					Type:      core.EventToolCall,
-					ToolCall:  core.ToolCall{ID: call.ID, Name: call.Function.Name, Input: args},
+					Type: core.EventToolCall,
+					ToolCall: core.ToolCall{
+						ID:    id,
+						Name:  acc.name,
+						Input: args,
+					},
 					Timestamp: time.Now(),
 					Schema:    "gai.events.v1",
 					Seq:       seq,
@@ -257,6 +420,8 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 					Model:     delta.Model,
 					Provider:  "openai",
 				})
+
+				delete(toolAcc, i)
 			}
 		}
 		if choice.FinishReason != "" {
@@ -422,36 +587,49 @@ func roleString(role core.Role) string {
 	}
 }
 
-func applyProviderOptions(payload *chatCompletionRequest, opts map[string]any) error {
+func applyProviderOptions(payload *chatCompletionRequest, opts map[string]any, profile modelProfile) ([]core.Warning, error) {
 	if payload == nil || len(opts) == 0 {
-		return nil
+		return nil, nil
 	}
+	warnings := make([]core.Warning, 0)
 	for key, value := range opts {
 		switch key {
 		case "response_format", "openai.response_format":
 			payload.ResponseFormat = value
 		case "presence_penalty", "openai.presence_penalty":
+			if !profile.AllowPenalties {
+				warnings = append(warnings, warnDroppedParam("presence_penalty", payload.Model, "not supported by this model"))
+				continue
+			}
 			if f, err := toFloat32(value); err == nil {
 				payload.PresencePenalty = f
 			} else {
-				return fmt.Errorf("presence_penalty: %w", err)
+				return nil, fmt.Errorf("presence_penalty: %w", err)
 			}
 		case "frequency_penalty", "openai.frequency_penalty":
+			if !profile.AllowPenalties {
+				warnings = append(warnings, warnDroppedParam("frequency_penalty", payload.Model, "not supported by this model"))
+				continue
+			}
 			if f, err := toFloat32(value); err == nil {
 				payload.FrequencyPenalty = f
 			} else {
-				return fmt.Errorf("frequency_penalty: %w", err)
+				return nil, fmt.Errorf("frequency_penalty: %w", err)
 			}
 		case "logit_bias", "openai.logit_bias":
+			if !profile.AllowLogitBias {
+				warnings = append(warnings, warnDroppedParam("logit_bias", payload.Model, "not supported by this model"))
+				continue
+			}
 			bias, ok := value.(map[string]any)
 			if !ok {
-				return fmt.Errorf("logit_bias must be object")
+				return nil, fmt.Errorf("logit_bias must be object")
 			}
 			payload.LogitBias = map[string]float32{}
 			for token, raw := range bias {
 				f, err := toFloat32(raw)
 				if err != nil {
-					return fmt.Errorf("logit_bias[%s]: %w", token, err)
+					return nil, fmt.Errorf("logit_bias[%s]: %w", token, err)
 				}
 				payload.LogitBias[token] = f
 			}
@@ -459,25 +637,59 @@ func applyProviderOptions(payload *chatCompletionRequest, opts map[string]any) e
 			if s, ok := value.(string); ok {
 				payload.User = s
 			} else {
-				return fmt.Errorf("user must be string")
+				return nil, fmt.Errorf("user must be string")
 			}
 		case "seed", "openai.seed":
+			if !profile.AllowSeed {
+				warnings = append(warnings, warnDroppedParam("seed", payload.Model, "not supported by this model"))
+				continue
+			}
 			if i, err := toInt(value); err == nil {
 				payload.Seed = &i
 			} else {
-				return fmt.Errorf("seed: %w", err)
+				return nil, fmt.Errorf("seed: %w", err)
 			}
 		case "stop", "openai.stop":
 			stops, err := toStringSlice(value)
 			if err != nil {
-				return fmt.Errorf("stop: %w", err)
+				return nil, fmt.Errorf("stop: %w", err)
 			}
 			payload.Stop = stops
+		case "reasoning_effort", "openai.reasoning_effort":
+			effort := strings.ToLower(fmt.Sprint(value))
+			if profile.AllowedReasoningEffort == nil {
+				warnings = append(warnings, warnDroppedParam("reasoning_effort", payload.Model, "not supported by this model"))
+				continue
+			}
+			if _, ok := profile.AllowedReasoningEffort[effort]; !ok {
+				return nil, fmt.Errorf("reasoning_effort %q not supported by model %s", effort, payload.Model)
+			}
+			payload.ReasoningEffort = effort
+		case "max_completion_tokens", "openai.max_completion_tokens":
+			val, err := toInt(value)
+			if err != nil {
+				return nil, fmt.Errorf("max_completion_tokens: %w", err)
+			}
+			if profile.UseMaxCompletionTokens {
+				payload.MaxCompletionTokens = val
+			} else {
+				payload.MaxTokens = val
+			}
+		case "max_output_tokens", "openai.max_output_tokens":
+			val, err := toInt(value)
+			if err != nil {
+				return nil, fmt.Errorf("max_output_tokens: %w", err)
+			}
+			if profile.UseMaxCompletionTokens {
+				payload.MaxCompletionTokens = val
+			} else {
+				payload.MaxTokens = val
+			}
 		default:
 			// ignore unknown options for forward compatibility
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
 func toFloat32(value any) (float32, error) {

@@ -68,6 +68,7 @@ type StreamMeta struct {
 	Model    string
 	Provider string
 	Usage    Usage
+	Warnings []Warning
 }
 
 // Stream represents a streaming response from a provider.
@@ -80,6 +81,7 @@ type Stream struct {
 	err    error
 	closed bool
 	meta   StreamMeta
+	warns  []Warning
 }
 
 // NewStream constructs a Stream with the provided event buffer size.
@@ -149,7 +151,11 @@ func (s *Stream) Err() error {
 func (s *Stream) Meta() StreamMeta {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.meta
+	meta := s.meta
+	if len(s.warns) > 0 {
+		meta.Warnings = append([]Warning(nil), s.warns...)
+	}
+	return meta
 }
 
 // Wait blocks until the stream is closed and returns the terminal error.
@@ -182,6 +188,28 @@ func (s *Stream) SetMeta(meta StreamMeta) {
 	s.mu.Lock()
 	s.meta = meta
 	s.mu.Unlock()
+}
+
+// AddWarnings appends warnings associated with the stream lifecycle.
+func (s *Stream) AddWarnings(warnings ...Warning) {
+	if len(warnings) == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.warns = append(s.warns, warnings...)
+	s.mu.Unlock()
+}
+
+// Warnings returns a copy of the accumulated warnings.
+func (s *Stream) Warnings() []Warning {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.warns) == 0 {
+		return nil
+	}
+	copyWarnings := make([]Warning, len(s.warns))
+	copy(copyWarnings, s.warns)
+	return copyWarnings
 }
 
 // ExtValue fetches a convenience value from ext map if present.

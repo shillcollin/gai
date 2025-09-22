@@ -180,13 +180,18 @@ fmt.Printf("Report: %+v\n", obj.Value)
 ### 📊 Built-in Observability
 OpenTelemetry integration with zero configuration:
 ```go
-shutdown, _ := obs.Init(obs.Options{
-    Provider:    "stdout", // or "otlp", "braintrust"
-    ServiceName: "my-app",
-})
-defer shutdown()
+ctx := context.Background()
+opts := obs.DefaultOptions()
+opts.ServiceName = "my-app"
+opts.Exporter = obs.ExporterStdout
+if apiKey := os.Getenv("BRAINTRUST_API_KEY"); apiKey != "" {
+    opts.Braintrust = obs.BraintrustOptions{Enabled: true, APIKey: apiKey}
+}
 
-// All provider calls, tool executions, and streams are automatically traced
+shutdown, _ := obs.Init(ctx, opts)
+defer shutdown(ctx)
+
+// All provider calls, runner steps, and tool executions emit spans & metrics
 ```
 
 ## Documentation Standards

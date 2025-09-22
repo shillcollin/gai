@@ -2,22 +2,64 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/shillcollin/gai/core"
+	"github.com/shillcollin/gai/obs"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var (
+	jitterMu   sync.Mutex
+	jitterRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 // Runner orchestrates multi-step tool execution using a provider.
 type Runner struct {
-	provider    core.Provider
-	maxParallel int
-	toolTimeout time.Duration
-	errorMode   ToolErrorMode
-	retry       ToolRetry
+	provider     core.Provider
+	maxParallel  int
+	toolTimeout  time.Duration
+	errorMode    ToolErrorMode
+	retry        ToolRetry
+	memo         ToolMemo
+	interceptors []Interceptor
 }
+
+// ToolMemo provides caching for tool results.
+type ToolMemo interface {
+	Get(name string, inputHash string) (any, bool)
+	Set(name string, inputHash string, result any)
+}
+
+// Interceptor hooks into runner lifecycle events.
+type Interceptor interface {
+	BeforeStep(ctx context.Context, req core.Request, state *core.RunnerState, stepNumber int) context.Context
+	AfterStep(ctx context.Context, step core.Step, state *core.RunnerState)
+	BeforeTool(ctx context.Context, call core.ToolCall, meta *core.ToolMeta) context.Context
+	AfterTool(ctx context.Context, exec *core.ToolExecution, meta *core.ToolMeta)
+}
+
+type noopInterceptor struct{}
+
+func (noopInterceptor) BeforeStep(ctx context.Context, _ core.Request, _ *core.RunnerState, _ int) context.Context {
+	return ctx
+}
+func (noopInterceptor) AfterStep(context.Context, core.Step, *core.RunnerState) {}
+func (noopInterceptor) BeforeTool(ctx context.Context, _ core.ToolCall, _ *core.ToolMeta) context.Context {
+	return ctx
+}
+func (noopInterceptor) AfterTool(context.Context, *core.ToolExecution, *core.ToolMeta) {}
 
 // RunnerOption configures the runner.
 type RunnerOption func(*Runner)
@@ -57,6 +99,8 @@ func WithOnToolError(mode ToolErrorMode) RunnerOption {
 type ToolRetry struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
+	Jitter      bool
+	MaxDelay    time.Duration
 }
 
 // WithToolRetry sets retry options.
@@ -64,60 +108,136 @@ func WithToolRetry(retry ToolRetry) RunnerOption {
 	return func(r *Runner) { r.retry = retry }
 }
 
+// WithMemo wires a memoization cache for tool executions.
+func WithMemo(m ToolMemo) RunnerOption {
+	return func(r *Runner) { r.memo = m }
+}
+
+// WithInterceptor registers an interceptor for lifecycle hooks.
+func WithInterceptor(i Interceptor) RunnerOption {
+	return func(r *Runner) {
+		if i != nil {
+			r.interceptors = append(r.interceptors, i)
+		}
+	}
+}
+
 // New creates a new runner.
 func New(provider core.Provider, opts ...RunnerOption) *Runner {
 	r := &Runner{
 		provider:    provider,
-		maxParallel: 1,
+		maxParallel: 5,
 		toolTimeout: 30 * time.Second,
 		errorMode:   ToolErrorPropagate,
-		retry:       ToolRetry{MaxAttempts: 1, BaseDelay: 250 * time.Millisecond},
+		retry: ToolRetry{
+			MaxAttempts: 1,
+			BaseDelay:   250 * time.Millisecond,
+		},
 	}
 	for _, opt := range opts {
 		opt(r)
+	}
+	if len(r.interceptors) == 0 {
+		r.interceptors = []Interceptor{noopInterceptor{}}
 	}
 	return r
 }
 
 // ExecuteRequest runs the request to completion, handling tool calls until stop conditions are met.
-func (r *Runner) ExecuteRequest(ctx context.Context, req core.Request) (*core.TextResult, error) {
+func (r *Runner) ExecuteRequest(ctx context.Context, req core.Request) (resp *core.TextResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	providerName := r.provider.Capabilities().Provider
+	ctx, recorder := obs.StartRequest(ctx, "runner.ExecuteRequest",
+		attribute.String("ai.provider", providerName),
+		attribute.String("ai.runner", "gai"),
+	)
+	defer func() {
+		usage := obs.UsageTokens{}
+		if resp != nil {
+			usage = obs.UsageFromCore(resp.Usage)
+		}
+		recorder.End(err, usage)
+	}()
+
+	stopWhen := req.StopWhen
+	if stopWhen == nil {
+		stopWhen = core.NoMoreTools()
+	}
+
 	state := &core.RunnerState{
 		Messages: append([]core.Message(nil), req.Messages...),
 		Steps:    []core.Step{},
+		Usage:    core.Usage{},
 	}
 
 	for {
-		if req.StopWhen != nil {
-			stop, reason := req.StopWhen(state)
-			if stop {
-				state.StopReason = reason
-				break
-			}
-		}
-		step, err := r.executeStep(ctx, req, state)
-		if err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
 			return nil, err
 		}
+
+		if stop, reason := stopWhen(state); stop {
+			if reason.Type == "" {
+				reason.Type = core.StopReasonComplete
+			}
+			state.StopReason = reason
+			break
+		}
+
+		step, stepErr := r.executeStep(ctx, req, state)
+		if stepErr != nil {
+			err = stepErr
+			return nil, err
+		}
+
 		state.Steps = append(state.Steps, step)
-		state.LastStep = &step
+		state.LastStep = &state.Steps[len(state.Steps)-1]
+		state.Usage = addUsage(state.Usage, step.Usage)
+
 		if len(step.ToolCalls) == 0 {
-			state.StopReason = core.StopReason{Type: "no_more_tools"}
+			if state.StopReason.Type == "" {
+				state.StopReason = core.StopReason{Type: core.StopReasonNoMoreTools}
+			}
 			break
 		}
 	}
 
-	return &core.TextResult{
+	if state.StopReason.Type == "" {
+		state.StopReason = core.StopReason{Type: core.StopReasonComplete}
+	}
+
+	if req.OnStop != nil {
+		return r.runFinalizer(ctx, req.OnStop, state)
+	}
+
+	resp = &core.TextResult{
 		Text:         state.LastText(),
-		Steps:        state.Steps,
+		Steps:        append([]core.Step(nil), state.Steps...),
 		Usage:        state.Usage,
 		FinishReason: state.StopReason,
-		Provider:     r.provider.Capabilities().Provider,
-	}, nil
+		Provider:     providerName,
+	}
+	return resp, nil
 }
 
 func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.RunnerState) (core.Step, error) {
 	stepNum := len(state.Steps) + 1
-	stream, err := r.provider.StreamText(ctx, core.Request{
+	stepCtx := ctx
+	for _, ic := range r.interceptors {
+		stepCtx = ic.BeforeStep(stepCtx, req, state, stepNum)
+	}
+	spanCtx, span := obs.Tracer().Start(stepCtx, "runner.Step",
+		trace.WithAttributes(
+			attribute.Int("ai.runner.step", stepNum),
+			attribute.String("ai.provider", r.provider.Capabilities().Provider),
+		),
+	)
+
+	stepStart := time.Now()
+	stream, err := r.provider.StreamText(spanCtx, core.Request{
 		Model:           req.Model,
 		Messages:        append([]core.Message(nil), state.Messages...),
 		Temperature:     req.Temperature,
@@ -130,150 +250,309 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 		Metadata:        req.Metadata,
 	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
 		return core.Step{}, err
 	}
 	defer stream.Close()
 
 	builder := &strings.Builder{}
-	var toolCalls []core.ToolExecution
+	toolCalls := make([]core.ToolCall, 0)
 	usage := core.Usage{}
+	var finishReason *core.StopReason
 
 	for event := range stream.Events() {
 		switch event.Type {
 		case core.EventTextDelta:
 			builder.WriteString(event.TextDelta)
 		case core.EventToolCall:
-			exec := core.ToolExecution{Call: event.ToolCall}
-			toolCalls = append(toolCalls, exec)
+			toolCalls = append(toolCalls, event.ToolCall)
 		case core.EventFinish:
-			if event.FinishReason != nil {
-				state.StopReason = *event.FinishReason
-			}
 			usage = event.Usage
+			if event.FinishReason != nil {
+				finishReason = event.FinishReason
+			}
 		case core.EventError:
 			if event.Error != nil {
+				stream.Fail(event.Error)
 				return core.Step{}, event.Error
 			}
 		}
 	}
-	if err := stream.Err(); err != nil {
+	if err := stream.Err(); err != nil && !errors.Is(err, core.ErrStreamClosed) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
 		return core.Step{}, err
 	}
 
+	assistantText := builder.String()
+	state.Messages = append(state.Messages, core.Message{Role: core.Assistant, Parts: []core.Part{core.Text{Text: assistantText}}})
+
+	executions := make([]core.ToolExecution, 0, len(toolCalls))
+	if len(toolCalls) > 0 {
+		execs, err := r.invokeTools(stepCtx, toolCalls, req.Tools, stepNum)
+		if err != nil && r.errorMode == ToolErrorPropagate {
+			return core.Step{}, err
+		}
+		executions = execs
+		state.Messages = append(state.Messages, buildToolResultMessages(executions)...)
+	}
+
+	if finishReason != nil && finishReason.Type != "" {
+		state.StopReason = *finishReason
+	}
+
+	finishedAt := time.Now()
 	step := core.Step{
-		Number:     stepNum,
-		Text:       builder.String(),
-		ToolCalls:  []core.ToolExecution{},
-		Usage:      usage,
-		DurationMS: 0,
+		Number:      stepNum,
+		Text:        assistantText,
+		ToolCalls:   executions,
+		Usage:       usage,
+		DurationMS:  finishedAt.Sub(stepStart).Milliseconds(),
+		StartedAt:   stepStart.UnixMilli(),
+		CompletedAt: finishedAt.UnixMilli(),
+	}
+	span.SetAttributes(
+		attribute.Int64("ai.tokens.input", int64(usage.InputTokens)),
+		attribute.Int64("ai.tokens.output", int64(usage.OutputTokens)),
+		attribute.Int("ai.tools.invoked", len(executions)),
+	)
+	span.End()
+
+	for _, ic := range r.interceptors {
+		ic.AfterStep(stepCtx, step, state)
 	}
 
-	state.Messages = append(state.Messages, core.Message{Role: core.Assistant, Parts: []core.Part{core.Text{Text: step.Text}}})
-
-	if len(toolCalls) == 0 {
-		state.Usage.InputTokens += usage.InputTokens
-		state.Usage.OutputTokens += usage.OutputTokens
-		state.Usage.TotalTokens += usage.TotalTokens
-		return step, nil
-	}
-
-	executions, err := r.invokeTools(ctx, toolCalls, req.Tools, stepNum)
-	if err != nil && r.errorMode == ToolErrorPropagate {
-		return core.Step{}, err
-	}
-	step.ToolCalls = executions
-	state.Messages = append(state.Messages, buildToolResultMessages(executions)...)
-	state.Usage.InputTokens += usage.InputTokens
-	state.Usage.OutputTokens += usage.OutputTokens
-	state.Usage.TotalTokens += usage.TotalTokens
 	return step, nil
 }
 
-func (r *Runner) invokeTools(ctx context.Context, calls []core.ToolExecution, tools []core.ToolHandle, stepID int) ([]core.ToolExecution, error) {
-	toolIndex := map[string]core.ToolHandle{}
+func (r *Runner) invokeTools(ctx context.Context, calls []core.ToolCall, tools []core.ToolHandle, stepID int) ([]core.ToolExecution, error) {
+	index := make(map[string]core.ToolHandle, len(tools))
 	for _, tool := range tools {
 		if tool == nil {
 			continue
 		}
-		toolIndex[tool.Name()] = tool
+		index[tool.Name()] = tool
 	}
+
 	results := make([]core.ToolExecution, len(calls))
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(calls))
-	sem := make(chan struct{}, r.maxParallel)
+	sem := make(chan struct{}, max(1, r.maxParallel))
 
 	for i, call := range calls {
-		handle, ok := toolIndex[call.Call.Name]
+		handle, ok := index[call.Name]
 		if !ok {
-			errCh <- fmt.Errorf("tool %s not registered", call.Call.Name)
-			continue
-		}
-		results[i] = call
-		wg.Add(1)
-		go func(idx int, handle core.ToolHandle, call core.ToolExecution) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			execResult, err := r.executeTool(ctx, handle, call.Call, stepID)
-			results[idx] = execResult
-			if err != nil {
+			err := fmt.Errorf("tool %s not registered", call.Name)
+			results[i] = core.ToolExecution{Call: call, Error: err}
+			if r.errorMode == ToolErrorPropagate {
 				errCh <- err
 			}
-		}(i, handle, call)
+			continue
+		}
+
+		wg.Add(1)
+		go func(idx int, c core.ToolCall, h core.ToolHandle) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] = core.ToolExecution{Call: c, Error: ctx.Err()}
+				if r.errorMode == ToolErrorPropagate {
+					errCh <- ctx.Err()
+				}
+				return
+			}
+			defer func() { <-sem }()
+
+			meta := &core.ToolMeta{CallID: c.ID, StepID: stepID, Metadata: map[string]any{}}
+			execCtx := ctx
+			for _, ic := range r.interceptors {
+				execCtx = ic.BeforeTool(execCtx, c, meta)
+			}
+
+			exec, err := r.executeTool(execCtx, h, c, meta)
+			if err != nil && r.errorMode == ToolErrorPropagate {
+				errCh <- err
+			}
+
+			for _, ic := range r.interceptors {
+				ic.AfterTool(execCtx, &exec, meta)
+			}
+
+			results[idx] = exec
+		}(i, call, handle)
 	}
 
 	wg.Wait()
 	close(errCh)
 
-	var err error
+	var aggErr error
 	for e := range errCh {
 		if e != nil {
-			err = e
-			if r.errorMode == ToolErrorPropagate {
-				break
-			}
-		}
-	}
-	return results, err
-}
-
-func (r *Runner) executeTool(ctx context.Context, handle core.ToolHandle, call core.ToolCall, stepID int) (core.ToolExecution, error) {
-	attempts := 0
-	var lastErr error
-	for attempts < max(1, r.retry.MaxAttempts) {
-		attempts++
-		ctxExec, cancel := context.WithTimeout(ctx, r.toolTimeout)
-		meta := core.ToolMeta{CallID: call.ID, StepID: stepID}
-		result, err := handle.Execute(ctxExec, call.Input, meta)
-		cancel()
-		if err == nil {
-			return core.ToolExecution{Call: call, Result: result, Retries: attempts - 1}, nil
-		}
-		lastErr = err
-		if attempts >= r.retry.MaxAttempts {
+			aggErr = e
 			break
 		}
-		time.Sleep(r.retry.BaseDelay * time.Duration(attempts))
 	}
-	exec := core.ToolExecution{Call: call, Error: lastErr, Retries: attempts - 1}
-	return exec, lastErr
+
+	return results, aggErr
+}
+
+func (r *Runner) executeTool(ctx context.Context, handle core.ToolHandle, call core.ToolCall, meta *core.ToolMeta) (core.ToolExecution, error) {
+	maxAttempts := max(1, r.retry.MaxAttempts)
+	inputHash := toolInputHash(call.Input)
+
+	if r.memo != nil {
+		if cached, ok := r.memo.Get(call.Name, inputHash); ok {
+			return core.ToolExecution{Call: call, Result: cached}, nil
+		}
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return core.ToolExecution{Call: call, Error: ctx.Err(), Retries: attempt}, ctx.Err()
+		}
+
+		attrs := []attribute.KeyValue{
+			attribute.String("ai.tool.name", handle.Name()),
+			attribute.String("ai.tool.call_id", call.ID),
+			attribute.Int("ai.tool.retry_attempt", attempt),
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, r.toolTimeout)
+		toolCtx, span := obs.Tracer().Start(attemptCtx, "runner.Tool",
+			trace.WithAttributes(attrs...))
+		start := time.Now()
+		var metaVal core.ToolMeta
+		if meta != nil {
+			if meta.Metadata == nil {
+				meta.Metadata = map[string]any{}
+			}
+			meta.Metadata["retry_attempt"] = attempt
+			metaVal = *meta
+		}
+		result, execErr := handle.Execute(toolCtx, call.Input, metaVal)
+		cancel()
+		if execErr != nil {
+			span.RecordError(execErr)
+			span.SetStatus(codes.Error, execErr.Error())
+		}
+		duration := time.Since(start).Milliseconds()
+
+		exec := core.ToolExecution{
+			Call:       call,
+			Result:     result,
+			Error:      execErr,
+			DurationMS: duration,
+			Retries:    attempt,
+		}
+		span.End()
+
+		if execErr == nil {
+			if r.memo != nil {
+				r.memo.Set(call.Name, inputHash, result)
+			}
+			return exec, nil
+		}
+
+		lastErr = execErr
+		if attempt == maxAttempts-1 {
+			return exec, execErr
+		}
+
+		delay := r.nextRetryDelay(attempt)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return core.ToolExecution{Call: call, Error: ctx.Err(), Retries: attempt + 1}, ctx.Err()
+		}
+	}
+
+	return core.ToolExecution{Call: call, Error: lastErr, Retries: maxAttempts - 1}, lastErr
+}
+
+func (r *Runner) nextRetryDelay(attempt int) time.Duration {
+	base := r.retry.BaseDelay
+	if base <= 0 {
+		base = 100 * time.Millisecond
+	}
+	delay := base * time.Duration(math.Pow(2, float64(attempt)))
+	if max := r.retry.MaxDelay; max > 0 && delay > max {
+		delay = max
+	}
+	if r.retry.Jitter {
+		jitterMu.Lock()
+		factor := 0.5 + jitterRand.Float64()
+		jitterMu.Unlock()
+		delay = time.Duration(float64(delay) * factor)
+	}
+	return delay
+}
+
+func (r *Runner) runFinalizer(ctx context.Context, finalizer core.Finalizer, state *core.RunnerState) (*core.TextResult, error) {
+	if finalizer == nil {
+		return &core.TextResult{
+			Text:         state.LastText(),
+			Steps:        append([]core.Step(nil), state.Steps...),
+			Usage:        state.Usage,
+			FinishReason: state.StopReason,
+			Provider:     r.provider.Capabilities().Provider,
+		}, nil
+	}
+
+	finalState := core.FinalState{
+		Messages:    append([]core.Message(nil), state.Messages...),
+		Steps:       append([]core.Step(nil), state.Steps...),
+		Usage:       state.Usage,
+		StopReason:  state.StopReason,
+		LastText:    func() string { return state.LastText() },
+		TotalTokens: func() int { return state.Usage.TotalTokens },
+	}
+
+	return finalizer(ctx, finalState)
 }
 
 func buildToolResultMessages(executions []core.ToolExecution) []core.Message {
-	var messages []core.Message
+	messages := make([]core.Message, 0, len(executions)*2)
 	for _, exec := range executions {
 		if exec.Call.Name == "" {
 			continue
 		}
+		callPart := core.ToolCall{ID: exec.Call.ID, Name: exec.Call.Name, Input: exec.Call.Input}
+		messages = append(messages, core.Message{Role: core.Assistant, Parts: []core.Part{callPart}})
 		if exec.Error != nil {
-			messages = append(messages, core.Message{Role: core.Assistant, Parts: []core.Part{core.Text{Text: fmt.Sprintf("tool %s failed: %v", exec.Call.Name, exec.Error)}}})
+			messages = append(messages, core.Message{Role: core.User, Parts: []core.Part{core.ToolResult{ID: exec.Call.ID, Name: exec.Call.Name, Error: exec.Error.Error()}}})
 			continue
 		}
-		messages = append(messages, core.Message{Role: core.Assistant, Parts: []core.Part{core.ToolCall{ID: exec.Call.ID, Name: exec.Call.Name, Input: exec.Call.Input}}})
 		messages = append(messages, core.Message{Role: core.User, Parts: []core.Part{core.ToolResult{ID: exec.Call.ID, Name: exec.Call.Name, Result: exec.Result}}})
 	}
 	return messages
+}
+
+func addUsage(total, step core.Usage) core.Usage {
+	total.InputTokens += step.InputTokens
+	total.OutputTokens += step.OutputTokens
+	total.TotalTokens += step.TotalTokens
+	total.ReasoningTokens += step.ReasoningTokens
+	total.CachedInputTokens += step.CachedInputTokens
+	total.AudioTokens += step.AudioTokens
+	total.CostUSD += step.CostUSD
+	return total
+}
+
+func toolInputHash(input map[string]any) string {
+	if len(input) == 0 {
+		return ""
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		// Fallback to fmt for unserializable inputs
+		payload = []byte(fmt.Sprint(input))
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }
 
 func max(a, b int) int {

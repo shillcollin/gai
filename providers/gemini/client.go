@@ -15,6 +15,8 @@ import (
 
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/internal/httpclient"
+	"github.com/shillcollin/gai/obs"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type Client struct {
@@ -33,11 +35,21 @@ func New(opts ...Option) *Client {
 	return &Client{opts: o, httpClient: o.httpClient}
 }
 
-func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.TextResult, error) {
+func (c *Client) GenerateText(ctx context.Context, req core.Request) (_ *core.TextResult, err error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.gemini.GenerateText",
+		attribute.String("ai.provider", "gemini"),
+		attribute.String("ai.operation", "generateContent"),
+	)
+	var usageTokens obs.UsageTokens
+	defer func() {
+		recorder.End(err, usageTokens)
+	}()
+
 	payload, err := buildRequest(req)
 	if err != nil {
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 	body, err := c.doRequest(ctx, payload, false)
 	if err != nil {
 		return nil, err
@@ -52,6 +64,9 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.Text
 	if text == "" {
 		return nil, errors.New("gemini: empty response")
 	}
+	if len(resp.Candidates) > 0 {
+		usageTokens = obs.UsageFromCore(core.Usage{})
+	}
 	return &core.TextResult{
 		Text:         text,
 		Model:        chooseModel(req.Model, c.opts.model),
@@ -61,16 +76,27 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.Text
 }
 
 func (c *Client) StreamText(ctx context.Context, req core.Request) (*core.Stream, error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.gemini.StreamText",
+		attribute.String("ai.provider", "gemini"),
+		attribute.String("ai.operation", "streamGenerateContent"),
+	)
 	payload, err := buildRequest(req)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 	body, err := c.doRequest(ctx, payload, true)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
 	stream := core.NewStream(ctx, 64)
-	go consumeStream(body, stream)
+	go func() {
+		consumeStream(body, stream)
+		meta := stream.Meta()
+		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+	}()
 	return stream, nil
 }
 

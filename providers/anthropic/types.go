@@ -48,6 +48,14 @@ type anthropicContentDelta struct {
 	} `json:"delta"`
 }
 
+type anthropicMessageDelta struct {
+	Model string         `json:"model"`
+	Usage anthropicUsage `json:"usage"`
+	Delta struct {
+		StopReason *string `json:"stop_reason"`
+	} `json:"delta"`
+}
+
 func (r anthropicResponse) JoinText() string {
 	text := ""
 	for _, c := range r.Content {

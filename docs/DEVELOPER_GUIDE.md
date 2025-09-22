@@ -1343,65 +1343,77 @@ Set up comprehensive observability:
 ```go
 import (
     "context"
-    "log"
+    "fmt"
+    "os"
+    "time"
 
+    "github.com/shillcollin/gai/core"
     "github.com/shillcollin/gai/obs"
-    "go.opentelemetry.io/otel"
     "go.opentelemetry.io/otel/attribute"
 )
 
-func setupObservability() (func(), error) {
-    // Initialize observability
-    shutdown, err := obs.Init(obs.Options{
-        Provider:    "otlp", // stdout, otlp, braintrust, phoenix
-        ServiceName: "ai-service",
-        Endpoint:    "localhost:4317",
-        Headers: map[string]string{
-            "api-key": "your-api-key",
-        },
-        SampleRate: 1.0, // Sample all traces in dev
-    })
+func setupObservability(ctx context.Context) (func(context.Context) error, error) {
+    opts := obs.DefaultOptions()
+    opts.ServiceName = os.Getenv("OTEL_SERVICE_NAME")
+    if opts.ServiceName == "" {
+        opts.ServiceName = "ai-service"
+    }
+    opts.Environment = os.Getenv("GAI_ENV")
+    opts.Exporter = obs.ExporterOTLP
+    opts.Endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    opts.Insecure = os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true"
 
+    if key := os.Getenv("BRAINTRUST_API_KEY"); key != "" {
+        opts.Braintrust = obs.BraintrustOptions{
+            Enabled:   true,
+            APIKey:    key,
+            Project:   os.Getenv("BRAINTRUST_PROJECT_NAME"),
+            ProjectID: os.Getenv("BRAINTRUST_PROJECT_ID"),
+            Dataset:   os.Getenv("BRAINTRUST_DATASET"),
+        }
+    }
+
+    shutdown, err := obs.Init(ctx, opts)
     if err != nil {
         return nil, fmt.Errorf("failed to init observability: %w", err)
     }
-
     return shutdown, nil
 }
 
-// All SDK operations are automatically traced
-func tracedOperation(ctx context.Context, p core.Provider) error {
-    // Start a custom span
-    ctx, span := obs.Tracer().Start(ctx, "business_logic")
-    defer span.End()
-
-    // Add custom attributes
-    span.SetAttributes(
-        attribute.String("user.id", "user-123"),
+func tracedOperation(ctx context.Context, p core.Provider, req core.Request) (_ *core.TextResult, err error) {
+    ctx, recorder := obs.StartRequest(ctx, "business_logic",
         attribute.String("feature", "chat"),
-        attribute.Bool("premium", true),
+        attribute.String("ai.provider", p.Capabilities().Provider),
     )
+    var usage obs.UsageTokens
+    defer func() {
+        recorder.End(err, usage)
+    }()
 
-    // SDK calls within this context are automatically traced
-    result, err := p.GenerateText(ctx, core.Request{
-        Messages: msgs,
-    })
-
+    res, err := p.GenerateText(ctx, req)
     if err != nil {
-        span.RecordError(err)
-        return err
+        return nil, err
     }
 
-    // Record custom metrics
-    obs.RecordTokens(span, result.Usage.InputTokens, result.Usage.OutputTokens)
-    span.SetAttributes(
-        attribute.Float64("response.quality_score", 0.95),
-        attribute.Int("response.length", len(result.Text)),
-    )
+    usage = obs.UsageFromCore(res.Usage)
+    return res, nil
+}
 
-    return nil
+func logCompletion(ctx context.Context, res *core.TextResult, history []core.Message, requestID string) {
+    obs.LogCompletion(ctx, obs.Completion{
+        Provider:     res.Provider,
+        Model:        res.Model,
+        RequestID:    requestID,
+        Input:        obs.MessagesFromCore(history),
+        Output:       obs.MessageFromCore(core.AssistantMessage(res.Text)),
+        Usage:        obs.UsageFromCore(res.Usage),
+        LatencyMS:    res.LatencyMS,
+        CreatedAtUTC: time.Now().UTC().UnixMilli(),
+    })
 }
 ```
+
+Braintrust is the default evaluation sink. Provide `BRAINTRUST_API_KEY`, `BRAINTRUST_PROJECT_NAME` (or `BRAINTRUST_PROJECT_ID`), and optional `BRAINTRUST_DATASET` to stream normalized completions automatically. The `obs` package also exposes an `ArizeOptions` struct so future releases can wire Arize exports without touching call sites; set `ARIZE_ENABLED=true` to opt-in once support lands.
 
 ### Metrics and Dashboards
 
@@ -1409,11 +1421,11 @@ Key metrics automatically collected:
 
 ```go
 // Automatic metrics collected by the SDK:
-// - gai.request.count (by provider, model, status)
-// - gai.request.duration_ms (histogram)
-// - gai.request.tokens_in (histogram)
-// - gai.request.tokens_out (histogram)
-// - gai.request.cost_usd (histogram)
+// - gai.requests (by provider/model)
+// - gai.request.latency_ms (histogram)
+// - gai.tokens.input (histogram)
+// - gai.tokens.output (histogram)
+// - gai.tokens.total (histogram)
 // - gai.tool.count (by name, status)
 // - gai.tool.duration_ms (histogram)
 // - gai.stream.events (by type)
@@ -1631,6 +1643,38 @@ func setupRetries(p core.Provider) core.Provider {
     })
 }
 ```
+
+### Parameter Policies & Warnings
+
+Providers frequently tighten request contracts as new models ship. OpenAI’s GPT‑5 and `o`-series reasoning models require `max_completion_tokens` and ignore custom temperatures, while GPT-4.1 keeps the classic knobs.citeturn0search0turn0search1turn0search5 Anthropic’s Claude Sonnet 4/Opus 4.1 still use `max_tokens` but publish hard output caps per release.citeturn1search6
+
+The SDK normalizes these quirks automatically. When a request includes a parameter that must be renamed or dropped, the provider adapter adjusts the payload and emits a non-fatal `core.Warning` so you can observe what changed:
+
+```go
+resp, err := openaiClient.GenerateText(ctx, core.Request{
+    Model:     "gpt-5-nano",
+    MaxTokens: 800,
+    Temperature: 0.2,
+})
+if err != nil {
+    return err
+}
+
+for _, warn := range resp.Warnings {
+    log.Printf("warning field=%s code=%s msg=%s", warn.Field, warn.Code, warn.Message)
+}
+
+stream, err := openaiClient.StreamText(ctx, core.Request{Model: "o4-mini", MaxTokens: 600})
+if err != nil {
+    return err
+}
+defer stream.Close()
+if ws := stream.Warnings(); len(ws) > 0 {
+    metrics.RecordWarnings(ws)
+}
+```
+
+These warnings keep telemetry honest (they flow into Braintrust/OTel spans) and make it easy to adapt front-end controls—e.g., disable the temperature slider when `stream.Warnings()` reports it was dropped for a reasoning model.
 
 ### Circuit Breaker Pattern
 

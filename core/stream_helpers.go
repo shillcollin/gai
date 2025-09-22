@@ -33,6 +33,9 @@ func CollectStream(stream *Stream) (*TextResult, error) {
 		return nil, err
 	}
 	result.Text = buf.String()
+	if warnings := stream.Warnings(); len(warnings) > 0 {
+		result.Warnings = warnings
+	}
 	return &result, nil
 }
 

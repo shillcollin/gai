@@ -14,6 +14,8 @@ import (
 
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/internal/httpclient"
+	"github.com/shillcollin/gai/obs"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Client implements the core.Provider interface for Anthropic's Messages API.
@@ -37,11 +39,21 @@ func New(opts ...Option) *Client {
 	return &Client{opts: o, httpClient: o.httpClient}
 }
 
-func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.TextResult, error) {
+func (c *Client) GenerateText(ctx context.Context, req core.Request) (_ *core.TextResult, err error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.anthropic.GenerateText",
+		attribute.String("ai.provider", "anthropic"),
+		attribute.String("ai.operation", "messages"),
+	)
+	var usageTokens obs.UsageTokens
+	defer func() {
+		recorder.End(err, usageTokens)
+	}()
+
 	payload, err := c.buildPayload(req, false)
 	if err != nil {
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 	body, err := c.doRequest(ctx, payload)
 	if err != nil {
 		return nil, err
@@ -53,6 +65,7 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.Text
 		return nil, fmt.Errorf("decode anthropic response: %w", err)
 	}
 	text := resp.JoinText()
+	usageTokens = obs.UsageFromCore(resp.Usage.toCore())
 	return &core.TextResult{
 		Text:         text,
 		Model:        resp.Model,
@@ -63,16 +76,27 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.Text
 }
 
 func (c *Client) StreamText(ctx context.Context, req core.Request) (*core.Stream, error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.anthropic.StreamText",
+		attribute.String("ai.provider", "anthropic"),
+		attribute.String("ai.operation", "messages.stream"),
+	)
 	payload, err := c.buildPayload(req, true)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 	body, err := c.doRequest(ctx, payload)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
 	stream := core.NewStream(ctx, 64)
-	go c.consumeStream(body, stream)
+	go func() {
+		c.consumeStream(body, stream)
+		meta := stream.Meta()
+		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+	}()
 	return stream, nil
 }
 
@@ -166,6 +190,9 @@ func (c *Client) consumeStream(body io.ReadCloser, stream *core.Stream) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
 	var currentEvent string
 	seq := 0
+	usage := anthropicUsage{}
+	var finishReason string
+	var model string
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event:") {
@@ -184,11 +211,36 @@ func (c *Client) consumeStream(body io.ReadCloser, stream *core.Stream) {
 				stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now()})
 				continue
 			}
+			if delta.Model != "" {
+				model = delta.Model
+			}
 			if delta.Delta.Text != "" {
 				stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: delta.Delta.Text, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic", Model: delta.Model})
 			}
+		case "message_delta":
+			var delta anthropicMessageDelta
+			if err := json.Unmarshal([]byte(data), &delta); err != nil {
+				stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic", Model: model})
+				continue
+			}
+			if delta.Model != "" {
+				model = delta.Model
+			}
+			if delta.Usage.InputTokens > usage.InputTokens {
+				usage.InputTokens = delta.Usage.InputTokens
+			}
+			if delta.Usage.OutputTokens > usage.OutputTokens {
+				usage.OutputTokens = delta.Usage.OutputTokens
+			}
+			if delta.Delta.StopReason != nil && *delta.Delta.StopReason != "" {
+				finishReason = *delta.Delta.StopReason
+			}
 		case "message_stop":
-			stream.Push(core.StreamEvent{Type: core.EventFinish, FinishReason: &core.StopReason{Type: "stop"}, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic"})
+			reason := finishReason
+			if reason == "" {
+				reason = "stop"
+			}
+			stream.Push(core.StreamEvent{Type: core.EventFinish, FinishReason: &core.StopReason{Type: reason}, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic", Model: model, Usage: usage.toCore()})
 		case "error":
 			stream.Push(core.StreamEvent{Type: core.EventError, Error: fmt.Errorf("anthropic stream error: %s", data), Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic"})
 		}

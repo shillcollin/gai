@@ -126,28 +126,35 @@ type Request struct {
     Metadata map[string]any `json:"metadata,omitempty"`
 }
 
+// Warning communicates a non-fatal adjustment that occurred while processing a request.
+type Warning struct {
+    Code    string `json:"code"`
+    Field   string `json:"field,omitempty"`
+    Message string `json:"message"`
+}
+
 // TextResult represents a non-streaming text generation result
 type TextResult struct {
-    Text     string   `json:"text"`
-    Model    string   `json:"model"`
-    Provider string   `json:"provider"`
-    Usage    Usage    `json:"usage"`
-    Steps    []Step   `json:"steps,omitempty"`    // For multi-step execution
-    Citations []Citation `json:"citations,omitempty"`
-    Safety   []SafetyEvent `json:"safety,omitempty"`
-    FinishReason StopReason `json:"finish_reason"`
-
-    // Timing information
-    LatencyMS int64 `json:"latency_ms"`
-    TTFBMS    int64 `json:"ttfb_ms"` // Time to first byte
+    Text         string        `json:"text"`
+    Model        string        `json:"model"`
+    Provider     string        `json:"provider"`
+    Usage        Usage         `json:"usage"`
+    Steps        []Step        `json:"steps,omitempty"`    // For multi-step execution
+    Citations    []Citation    `json:"citations,omitempty"`
+    Safety       []SafetyEvent `json:"safety,omitempty"`
+    FinishReason StopReason    `json:"finish_reason"`
+    LatencyMS    int64         `json:"latency_ms,omitempty"`
+    TTFBMS       int64         `json:"ttfb_ms,omitempty"`
+    Warnings     []Warning     `json:"warnings,omitempty"`
 }
 
 // ObjectResultRaw represents raw JSON generation result
 type ObjectResultRaw struct {
-    JSON     string `json:"json"`     // Raw JSON string
-    Model    string `json:"model"`
-    Provider string `json:"provider"`
-    Usage    Usage  `json:"usage"`
+    JSON     []byte    `json:"json"`
+    Model    string    `json:"model"`
+    Provider string    `json:"provider"`
+    Usage    Usage     `json:"usage"`
+    Warnings []Warning `json:"warnings,omitempty"`
 }
 
 // Usage tracks token consumption and costs
@@ -1437,6 +1444,7 @@ func ChatRequest(messages []core.Message) core.Request
 // Stream helpers
 func CollectStream(stream *core.Stream) (*core.TextResult, error)
 func StreamToWriter(stream *core.Stream, w io.Writer) error
+// Inspect non-fatal adjustments via result.Warnings / stream.Warnings()
 
 // Error helpers
 func WrapProviderError(err error, provider string) error
