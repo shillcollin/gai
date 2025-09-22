@@ -52,6 +52,7 @@ type Step struct {
 	DurationMS  int64
 	StartedAt   int64
 	CompletedAt int64
+	Model       string
 }
 
 // ToolExecution captures an individual tool invocation and its outcome.

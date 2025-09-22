@@ -157,6 +157,11 @@ func (s *ObjectStream[T]) Final() (*ObjectResult[T], error) {
 		Provider: s.stream.meta.Provider,
 		Usage:    s.stream.meta.Usage,
 	}
+	if rawProvider, ok := s.decoder.(interface{ RawJSON() []byte }); ok {
+		if raw := rawProvider.RawJSON(); len(raw) > 0 {
+			res.RawJSON = raw
+		}
+	}
 	if warnings := s.stream.Warnings(); len(warnings) > 0 {
 		res.Warnings = warnings
 	}

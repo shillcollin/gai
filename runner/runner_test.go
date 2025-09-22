@@ -72,3 +72,72 @@ func TestRunnerToolExecution(t *testing.T) {
 		t.Fatalf("unexpected final text: %s", res.Text)
 	}
 }
+
+func TestRunnerStreamRequest(t *testing.T) {
+	provider := &fakeProvider{}
+	runner := New(provider, WithMaxParallel(2))
+
+	type input struct {
+		Name string `json:"name"`
+	}
+	type output struct {
+		Greeting string `json:"greeting"`
+	}
+	tool := tools.New[input, output](
+		"greet",
+		"Generate greeting",
+		func(ctx context.Context, in input, meta core.ToolMeta) (output, error) {
+			return output{Greeting: "Hello " + in.Name}, nil
+		},
+	)
+
+	stream, err := runner.StreamRequest(context.Background(), core.Request{
+		Messages:   []core.Message{core.UserMessage(core.TextPart("Say hi"))},
+		Tools:      []core.ToolHandle{tools.NewCoreAdapter(tool)},
+		ToolChoice: core.ToolChoiceAuto,
+	})
+	if err != nil {
+		t.Fatalf("StreamRequest error: %v", err)
+	}
+
+	var (
+		stepStart  bool
+		stepFinish bool
+		toolResult bool
+		finalEvent *core.StreamEvent
+	)
+	for event := range stream.Events() {
+		switch event.Type {
+		case core.EventStepStart:
+			stepStart = true
+		case core.EventStepFinish:
+			stepFinish = true
+		case core.EventToolResult:
+			toolResult = true
+		case core.EventFinish:
+			if event.StepID == 0 {
+				copy := event
+				finalEvent = &copy
+			}
+		}
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+	if !stepStart {
+		t.Fatalf("expected step start events")
+	}
+	if !stepFinish {
+		t.Fatalf("expected step finish events")
+	}
+	if !toolResult {
+		t.Fatalf("expected tool result events")
+	}
+	if finalEvent == nil || finalEvent.FinishReason == nil || finalEvent.FinishReason.Type == "" {
+		t.Fatalf("unexpected final finish event: %#v", finalEvent)
+	}
+	meta := stream.Meta()
+	if meta.Provider != "fake" {
+		t.Fatalf("unexpected stream meta provider: %s", meta.Provider)
+	}
+}

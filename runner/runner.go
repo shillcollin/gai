@@ -61,6 +61,83 @@ func (noopInterceptor) BeforeTool(ctx context.Context, _ core.ToolCall, _ *core.
 }
 func (noopInterceptor) AfterTool(context.Context, *core.ToolExecution, *core.ToolMeta) {}
 
+type streamPublisher struct {
+	stream   *core.Stream
+	provider string
+	seq      int
+}
+
+func (p *streamPublisher) push(event core.StreamEvent, step int) {
+	if p == nil || p.stream == nil {
+		return
+	}
+	clone := event
+	clone.StepID = step
+	if clone.Schema == "" {
+		clone.Schema = "gai.events.v1"
+	}
+	if clone.Provider == "" {
+		clone.Provider = p.provider
+	}
+	if clone.Timestamp.IsZero() {
+		clone.Timestamp = time.Now()
+	}
+	if clone.StreamID == "" {
+		if step == 0 {
+			clone.StreamID = "runner"
+		} else {
+			clone.StreamID = fmt.Sprintf("runner.step.%d", step)
+		}
+	}
+	p.seq++
+	clone.Seq = p.seq
+	p.stream.Push(clone)
+}
+
+func (p *streamPublisher) emitRunnerStart() {
+	p.push(core.StreamEvent{Type: core.EventStart}, 0)
+}
+
+func (p *streamPublisher) emitRunnerFinish(state *core.RunnerState) {
+	if p == nil || state == nil {
+		return
+	}
+	reason := state.StopReason
+	p.push(core.StreamEvent{
+		Type:         core.EventFinish,
+		FinishReason: &reason,
+		Usage:        state.Usage,
+	}, 0)
+}
+
+func (p *streamPublisher) emitStepStart(step int) {
+	p.push(core.StreamEvent{Type: core.EventStepStart}, step)
+}
+
+func (p *streamPublisher) emitStepFinish(step core.Step) {
+	p.push(core.StreamEvent{
+		Type:       core.EventStepFinish,
+		Usage:      step.Usage,
+		DurationMS: step.DurationMS,
+		ToolCalls:  len(step.ToolCalls),
+	}, step.Number)
+}
+
+func (p *streamPublisher) emitToolResult(step int, exec core.ToolExecution) {
+	result := core.ToolResult{ID: exec.Call.ID, Name: exec.Call.Name, Result: exec.Result}
+	if exec.Error != nil {
+		result.Error = exec.Error.Error()
+	}
+	p.push(core.StreamEvent{Type: core.EventToolResult, ToolResult: result}, step)
+}
+
+func (p *streamPublisher) addWarnings(warnings ...core.Warning) {
+	if p == nil || p.stream == nil || len(warnings) == 0 {
+		return
+	}
+	p.stream.AddWarnings(warnings...)
+}
+
 // RunnerOption configures the runner.
 type RunnerOption func(*Runner)
 
@@ -187,7 +264,7 @@ func (r *Runner) ExecuteRequest(ctx context.Context, req core.Request) (resp *co
 			break
 		}
 
-		step, stepErr := r.executeStep(ctx, req, state)
+		step, stepErr := r.executeStep(ctx, req, state, nil)
 		if stepErr != nil {
 			err = stepErr
 			return nil, err
@@ -223,7 +300,92 @@ func (r *Runner) ExecuteRequest(ctx context.Context, req core.Request) (resp *co
 	return resp, nil
 }
 
-func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.RunnerState) (core.Step, error) {
+// StreamRequest executes the request while streaming normalized events to the caller.
+func (r *Runner) StreamRequest(ctx context.Context, req core.Request) (*core.Stream, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stream := core.NewStream(ctx, 128)
+	go r.runStreamRequest(ctx, req, stream)
+	return stream, nil
+}
+
+func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream *core.Stream) {
+	providerName := r.provider.Capabilities().Provider
+	ctx, recorder := obs.StartRequest(ctx, "runner.StreamRequest",
+		attribute.String("ai.provider", providerName),
+		attribute.String("ai.runner", "gai"),
+	)
+
+	stopWhen := req.StopWhen
+	if stopWhen == nil {
+		stopWhen = core.NoMoreTools()
+	}
+	state := &core.RunnerState{
+		Messages: append([]core.Message(nil), req.Messages...),
+		Steps:    []core.Step{},
+		Usage:    core.Usage{},
+	}
+	publisher := &streamPublisher{stream: stream, provider: providerName}
+	publisher.emitRunnerStart()
+
+	var (
+		lastModel string
+		runErr    error
+	)
+
+	for {
+		if ctx.Err() != nil {
+			runErr = ctx.Err()
+			break
+		}
+		if stop, reason := stopWhen(state); stop {
+			if reason.Type == "" {
+				reason.Type = core.StopReasonComplete
+			}
+			state.StopReason = reason
+			break
+		}
+
+		step, err := r.executeStep(ctx, req, state, publisher)
+		if err != nil {
+			runErr = err
+			break
+		}
+		state.Steps = append(state.Steps, step)
+		state.LastStep = &state.Steps[len(state.Steps)-1]
+		state.Usage = addUsage(state.Usage, step.Usage)
+		lastModel = step.Model
+
+		if len(step.ToolCalls) == 0 {
+			if state.StopReason.Type == "" {
+				state.StopReason = core.StopReason{Type: core.StopReasonNoMoreTools}
+			}
+			break
+		}
+	}
+
+	if runErr == nil {
+		if state.StopReason.Type == "" {
+			state.StopReason = core.StopReason{Type: core.StopReasonComplete}
+		}
+		publisher.emitRunnerFinish(state)
+		stream.SetMeta(core.StreamMeta{Model: lastModel, Provider: providerName, Usage: state.Usage})
+	}
+
+	usage := obs.UsageTokens{}
+	if runErr == nil {
+		usage = obs.UsageFromCore(state.Usage)
+	}
+	recorder.End(runErr, usage)
+	if runErr != nil {
+		stream.Fail(runErr)
+		return
+	}
+	_ = stream.Close()
+}
+
+func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.RunnerState, publisher *streamPublisher) (core.Step, error) {
 	stepNum := len(state.Steps) + 1
 	stepCtx := ctx
 	for _, ic := range r.interceptors {
@@ -256,6 +418,9 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 		return core.Step{}, err
 	}
 	defer stream.Close()
+	if publisher != nil {
+		publisher.emitStepStart(stepNum)
+	}
 
 	builder := &strings.Builder{}
 	toolCalls := make([]core.ToolCall, 0)
@@ -263,6 +428,9 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 	var finishReason *core.StopReason
 
 	for event := range stream.Events() {
+		if publisher != nil {
+			publisher.push(event, stepNum)
+		}
 		switch event.Type {
 		case core.EventTextDelta:
 			builder.WriteString(event.TextDelta)
@@ -286,6 +454,11 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 		span.End()
 		return core.Step{}, err
 	}
+	if publisher != nil {
+		publisher.addWarnings(stream.Warnings()...)
+	}
+
+	meta := stream.Meta()
 
 	assistantText := builder.String()
 	state.Messages = append(state.Messages, core.Message{Role: core.Assistant, Parts: []core.Part{core.Text{Text: assistantText}}})
@@ -298,6 +471,11 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 		}
 		executions = execs
 		state.Messages = append(state.Messages, buildToolResultMessages(executions)...)
+		if publisher != nil {
+			for _, exec := range executions {
+				publisher.emitToolResult(stepNum, exec)
+			}
+		}
 	}
 
 	if finishReason != nil && finishReason.Type != "" {
@@ -313,6 +491,7 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 		DurationMS:  finishedAt.Sub(stepStart).Milliseconds(),
 		StartedAt:   stepStart.UnixMilli(),
 		CompletedAt: finishedAt.UnixMilli(),
+		Model:       meta.Model,
 	}
 	span.SetAttributes(
 		attribute.Int64("ai.tokens.input", int64(usage.InputTokens)),
@@ -323,6 +502,10 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 
 	for _, ic := range r.interceptors {
 		ic.AfterStep(stepCtx, step, state)
+	}
+
+	if publisher != nil {
+		publisher.emitStepFinish(step)
 	}
 
 	return step, nil
