@@ -57,7 +57,8 @@ The SDK is organized into logical packages:
 ```go
 import (
     "github.com/shillcollin/gai/core"           // Core types and interfaces
-    "github.com/shillcollin/gai/providers/openai"     // OpenAI adapter
+    "github.com/shillcollin/gai/providers/openai"         // OpenAI Chat adapter
+    openairesponses "github.com/shillcollin/gai/providers/openai-responses" // OpenAI Responses adapter
     "github.com/shillcollin/gai/providers/anthropic"  // Anthropic adapter
     "github.com/shillcollin/gai/providers/gemini"     // Gemini adapter
     "github.com/shillcollin/gai/providers/compat"     // OpenAI-compatible adapters
@@ -109,12 +110,18 @@ import (
 func initProviders() {
     ctx := context.Background()
 
-    // OpenAI
+    // OpenAI Chat Completions
     openaiProvider := openai.New(
         openai.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
         openai.WithModel("gpt-4o-mini"),
         openai.WithBaseURL("https://api.openai.com/v1"), // Optional: custom endpoint
         openai.WithHTTPClient(customHTTPClient),         // Optional: custom HTTP client
+    )
+
+    // OpenAI Responses API (GPT-5, o-series)
+    responsesProvider := openairesponses.New(
+        openairesponses.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
+        openairesponses.WithModel("gpt-5-nano"), // Automatically normalizes max_completion_tokens, reasoning, etc.
     )
 
     // Anthropic
@@ -130,6 +137,21 @@ func initProviders() {
         gemini.WithModel("gemini-1.5-pro"),
         gemini.WithRegion("us-central1"), // Optional: specific region
     )
+
+    // OpenAI Responses API usage (e.g. GPT-5, o-series)
+    respResult, err := responsesProvider.GenerateText(ctx, core.Request{
+        Model:     "gpt-5-nano",
+        MaxTokens: 1200,             // renamed to max_completion_tokens for you
+        Messages: []core.Message{
+            core.UserMessage(core.TextPart("Summarize the latest AI governance research")),
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, w := range respResult.Warnings {
+        log.Printf("OpenAI Responses warning: %s (%s)", w.Message, w.Field)
+    }
 
     // OpenAI-Compatible (Groq example)
     groqProvider := compat.OpenAICompatible(compat.CompatOpts{
@@ -1646,7 +1668,7 @@ func setupRetries(p core.Provider) core.Provider {
 
 ### Parameter Policies & Warnings
 
-Providers frequently tighten request contracts as new models ship. OpenAI’s GPT‑5 and `o`-series reasoning models require `max_completion_tokens` and ignore custom temperatures, while GPT-4.1 keeps the classic knobs.citeturn0search0turn0search1turn0search5 Anthropic’s Claude Sonnet 4/Opus 4.1 still use `max_tokens` but publish hard output caps per release.citeturn1search6
+Providers frequently tighten request contracts as new models ship. OpenAI’s GPT‑5 and `o`-series reasoning models require `max_completion_tokens` and ignore custom temperatures, while GPT-4.1 keeps the classic knobs.citeturn0search1turn0search3turn0search10 Anthropic’s Claude Sonnet 4/Opus 4.1 still use `max_tokens` but publish hard output caps per release.citeturn1search0
 
 The SDK normalizes these quirks automatically. When a request includes a parameter that must be renamed or dropped, the provider adapter adjusts the payload and emits a non-fatal `core.Warning` so you can observe what changed:
 

@@ -14,13 +14,23 @@ import (
 
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/internal/httpclient"
+	"github.com/shillcollin/gai/obs"
 	"github.com/shillcollin/gai/schema"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Client implements the core.Provider interface for OpenAI's Responses API.
 type Client struct {
 	httpClient *http.Client
 	opts       options
+}
+
+func warnDroppedParam(field, model, reason string) core.Warning {
+	return core.Warning{
+		Code:    "param_dropped",
+		Field:   field,
+		Message: fmt.Sprintf("%s ignored for model %s (%s)", field, model, reason),
+	}
 }
 
 // New creates a new OpenAI Responses API client.
@@ -39,11 +49,20 @@ func New(opts ...Option) *Client {
 }
 
 // GenerateText implements core.Provider.
-func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.TextResult, error) {
-	payload, err := c.buildPayload(req, false)
+func (c *Client) GenerateText(ctx context.Context, req core.Request) (_ *core.TextResult, err error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai-responses.GenerateText",
+		attribute.String("ai.provider", "openai-responses"),
+	)
+	var usageTokens obs.UsageTokens
+	defer func() {
+		recorder.End(err, usageTokens)
+	}()
+
+	payload, warnings, err := c.buildPayload(req, false)
 	if err != nil {
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 
 	body, err := c.doRequest(ctx, "POST", "/responses", payload)
 	if err != nil {
@@ -60,56 +79,75 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (*core.Text
 		return nil, fmt.Errorf("api error: %s - %s", resp.Error.Type, resp.Error.Message)
 	}
 
-	// Extract text from output items
 	text, citations, _ := c.extractActualOutputContent(resp.Output)
-
-	// Convert usage
 	usage := c.convertActualUsage(resp.Usage)
+	usageTokens = obs.UsageFromCore(usage)
 
-	// Determine finish reason
-	finishReason := core.StopReason{
-		Type: core.StopReasonComplete,
-	}
-
-	return &core.TextResult{
+	result := &core.TextResult{
 		Text:         text,
 		Model:        resp.Model,
 		Provider:     "openai-responses",
 		Usage:        usage,
 		Citations:    citations,
-		FinishReason: finishReason,
-	}, nil
+		FinishReason: core.StopReason{Type: core.StopReasonComplete},
+	}
+	if len(warnings) > 0 {
+		result.Warnings = append(result.Warnings, warnings...)
+	}
+	return result, nil
 }
 
 // StreamText implements core.Provider.
 func (c *Client) StreamText(ctx context.Context, req core.Request) (*core.Stream, error) {
-	payload, err := c.buildPayload(req, true)
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai-responses.StreamText",
+		attribute.String("ai.provider", "openai-responses"),
+	)
+	payload, warnings, err := c.buildPayload(req, true)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 
 	body, err := c.doRequestSSE(ctx, "POST", "/responses", payload)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
 
 	stream := core.NewStream(ctx, 128)
-	go c.consumeSSEStream(ctx, body, stream)
+	if len(warnings) > 0 {
+		stream.AddWarnings(warnings...)
+	}
+	modelName := payload.Model
+	go func() {
+		c.consumeSSEStream(ctx, body, stream, modelName)
+		meta := stream.Meta()
+		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+	}()
 	return stream, nil
 }
 
 // GenerateObject implements core.Provider for structured outputs.
-func (c *Client) GenerateObject(ctx context.Context, req core.Request) (*core.ObjectResultRaw, error) {
+func (c *Client) GenerateObject(ctx context.Context, req core.Request) (_ *core.ObjectResultRaw, err error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai-responses.GenerateObject",
+		attribute.String("ai.provider", "openai-responses"),
+	)
+	var usageTokens obs.UsageTokens
+	defer func() {
+		recorder.End(err, usageTokens)
+	}()
 	// Add JSON schema format to request if not present
 	if req.ProviderOptions == nil {
 		req.ProviderOptions = map[string]any{}
 	}
 
 	// Use inline structured output format
-	payload, err := c.buildPayload(req, false)
+	payload, warnings, err := c.buildPayload(req, false)
 	if err != nil {
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 
 	// Ensure JSON output format
 	if payload.Text == nil {
@@ -140,25 +178,35 @@ func (c *Client) GenerateObject(ctx context.Context, req core.Request) (*core.Ob
 	// Extract JSON from output
 	jsonContent := c.extractActualJSONContent(resp.Output)
 
-	return &core.ObjectResultRaw{
+	result := &core.ObjectResultRaw{
 		JSON:     []byte(jsonContent),
 		Model:    resp.Model,
 		Provider: "openai-responses",
 		Usage:    c.convertActualUsage(resp.Usage),
-	}, nil
+	}
+	usageTokens = obs.UsageFromCore(result.Usage)
+	if len(warnings) > 0 {
+		result.Warnings = append(result.Warnings, warnings...)
+	}
+	return result, nil
 }
 
 // StreamObject implements core.Provider for streaming structured outputs.
 func (c *Client) StreamObject(ctx context.Context, req core.Request) (*core.ObjectStreamRaw, error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.openai-responses.StreamObject",
+		attribute.String("ai.provider", "openai-responses"),
+	)
 	// Add JSON format
 	if req.ProviderOptions == nil {
 		req.ProviderOptions = map[string]any{}
 	}
 
-	payload, err := c.buildPayload(req, true)
+	payload, warnings, err := c.buildPayload(req, true)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
 
 	// Ensure JSON output format
 	if payload.Text == nil {
@@ -172,11 +220,20 @@ func (c *Client) StreamObject(ctx context.Context, req core.Request) (*core.Obje
 
 	body, err := c.doRequestSSE(ctx, "POST", "/responses", payload)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
 
 	stream := core.NewStream(ctx, 128)
-	go c.consumeSSEStream(ctx, body, stream)
+	if len(warnings) > 0 {
+		stream.AddWarnings(warnings...)
+	}
+	modelName := payload.Model
+	go func() {
+		c.consumeSSEStream(ctx, body, stream, modelName)
+		meta := stream.Meta()
+		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+	}()
 	return core.NewObjectStreamRaw(stream), nil
 }
 
@@ -205,7 +262,7 @@ func (c *Client) Capabilities() core.Capabilities {
 }
 
 // buildPayload converts a core.Request to a ResponsesRequest.
-func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest, error) {
+func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest, []core.Warning, error) {
 	// Convert messages to input format
 	input, instructions := c.convertMessages(req.Messages)
 
@@ -216,6 +273,8 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest,
 		Stream:       stream,
 		Store:        c.opts.store,
 	}
+	policy := policyForModel(payload.Model)
+	warnings := make([]core.Warning, 0, 2)
 
 	// Apply default instructions if none provided
 	if payload.Instructions == "" && c.opts.defaultInstructions != "" {
@@ -224,7 +283,13 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest,
 
 	// Handle provider-specific options
 	if req.ProviderOptions != nil {
-		c.applyProviderOptions(payload, req.ProviderOptions)
+		optionWarnings, err := c.applyProviderOptions(payload, req.ProviderOptions, policy)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(optionWarnings) > 0 {
+			warnings = append(warnings, optionWarnings...)
+		}
 	}
 
 	// Convert tools if present
@@ -234,21 +299,41 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest,
 
 	// Apply temperature and other generation parameters
 	if req.Temperature > 0 {
-		payload.Temperature = req.Temperature
+		if policy.AllowTemperature {
+			payload.Temperature = req.Temperature
+		} else {
+			warnings = append(warnings, warnDroppedParam("temperature", payload.Model, "not supported"))
+		}
 	}
 	if req.MaxTokens > 0 {
-		payload.MaxOutputTokens = req.MaxTokens
+		if policy.UseMaxOutputTokens {
+			payload.MaxOutputTokens = req.MaxTokens
+		} else {
+			payload.MaxOutputTokens = req.MaxTokens
+		}
 	}
 	if req.TopP > 0 {
-		payload.TopP = req.TopP
+		if policy.AllowTopP {
+			payload.TopP = req.TopP
+		} else {
+			warnings = append(warnings, warnDroppedParam("top_p", payload.Model, "not supported"))
+		}
 	}
 
 	// Apply default reasoning if configured
-	if c.opts.defaultReasoning != nil && payload.Reasoning == nil {
-		payload.Reasoning = c.opts.defaultReasoning
+	if c.opts.defaultReasoning != nil && payload.Reasoning == nil && policy.AllowReasoning {
+		if policy.AllowedReasoningEffort != nil {
+			if _, ok := policy.AllowedReasoningEffort[strings.ToLower(c.opts.defaultReasoning.Effort)]; !ok && c.opts.defaultReasoning.Effort != "" {
+				warnings = append(warnings, warnDroppedParam("reasoning.effort", payload.Model, "unsupported default value"))
+			} else {
+				payload.Reasoning = c.opts.defaultReasoning
+			}
+		} else {
+			payload.Reasoning = c.opts.defaultReasoning
+		}
 	}
 
-	return payload, nil
+	return payload, warnings, nil
 }
 
 // convertMessages converts core messages to Responses API input format.
@@ -380,7 +465,8 @@ func (c *Client) convertTools(tools []core.ToolHandle) []ResponseTool {
 }
 
 // applyProviderOptions applies provider-specific options to the payload.
-func (c *Client) applyProviderOptions(payload *ResponsesRequest, options map[string]any) {
+func (c *Client) applyProviderOptions(payload *ResponsesRequest, options map[string]any, policy modelPolicy) ([]core.Warning, error) {
+	warnings := make([]core.Warning, 0)
 	for key, value := range options {
 		switch key {
 		case "openai-responses.previous_response_id":
@@ -393,13 +479,27 @@ func (c *Client) applyProviderOptions(payload *ResponsesRequest, options map[str
 			}
 		case "openai-responses.reasoning":
 			if reasoning, ok := value.(map[string]any); ok {
-				payload.Reasoning = &ReasoningParams{}
+				if !policy.AllowReasoning {
+					warnings = append(warnings, warnDroppedParam("reasoning", payload.Model, "not supported"))
+					continue
+				}
+				reasoningParams := &ReasoningParams{}
 				if effort, ok := reasoning["effort"].(string); ok {
-					payload.Reasoning.Effort = effort
+					lower := strings.ToLower(effort)
+					if policy.AllowedReasoningEffort != nil {
+						if _, ok := policy.AllowedReasoningEffort[lower]; !ok && lower != "" {
+							warnings = append(warnings, warnDroppedParam("reasoning.effort", payload.Model, "unsupported value"))
+						} else {
+							reasoningParams.Effort = lower
+						}
+					} else {
+						reasoningParams.Effort = lower
+					}
 				}
 				if summary, ok := reasoning["summary"].(string); ok {
-					payload.Reasoning.Summary = &summary
+					reasoningParams.Summary = &summary
 				}
+				payload.Reasoning = reasoningParams
 			}
 		case "openai-responses.hosted_tools":
 			if tools, ok := value.([]ResponseTool); ok {
@@ -413,8 +513,39 @@ func (c *Client) applyProviderOptions(payload *ResponsesRequest, options map[str
 			if meta, ok := value.(map[string]any); ok {
 				payload.Metadata = meta
 			}
+		case "openai-responses.verbosity":
+			if val, ok := value.(string); ok {
+				if !policy.AllowVerbosity {
+					warnings = append(warnings, warnDroppedParam("verbosity", payload.Model, "not supported"))
+					continue
+				}
+				lower := strings.ToLower(val)
+				if policy.VerbosityOptions != nil {
+					if _, ok := policy.VerbosityOptions[lower]; !ok {
+						warnings = append(warnings, warnDroppedParam("verbosity", payload.Model, "unsupported value"))
+						continue
+					}
+				}
+				if payload.Text == nil {
+					payload.Text = &TextFormatParams{}
+				}
+				payload.Text.Verbosity = lower
+			}
+		case "openai-responses.temperature":
+			if temp, ok := value.(float64); ok {
+				if policy.AllowTemperature {
+					payload.Temperature = float32(temp)
+				} else {
+					warnings = append(warnings, warnDroppedParam("temperature", payload.Model, "not supported"))
+				}
+			}
+		case "openai-responses.max_output_tokens":
+			if val, err := toInt(value); err == nil {
+				payload.MaxOutputTokens = val
+			}
 		}
 	}
+	return warnings, nil
 }
 
 // doRequest makes an HTTP request to the API.
@@ -507,7 +638,7 @@ func (c *Client) doRequestSSE(ctx context.Context, method, path string, payload 
 }
 
 // consumeSSEStream processes the SSE stream and emits normalized events.
-func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, stream *core.Stream) {
+func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, stream *core.Stream, modelName string) {
 	defer body.Close()
 	defer stream.Close()
 
@@ -519,7 +650,6 @@ func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, strea
 	var reasoningBuilder strings.Builder
 	var usage core.Usage
 	var responseID string
-	var model string
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -573,7 +703,16 @@ func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, strea
 				}
 
 			case "response.reasoning_text.done":
-				// Reasoning summary event - would need to be added to core.StreamEvent if needed
+				var evt StreamEventReasoningDone
+				if err := json.Unmarshal([]byte(data), &evt); err == nil {
+					if evt.Summary != "" {
+						stream.Push(core.StreamEvent{
+							Type:             core.EventReasoningSummary,
+							ReasoningSummary: evt.Summary,
+							StreamID:         responseID,
+						})
+					}
+				}
 
 			case "response.tool_call":
 				var evt StreamEventToolCall
@@ -622,7 +761,7 @@ func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, strea
 
 	// Set final metadata
 	stream.SetMeta(core.StreamMeta{
-		Model:    model,
+		Model:    modelName,
 		Provider: "openai-responses",
 		Usage:    usage,
 	})
@@ -746,4 +885,28 @@ func schemaToMap(s *schema.Schema) map[string]any {
 	}
 
 	return result
+}
+
+func toInt(value any) (int, error) {
+	switch v := value.(type) {
+	case int:
+		return v, nil
+	case int32:
+		return int(v), nil
+	case int64:
+		return int(v), nil
+	case float32:
+		return int(v), nil
+	case float64:
+		return int(v), nil
+	case json.Number:
+		i, err := v.Int64()
+		return int(i), err
+	case string:
+		var num json.Number = json.Number(v)
+		i, err := num.Int64()
+		return int(i), err
+	default:
+		return 0, fmt.Errorf("invalid number type %T", value)
+	}
 }

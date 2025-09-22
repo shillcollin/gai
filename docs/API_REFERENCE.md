@@ -133,6 +133,8 @@ type Warning struct {
     Message string `json:"message"`
 }
 
+Warnings report non-fatal adjustments (for example, an unsupported parameter dropped for a model). They accompany both non-streaming results and streams via `TextResult.Warnings`, `ObjectResult.Warnings`, and `stream.Warnings()`.
+
 // TextResult represents a non-streaming text generation result
 type TextResult struct {
     Text         string        `json:"text"`
@@ -1356,6 +1358,7 @@ Each provider package exposes a `BuildProviderOptions` helper to construct the o
 import "github.com/shillcollin/gai/providers/openai"
 import "github.com/shillcollin/gai/providers/anthropic"
 import "github.com/shillcollin/gai/providers/gemini"
+import openairesponses "github.com/shillcollin/gai/providers/openai-responses"
 
 // OpenAI specific options using typed builders
 req := core.Request{
@@ -1382,6 +1385,15 @@ req := core.Request{
     ProviderOptions: gemini.BuildProviderOptions(
         gemini.WithGrounding("web"),
         gemini.WithThoughtSignatures("require"),
+    ),
+}
+
+// OpenAI Responses API options (GPT-5, o-series)
+req := core.Request{
+    Messages: msgs,
+    ProviderOptions: openairesponses.BuildProviderOptions(
+        openairesponses.WithReasoningEffort("medium"),
+        openairesponses.WithBackground(false),
     ),
 }
 ```

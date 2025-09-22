@@ -6,55 +6,55 @@ import (
 
 // ResponsesRequest represents a request to the OpenAI Responses API.
 type ResponsesRequest struct {
-	Model              string                 `json:"model"`
-	Input              any                    `json:"input"`                        // string | ResponseInputParam | []ResponseInputParam
-	Instructions       string                 `json:"instructions,omitempty"`      // System/developer instructions
-	Tools              []ResponseTool         `json:"tools,omitempty"`
-	PreviousResponseID string                 `json:"previous_response_id,omitempty"` // For stateful multi-turn
-	Stream             bool                   `json:"stream,omitempty"`
-	Background         bool                   `json:"background,omitempty"`         // Async mode
-	Reasoning          *ReasoningParams       `json:"reasoning,omitempty"`
-	Store              *bool                  `json:"store,omitempty"`              // Default: true
-	Metadata           map[string]any         `json:"metadata,omitempty"`
-	Text               *TextFormatParams      `json:"text,omitempty"`               // For structured outputs
-	Temperature        float32                `json:"temperature,omitempty"`
-	TopP               float32                `json:"top_p,omitempty"`
-	MaxOutputTokens    int                    `json:"max_output_tokens,omitempty"`
-	ToolChoice         string                 `json:"tool_choice,omitempty"`        // auto | none | required
+	Model              string            `json:"model"`
+	Input              any               `json:"input"`                  // string | ResponseInputParam | []ResponseInputParam
+	Instructions       string            `json:"instructions,omitempty"` // System/developer instructions
+	Tools              []ResponseTool    `json:"tools,omitempty"`
+	PreviousResponseID string            `json:"previous_response_id,omitempty"` // For stateful multi-turn
+	Stream             bool              `json:"stream,omitempty"`
+	Background         bool              `json:"background,omitempty"` // Async mode
+	Reasoning          *ReasoningParams  `json:"reasoning,omitempty"`
+	Store              *bool             `json:"store,omitempty"` // Default: true
+	Metadata           map[string]any    `json:"metadata,omitempty"`
+	Text               *TextFormatParams `json:"text,omitempty"` // For structured outputs
+	Temperature        float32           `json:"temperature,omitempty"`
+	TopP               float32           `json:"top_p,omitempty"`
+	MaxOutputTokens    int               `json:"max_output_tokens,omitempty"`
+	ToolChoice         string            `json:"tool_choice,omitempty"` // auto | none | required
 }
 
 // ActualResponsesResponse represents the actual response structure from the API
 type ActualResponsesResponse struct {
-	ID                 string                  `json:"id"`
-	Object             string                  `json:"object"`
-	CreatedAt          float64                 `json:"created_at"`
-	Status             string                  `json:"status"`
-	Background         bool                    `json:"background"`
-	Billing            *Billing                `json:"billing"`
-	Error              *ResponseError          `json:"error"`
-	IncompleteDetails  any                     `json:"incomplete_details"`
-	Instructions       *string                 `json:"instructions"`
-	MaxOutputTokens    *int                    `json:"max_output_tokens"`
-	MaxToolCalls       *int                    `json:"max_tool_calls"`
-	Model              string                  `json:"model"`
-	Output             []ActualResponseItem    `json:"output"`
-	ParallelToolCalls  bool                    `json:"parallel_tool_calls"`
-	PreviousResponseID *string                 `json:"previous_response_id"`
-	PromptCacheKey     *string                 `json:"prompt_cache_key"`
-	Reasoning          *ActualReasoning        `json:"reasoning"`
-	SafetyIdentifier   *string                 `json:"safety_identifier"`
-	ServiceTier        string                  `json:"service_tier"`
-	Store              bool                    `json:"store"`
-	Temperature        float32                 `json:"temperature"`
-	Text               *ActualTextFormat       `json:"text"`
-	ToolChoice         string                  `json:"tool_choice"`
-	Tools              []json.RawMessage       `json:"tools"`
-	TopLogprobs        int                     `json:"top_logprobs"`
-	TopP               float32                 `json:"top_p"`
-	Truncation         string                  `json:"truncation"`
-	Usage              *ActualUsage            `json:"usage"`
-	User               *string                 `json:"user"`
-	Metadata           map[string]any          `json:"metadata"`
+	ID                 string               `json:"id"`
+	Object             string               `json:"object"`
+	CreatedAt          float64              `json:"created_at"`
+	Status             string               `json:"status"`
+	Background         bool                 `json:"background"`
+	Billing            *Billing             `json:"billing"`
+	Error              *ResponseError       `json:"error"`
+	IncompleteDetails  any                  `json:"incomplete_details"`
+	Instructions       *string              `json:"instructions"`
+	MaxOutputTokens    *int                 `json:"max_output_tokens"`
+	MaxToolCalls       *int                 `json:"max_tool_calls"`
+	Model              string               `json:"model"`
+	Output             []ActualResponseItem `json:"output"`
+	ParallelToolCalls  bool                 `json:"parallel_tool_calls"`
+	PreviousResponseID *string              `json:"previous_response_id"`
+	PromptCacheKey     *string              `json:"prompt_cache_key"`
+	Reasoning          *ActualReasoning     `json:"reasoning"`
+	SafetyIdentifier   *string              `json:"safety_identifier"`
+	ServiceTier        string               `json:"service_tier"`
+	Store              bool                 `json:"store"`
+	Temperature        float32              `json:"temperature"`
+	Text               *ActualTextFormat    `json:"text"`
+	ToolChoice         string               `json:"tool_choice"`
+	Tools              []json.RawMessage    `json:"tools"`
+	TopLogprobs        int                  `json:"top_logprobs"`
+	TopP               float32              `json:"top_p"`
+	Truncation         string               `json:"truncation"`
+	Usage              *ActualUsage         `json:"usage"`
+	User               *string              `json:"user"`
+	Metadata           map[string]any       `json:"metadata"`
 }
 
 // Billing information
@@ -64,11 +64,11 @@ type Billing struct {
 
 // ActualResponseItem represents an actual output item
 type ActualResponseItem struct {
-	ID      string                `json:"id"`
-	Type    string                `json:"type"`
-	Status  string                `json:"status,omitempty"`
-	Content []ActualContentPart   `json:"content,omitempty"`
-	Role    string                `json:"role,omitempty"`
+	ID      string              `json:"id"`
+	Type    string              `json:"type"`
+	Status  string              `json:"status,omitempty"`
+	Content []ActualContentPart `json:"content,omitempty"`
+	Role    string              `json:"role,omitempty"`
 
 	// For tool calls
 	Name      string         `json:"name,omitempty"`
@@ -77,8 +77,8 @@ type ActualResponseItem struct {
 
 // ActualContentPart represents actual content structure
 type ActualContentPart struct {
-	Type        string           `json:"type"`
-	Text        string           `json:"text,omitempty"`
+	Type        string            `json:"type"`
+	Text        string            `json:"text,omitempty"`
 	Annotations []json.RawMessage `json:"annotations,omitempty"`
 	Logprobs    []json.RawMessage `json:"logprobs,omitempty"`
 }
@@ -102,11 +102,11 @@ type ActualFormat struct {
 
 // ActualUsage from the response
 type ActualUsage struct {
-	InputTokens        int                   `json:"input_tokens"`
-	InputTokensDetails *InputTokensDetails   `json:"input_tokens_details,omitempty"`
-	OutputTokens       int                   `json:"output_tokens"`
+	InputTokens         int                  `json:"input_tokens"`
+	InputTokensDetails  *InputTokensDetails  `json:"input_tokens_details,omitempty"`
+	OutputTokens        int                  `json:"output_tokens"`
 	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
-	TotalTokens        int                   `json:"total_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
 }
 
 // InputTokensDetails breakdown
@@ -123,8 +123,8 @@ type OutputTokensDetails struct {
 
 // ResponseInputParam represents a message in the input.
 type ResponseInputParam struct {
-	Role    string         `json:"role"` // user | developer | assistant | tool
-	Content []ContentPart  `json:"content"`
+	Role    string        `json:"role"` // user | developer | assistant | tool
+	Content []ContentPart `json:"content"`
 }
 
 // ContentPart represents different types of content in a message.
@@ -151,9 +151,10 @@ type ReasoningParams struct {
 
 // TextFormatParams controls structured output formatting.
 type TextFormatParams struct {
-	Format *TextFormat `json:"format,omitempty"`
-	Strict bool        `json:"strict,omitempty"`
-	Stop   []string    `json:"stop,omitempty"`
+	Format    *TextFormat `json:"format,omitempty"`
+	Strict    bool        `json:"strict,omitempty"`
+	Stop      []string    `json:"stop,omitempty"`
+	Verbosity string      `json:"verbosity,omitempty"`
 }
 
 // TextFormat specifies the format for structured outputs.
@@ -174,12 +175,12 @@ type ResponseTool struct {
 	Type string `json:"type"` // web_search | file_search | code_interpreter | image_generation | mcp | function
 
 	// For hosted tools
-	VectorStoreIDs  []string   `json:"vector_store_ids,omitempty"`  // file_search
-	Container       *Container `json:"container,omitempty"`         // code_interpreter
-	Model           string     `json:"model,omitempty"`             // image_generation
-	ServerLabel     string     `json:"server_label,omitempty"`      // mcp
-	ServerURL       string     `json:"server_url,omitempty"`        // mcp
-	RequireApproval string     `json:"require_approval,omitempty"`  // mcp: never | always | auto
+	VectorStoreIDs  []string   `json:"vector_store_ids,omitempty"` // file_search
+	Container       *Container `json:"container,omitempty"`        // code_interpreter
+	Model           string     `json:"model,omitempty"`            // image_generation
+	ServerLabel     string     `json:"server_label,omitempty"`     // mcp
+	ServerURL       string     `json:"server_url,omitempty"`       // mcp
+	RequireApproval string     `json:"require_approval,omitempty"` // mcp: never | always | auto
 
 	// For custom function tools
 	Name        string         `json:"name,omitempty"`

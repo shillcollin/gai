@@ -44,6 +44,7 @@ func GenerateObjectTyped[T any](ctx context.Context, p Provider, req Request, op
 		Model:    raw.Model,
 		Provider: raw.Provider,
 		Usage:    raw.Usage,
+		Warnings: append([]Warning(nil), raw.Warnings...),
 	}, nil
 }
 
