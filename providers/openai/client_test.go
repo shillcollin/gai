@@ -65,7 +65,7 @@ func TestGenerateText(t *testing.T) {
 
 func TestStreamText(t *testing.T) {
 	events := "data: {\"id\":\"chatcmpl\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"Hel\"}]}}]}\n\n" +
-		"data: {\"id\":\"chatcmpl\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"lo\"}]},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"id\":\"chatcmpl\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"lo\"}]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n" +
 		"data: [DONE]\n\n"
 
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -97,5 +97,9 @@ func TestStreamText(t *testing.T) {
 	}
 	if output != "Hello" {
 		t.Fatalf("unexpected streamed text: %s", output)
+	}
+	meta := stream.Meta()
+	if meta.Usage.TotalTokens != 15 || meta.Usage.InputTokens != 12 || meta.Usage.OutputTokens != 3 {
+		t.Fatalf("unexpected usage: %+v", meta.Usage)
 	}
 }

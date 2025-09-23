@@ -237,6 +237,9 @@ func (c *Client) buildChatPayload(req core.Request, stream bool) (*chatCompletio
 		Messages: messages,
 		Stream:   stream,
 	}
+	if stream {
+		payload.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
 	warnings := make([]core.Warning, 0, 2)
 
 	if req.MaxTokens > 0 {
@@ -330,6 +333,9 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 		name string
 	}
 	toolAcc := make(map[int]*toolAccumulator)
+	lastUsage := core.Usage{}
+	finalModel := c.opts.model
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -363,7 +369,8 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 					Provider:  "openai",
 				})
 			}
-			stream.Push(core.StreamEvent{Type: core.EventFinish, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq, StreamID: "stream"})
+			stream.Push(core.StreamEvent{Type: core.EventFinish, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq, StreamID: "stream", Model: finalModel, Provider: "openai", Usage: lastUsage})
+			stream.SetMeta(core.StreamMeta{Model: finalModel, Provider: "openai", Usage: lastUsage})
 			return
 		}
 		seq++
@@ -371,6 +378,13 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 		if err := json.Unmarshal([]byte(data), &delta); err != nil {
 			stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq})
 			continue
+		}
+		if delta.Model != "" {
+			finalModel = delta.Model
+		}
+		if delta.Usage != nil {
+			lastUsage = delta.Usage.toCore()
+			stream.SetMeta(core.StreamMeta{Model: finalModel, Provider: "openai", Usage: lastUsage})
 		}
 		if len(delta.Choices) == 0 {
 			continue
@@ -425,7 +439,8 @@ func (c *Client) consumeStream(ctx context.Context, body io.ReadCloser, stream *
 			}
 		}
 		if choice.FinishReason != "" {
-			stream.Push(core.StreamEvent{Type: core.EventFinish, FinishReason: &core.StopReason{Type: choice.FinishReason}, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq, StreamID: delta.ID, Model: delta.Model, Provider: "openai"})
+			stream.Push(core.StreamEvent{Type: core.EventFinish, FinishReason: &core.StopReason{Type: choice.FinishReason}, Timestamp: time.Now(), Schema: "gai.events.v1", Seq: seq, StreamID: delta.ID, Model: delta.Model, Provider: "openai", Usage: lastUsage})
+			stream.SetMeta(core.StreamMeta{Model: delta.Model, Provider: "openai", Usage: lastUsage})
 		}
 	}
 	if err := scanner.Err(); err != nil {

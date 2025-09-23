@@ -1,0 +1,723 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shillcollin/gai/core"
+	"github.com/shillcollin/gai/obs"
+	"github.com/shillcollin/gai/providers/anthropic"
+	"github.com/shillcollin/gai/providers/gemini"
+	"github.com/shillcollin/gai/providers/openai"
+	openairesponses "github.com/shillcollin/gai/providers/openai-responses"
+	"github.com/shillcollin/gai/runner"
+	"github.com/shillcollin/gai/tools"
+	"go/ast"
+	"go/parser"
+	"go/token"
+)
+
+type providerEntry struct {
+	Name    string
+	Label   string
+	Models  []string
+	Default string
+	Client  core.Provider
+}
+
+type providerOption struct {
+	entry *providerEntry
+	model string
+}
+
+type toolTranscript struct {
+	StepID int
+	Call   core.ToolCall
+	Result core.ToolResult
+}
+
+type conversation struct {
+	reader         *bufio.Reader
+	providers      []*providerEntry
+	current        *providerEntry
+	currentModel   string
+	runner         *runner.Runner
+	toolHandle     core.ToolHandle
+	messages       []core.Message
+	conversationID string
+	turn           int
+}
+
+func main() {
+	if err := loadDotEnv(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "failed to load .env: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	shutdownObs, err := initObservability(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "observability init error: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if shutdownObs != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownObs(shutdownCtx); err != nil {
+				fmt.Fprintf(os.Stderr, "observability shutdown error: %v\n", err)
+			}
+		}
+	}()
+
+	providers, err := buildProviders()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if len(providers) == 0 {
+		fmt.Fprintln(os.Stderr, "no providers configured; ensure API keys are present in environment")
+		os.Exit(1)
+	}
+
+	calcTool := newCalculatorTool()
+
+	conv := &conversation{
+		reader:         bufio.NewReader(os.Stdin),
+		providers:      providers,
+		current:        providers[0],
+		currentModel:   providers[0].Default,
+		runner:         newRunner(providers[0].Client),
+		toolHandle:     calcTool,
+		messages:       make([]core.Message, 0, 32),
+		conversationID: uuid.NewString(),
+	}
+
+	fmt.Println("gai CLI — type 'model' to switch provider/model, Ctrl+C to exit.")
+	fmt.Printf("Current provider: %s (%s)\n\n", conv.current.Label, conv.currentModel)
+
+	for {
+		fmt.Print("You: ")
+		text, err := conv.readLine()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				fmt.Println()
+				return
+			}
+			fmt.Fprintf(os.Stderr, "read error: %v\n", err)
+			continue
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		if strings.EqualFold(text, "model") || text == "/" {
+			if err := conv.pickModel(); err != nil {
+				fmt.Fprintf(os.Stderr, "model selection error: %v\n", err)
+			}
+			continue
+		}
+
+		if err := conv.processTurn(ctx, text); err != nil {
+			fmt.Fprintf(os.Stderr, "turn error: %v\n", err)
+		}
+	}
+}
+
+func (c *conversation) readLine() (string, error) {
+	line, err := c.reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func (c *conversation) processTurn(ctx context.Context, userInput string) error {
+	userMsg := core.UserMessage(core.TextPart(userInput))
+	c.messages = append(c.messages, userMsg)
+
+	req := core.Request{
+		Model:           c.currentModel,
+		Messages:        append([]core.Message(nil), c.messages...),
+		Tools:           []core.ToolHandle{c.toolHandle},
+		ToolChoice:      core.ToolChoiceAuto,
+		StopWhen:        core.NoMoreTools(),
+		Metadata:        map[string]any{"conversation_id": c.conversationID, "turn": c.turn + 1},
+		ProviderOptions: map[string]any{},
+	}
+
+	turnID := uuid.NewString()
+	start := time.Now()
+	stream, err := c.runner.StreamRequest(ctx, req)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	textByStep := make(map[int]*strings.Builder)
+	var lastStepID int
+	var reasoningBuilder strings.Builder
+	var toolRecords []toolTranscript
+	toolByID := make(map[string]int)
+
+	for event := range stream.Events() {
+		if event.StepID > lastStepID {
+			lastStepID = event.StepID
+		}
+		switch event.Type {
+		case core.EventReasoningDelta, core.EventReasoningSummary:
+			appendReasoning(&reasoningBuilder, event.ReasoningDelta, event.ReasoningSummary)
+		case core.EventTextDelta:
+			b := textByStep[event.StepID]
+			if b == nil {
+				b = &strings.Builder{}
+				textByStep[event.StepID] = b
+			}
+			b.WriteString(event.TextDelta)
+		case core.EventToolCall:
+			idx := len(toolRecords)
+			toolRecords = append(toolRecords, toolTranscript{StepID: event.StepID, Call: event.ToolCall})
+			toolByID[event.ToolCall.ID] = idx
+			printToolCall(event.ToolCall)
+		case core.EventToolResult:
+			result := event.ToolResult
+			if idx, ok := toolByID[result.ID]; ok {
+				toolRecords[idx].Result = result
+			} else {
+				toolRecords = append(toolRecords, toolTranscript{StepID: event.StepID, Result: result})
+			}
+			printToolResult(result)
+		}
+	}
+
+	if err := stream.Err(); err != nil && !errors.Is(err, core.ErrStreamClosed) {
+		return err
+	}
+
+	finalText := strings.TrimSpace(builderTextForStep(textByStep, lastStepID))
+	if finalText == "" {
+		finalText = "(no assistant response)"
+	}
+
+	for _, rec := range toolRecords {
+		if rec.Call.Name != "" {
+			c.messages = append(c.messages, core.Message{Role: core.Assistant, Parts: []core.Part{rec.Call}})
+		}
+		if rec.Result.Name != "" || rec.Result.Result != nil || rec.Result.Error != "" {
+			c.messages = append(c.messages, core.Message{Role: core.User, Parts: []core.Part{rec.Result}})
+		}
+	}
+
+	assistantMsg := core.AssistantMessage(finalText)
+	c.messages = append(c.messages, assistantMsg)
+
+	elapsed := time.Since(start)
+	meta := stream.Meta()
+
+	fmt.Println()
+	if reasoningBuilder.Len() > 0 {
+		fmt.Println("[Reasoning]")
+		fmt.Println(strings.TrimSpace(reasoningBuilder.String()))
+		fmt.Println()
+	}
+	if len(toolRecords) > 0 {
+		fmt.Println("[Tools]")
+		for _, rec := range toolRecords {
+			if rec.Call.Name != "" {
+				inputJSON := mustJSON(rec.Call.Input)
+				fmt.Printf("- %s input: %s\n", rec.Call.Name, inputJSON)
+			}
+			if rec.Result.Name != "" {
+				outputJSON := mustJSON(rec.Result.Result)
+				if rec.Result.Error != "" {
+					fmt.Printf("  error: %s\n", rec.Result.Error)
+				} else {
+					fmt.Printf("  output: %s\n", outputJSON)
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Assistant (%s / %s):\n%s\n\n", c.current.Label, c.currentModel, finalText)
+	fmt.Printf("Usage: input=%d output=%d total=%d (%.2fs)\n\n", meta.Usage.InputTokens, meta.Usage.OutputTokens, meta.Usage.TotalTokens, elapsed.Seconds())
+
+	obs.LogCompletion(ctx, obs.Completion{
+		Provider:     c.current.Name,
+		Model:        c.currentModel,
+		RequestID:    turnID,
+		Input:        obs.MessagesFromCore(c.messages),
+		Output:       obs.MessageFromCore(core.AssistantMessage(finalText)),
+		Usage:        obs.UsageFromCore(meta.Usage),
+		LatencyMS:    elapsed.Milliseconds(),
+		Metadata:     map[string]any{"conversation_id": c.conversationID, "turn": c.turn + 1},
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	c.turn++
+	fmt.Printf("Current provider: %s (%s)\n\n", c.current.Label, c.currentModel)
+	return nil
+}
+
+func appendReasoning(builder *strings.Builder, delta, summary string) {
+	text := delta
+	if text == "" {
+		text = summary
+	}
+	if text == "" {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteString(" ")
+	}
+	builder.WriteString(strings.TrimSpace(text))
+}
+
+func builderTextForStep(m map[int]*strings.Builder, step int) string {
+	if b := m[step]; b != nil {
+		return b.String()
+	}
+	var maxStep int
+	for s := range m {
+		if s > maxStep {
+			maxStep = s
+		}
+	}
+	if b := m[maxStep]; b != nil {
+		return b.String()
+	}
+	return ""
+}
+
+func printToolCall(call core.ToolCall) {
+	inputJSON := mustJSON(call.Input)
+	fmt.Printf("[Tool call] %s -> %s\n", call.Name, inputJSON)
+}
+
+func printToolResult(result core.ToolResult) {
+	if result.Error != "" {
+		fmt.Printf("[Tool error] %s: %s\n", result.Name, result.Error)
+		return
+	}
+	outputJSON := mustJSON(result.Result)
+	fmt.Printf("[Tool result] %s -> %s\n", result.Name, outputJSON)
+}
+
+func mustJSON(v any) string {
+	if v == nil {
+		return "null"
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("<unserializable: %v>", err)
+	}
+	return string(data)
+}
+
+func (c *conversation) pickModel() error {
+	options := c.providerOptions()
+	if len(options) == 0 {
+		fmt.Println()
+		fmt.Println("No providers available.")
+		fmt.Println()
+		return nil
+	}
+
+	if !isTerminal(int(os.Stdin.Fd())) {
+		return c.pickModelNumeric(options)
+	}
+
+	fd := int(os.Stdin.Fd())
+	state, err := enableRaw(fd)
+	if err != nil {
+		return c.pickModelNumeric(options)
+	}
+	defer restoreTerm(fd, state)
+
+	hideCursor()
+	defer showCursor()
+
+	fmt.Println()
+	fmt.Println("Select provider/model (↑/↓ then Enter, q to cancel):")
+
+	index := c.currentOptionIndex(options)
+	renderModelMenu(options, index, true)
+
+	for {
+		b, err := readByte()
+		if err != nil {
+			fmt.Println()
+			return err
+		}
+		switch b {
+		case '\r', '\n':
+			clearModelMenu(len(options))
+			fmt.Println()
+			return c.applyModelSelection(options[index])
+		case 'q', 'Q':
+			clearModelMenu(len(options))
+			fmt.Println("Selection cancelled.")
+			fmt.Println()
+			return nil
+		case 27:
+			next, err := readByte()
+			if err != nil {
+				clearModelMenu(len(options))
+				fmt.Println()
+				return err
+			}
+			if next != '[' {
+				clearModelMenu(len(options))
+				fmt.Println("Selection cancelled.")
+				fmt.Println()
+				return nil
+			}
+			arrow, err := readByte()
+			if err != nil {
+				clearModelMenu(len(options))
+				fmt.Println()
+				return err
+			}
+			switch arrow {
+			case 'A':
+				if index > 0 {
+					index--
+					renderModelMenu(options, index, false)
+				}
+			case 'B':
+				if index < len(options)-1 {
+					index++
+					renderModelMenu(options, index, false)
+				}
+			}
+		}
+	}
+}
+
+func (c *conversation) providerOptions() []providerOption {
+	options := make([]providerOption, 0)
+	for _, p := range c.providers {
+		models := p.Models
+		if len(models) == 0 {
+			models = []string{p.Default}
+		}
+		for _, m := range models {
+			options = append(options, providerOption{entry: p, model: m})
+		}
+	}
+	return options
+}
+
+func (c *conversation) currentOptionIndex(options []providerOption) int {
+	for i, opt := range options {
+		if opt.entry == c.current && opt.model == c.currentModel {
+			return i
+		}
+	}
+	return 0
+}
+
+func (c *conversation) applyModelSelection(opt providerOption) error {
+	if c.current != opt.entry {
+		c.current = opt.entry
+		c.runner = newRunner(opt.entry.Client)
+	}
+	c.currentModel = opt.model
+	fmt.Printf("Switched to %s (%s).\n\n", opt.entry.Label, opt.model)
+	return nil
+}
+
+func (c *conversation) pickModelNumeric(options []providerOption) error {
+	fmt.Println()
+	fmt.Println("Available providers/models:")
+	for i, opt := range options {
+		fmt.Printf("%d) %s — %s\n", i+1, opt.entry.Label, opt.model)
+	}
+	fmt.Print("Select option (or blank to cancel): ")
+	line, err := c.readLine()
+	if err != nil {
+		return err
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		fmt.Println("Selection cancelled.")
+		fmt.Println()
+		return nil
+	}
+	index, err := strconv.Atoi(line)
+	if err != nil || index < 1 || index > len(options) {
+		return fmt.Errorf("invalid selection")
+	}
+	fmt.Println()
+	return c.applyModelSelection(options[index-1])
+}
+
+func renderModelMenu(options []providerOption, index int, first bool) {
+	if !first {
+		fmt.Printf("\x1b[%dF", len(options))
+	}
+	for i, opt := range options {
+		marker := " "
+		if i == index {
+			marker = ">"
+		}
+		fmt.Printf("\x1b[2K%s %s — %s\n", marker, opt.entry.Label, opt.model)
+	}
+}
+
+func clearModelMenu(lines int) {
+	fmt.Printf("\x1b[%dF\x1b[J", lines+1)
+}
+
+func readByte() (byte, error) {
+	var buf [1]byte
+	_, err := os.Stdin.Read(buf[:])
+	if err != nil {
+		return 0, err
+	}
+	return buf[0], nil
+}
+
+func hideCursor() {
+	fmt.Print("\x1b[?25l")
+}
+
+func showCursor() {
+	fmt.Print("\x1b[?25h")
+}
+
+func loadDotEnv() error {
+	paths := []string{".env", filepath.Join("ent", ".env"), filepath.Join("ent", "backend", ".env")}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
+			if os.Getenv(key) == "" {
+				_ = os.Setenv(key, val)
+			}
+		}
+		return nil
+	}
+	return os.ErrNotExist
+}
+
+func initObservability(ctx context.Context) (func(context.Context) error, error) {
+	opts := obs.DefaultOptions()
+	opts.ServiceName = "gai-cli"
+	if eps := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); eps != "" {
+		opts.Endpoint = eps
+	}
+	if os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true" {
+		opts.Insecure = true
+	}
+	btKey := os.Getenv("BRAINTRUST_API_KEY")
+	if btKey == "" {
+		return nil, fmt.Errorf("BRAINTRUST_API_KEY must be set to log completions")
+	}
+	opts.Braintrust.Enabled = true
+	opts.Braintrust.APIKey = btKey
+	opts.Braintrust.Project = os.Getenv("BRAINTRUST_PROJECT_NAME")
+	opts.Braintrust.ProjectID = os.Getenv("BRAINTRUST_PROJECT_ID")
+	opts.Braintrust.Dataset = os.Getenv("BRAINTRUST_DATASET")
+	if opts.Braintrust.Project == "" && opts.Braintrust.ProjectID == "" {
+		return nil, fmt.Errorf("set BRAINTRUST_PROJECT_NAME or BRAINTRUST_PROJECT_ID")
+	}
+	return obs.Init(ctx, opts)
+}
+
+func buildProviders() ([]*providerEntry, error) {
+	providers := make([]*providerEntry, 0, 4)
+
+	if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
+		client := openai.New(
+			openai.WithAPIKey(key),
+			openai.WithModel("gpt-4.1-mini"),
+		)
+		providers = append(providers, &providerEntry{
+			Name:    "openai",
+			Label:   "OpenAI Chat",
+			Models:  []string{"gpt-4.1-mini", "gpt-4.1", "gpt-4o"},
+			Default: "gpt-4.1-mini",
+			Client:  client,
+		})
+		respClient := openairesponses.New(
+			openairesponses.WithAPIKey(key),
+			openairesponses.WithModel("o4-mini"),
+		)
+		providers = append(providers, &providerEntry{
+			Name:    "openai-responses",
+			Label:   "OpenAI Responses",
+			Models:  []string{"o4-mini", "o4", "gpt-4.1-mini"},
+			Default: "o4-mini",
+			Client:  respClient,
+		})
+	}
+
+	if key := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); key != "" {
+		client := anthropic.New(
+			anthropic.WithAPIKey(key),
+			anthropic.WithModel("claude-3-7-sonnet-20250219"),
+		)
+		providers = append(providers, &providerEntry{
+			Name:    "anthropic",
+			Label:   "Anthropic",
+			Models:  []string{"claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"},
+			Default: "claude-3-7-sonnet-20250219",
+			Client:  client,
+		})
+	}
+
+	if key := strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")); key != "" {
+		client := gemini.New(
+			gemini.WithAPIKey(key),
+			gemini.WithModel("gemini-2.5-pro"),
+		)
+		providers = append(providers, &providerEntry{
+			Name:    "gemini",
+			Label:   "Gemini",
+			Models:  []string{"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"},
+			Default: "gemini-2.5-pro",
+			Client:  client,
+		})
+	}
+
+	if len(providers) == 0 {
+		return nil, fmt.Errorf("no providers initialised; set API keys in environment")
+	}
+	return providers, nil
+}
+
+func newRunner(p core.Provider) *runner.Runner {
+	return runner.New(
+		p,
+		runner.WithMaxParallel(4),
+		runner.WithToolTimeout(10*time.Second),
+		runner.WithOnToolError(runner.ToolErrorAppendAndContinue),
+	)
+}
+
+func newCalculatorTool() core.ToolHandle {
+	type calcInput struct {
+		Expression string `json:"expression"`
+	}
+	type calcOutput struct {
+		Result float64 `json:"result"`
+	}
+	tool := tools.New[calcInput, calcOutput]("calculator", "Evaluate arithmetic expressions", func(ctx context.Context, in calcInput, meta core.ToolMeta) (calcOutput, error) {
+		if strings.TrimSpace(in.Expression) == "" {
+			return calcOutput{}, fmt.Errorf("expression required")
+		}
+		value, err := evaluateExpression(in.Expression)
+		if err != nil {
+			return calcOutput{}, err
+		}
+		return calcOutput{Result: value}, nil
+	})
+	return tools.NewCoreAdapter(tool)
+}
+
+func evaluateExpression(expr string) (float64, error) {
+	parsed, err := parser.ParseExpr(expr)
+	if err != nil {
+		return 0, err
+	}
+	return evalNode(parsed)
+}
+
+func evalNode(node ast.Expr) (float64, error) {
+	switch n := node.(type) {
+	case *ast.BasicLit:
+		switch n.Kind {
+		case token.INT:
+			v, err := strconv.ParseInt(n.Value, 10, 64)
+			if err != nil {
+				return 0, err
+			}
+			return float64(v), nil
+		case token.FLOAT:
+			v, err := strconv.ParseFloat(n.Value, 64)
+			if err != nil {
+				return 0, err
+			}
+			return v, nil
+		default:
+			return 0, fmt.Errorf("unsupported literal: %s", n.Value)
+		}
+	case *ast.ParenExpr:
+		return evalNode(n.X)
+	case *ast.UnaryExpr:
+		val, err := evalNode(n.X)
+		if err != nil {
+			return 0, err
+		}
+		switch n.Op {
+		case token.ADD:
+			return val, nil
+		case token.SUB:
+			return -val, nil
+		default:
+			return 0, fmt.Errorf("unsupported unary operator: %s", n.Op)
+		}
+	case *ast.BinaryExpr:
+		left, err := evalNode(n.X)
+		if err != nil {
+			return 0, err
+		}
+		right, err := evalNode(n.Y)
+		if err != nil {
+			return 0, err
+		}
+		switch n.Op {
+		case token.ADD:
+			return left + right, nil
+		case token.SUB:
+			return left - right, nil
+		case token.MUL:
+			return left * right, nil
+		case token.QUO:
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return left / right, nil
+		case token.REM:
+			if right == 0 {
+				return 0, fmt.Errorf("modulo by zero")
+			}
+			return math.Mod(left, right), nil
+		default:
+			return 0, fmt.Errorf("unsupported operator: %s", n.Op)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported expression")
+	}
+}

@@ -45,7 +45,8 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (_ *core.Te
 		recorder.End(err, usageTokens)
 	}()
 
-	payload, err := buildRequest(req)
+	model := chooseModel(req.Model, c.opts.model)
+	payload, err := buildRequest(req, model)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +70,7 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (_ *core.Te
 	}
 	return &core.TextResult{
 		Text:         text,
-		Model:        chooseModel(req.Model, c.opts.model),
+		Model:        model,
 		Provider:     "gemini",
 		FinishReason: core.StopReason{Type: resp.Candidates[0].FinishReason},
 	}, nil
@@ -80,7 +81,8 @@ func (c *Client) StreamText(ctx context.Context, req core.Request) (*core.Stream
 		attribute.String("ai.provider", "gemini"),
 		attribute.String("ai.operation", "streamGenerateContent"),
 	)
-	payload, err := buildRequest(req)
+	model := chooseModel(req.Model, c.opts.model)
+	payload, err := buildRequest(req, model)
 	if err != nil {
 		recorder.End(err, obs.UsageTokens{})
 		return nil, err
@@ -159,7 +161,7 @@ func (c *Client) doRequest(ctx context.Context, payload *geminiRequest, stream b
 	return resp.Body, nil
 }
 
-func buildRequest(req core.Request) (*geminiRequest, error) {
+func buildRequest(req core.Request, model string) (*geminiRequest, error) {
 	contents, err := convertMessages(req.Messages)
 	if err != nil {
 		return nil, err
@@ -168,7 +170,7 @@ func buildRequest(req core.Request) (*geminiRequest, error) {
 		return nil, errors.New("gemini: request requires messages")
 	}
 	return &geminiRequest{
-		Model:    req.Model,
+		Model:    model,
 		Contents: contents,
 		GenerationConfig: geminiGenerationConfig{
 			Temperature:     req.Temperature,
@@ -186,6 +188,12 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
 	seq := 0
+	var buffer strings.Builder
+
+	flushBuffer := func() {
+		buffer.Reset()
+	}
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -194,19 +202,46 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 		if strings.HasPrefix(line, "data:") {
 			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
-		seq++
 		if line == "[DONE]" {
+			seq++
 			stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+			flushBuffer()
 			break
 		}
+		if buffer.Len() > 0 {
+			buffer.WriteByte('\n')
+		}
+		buffer.WriteString(line)
+
 		var resp geminiStreamResponse
-		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now()})
+		if err := json.Unmarshal([]byte(buffer.String()), &resp); err != nil {
+			if strings.Contains(err.Error(), "unexpected end of JSON input") {
+				continue
+			}
+			if strings.Contains(err.Error(), "cannot unmarshal array") {
+				var respArr []geminiStreamResponse
+				if errArr := json.Unmarshal([]byte(buffer.String()), &respArr); errArr == nil {
+					for _, item := range respArr {
+						seq++
+						if text := item.JoinText(); text != "" {
+							stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+						}
+					}
+					flushBuffer()
+					continue
+				}
+			}
+			seq++
+			stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+			flushBuffer()
 			continue
 		}
+
+		seq++
 		if text := resp.JoinText(); text != "" {
 			stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
 		}
+		flushBuffer()
 	}
 	if err := scanner.Err(); err != nil {
 		stream.Fail(err)
@@ -215,7 +250,39 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 
 func convertMessages(messages []core.Message) ([]geminiContent, error) {
 	contents := make([]geminiContent, 0, len(messages))
+	var systemBuffer strings.Builder
+
+	appendContent := func(role string, parts []geminiPart) {
+		if len(parts) == 0 {
+			return
+		}
+		contents = append(contents, geminiContent{Role: role, Parts: parts})
+	}
+
 	for _, message := range messages {
+		// Collect system instructions separately.
+		if message.Role == core.System {
+			for _, part := range message.Parts {
+				if text, ok := part.(core.Text); ok {
+					if systemBuffer.Len() > 0 {
+						systemBuffer.WriteString("\n")
+					}
+					systemBuffer.WriteString(text.Text)
+				}
+			}
+			continue
+		}
+
+		role := "user"
+		switch message.Role {
+		case core.User:
+			role = "user"
+		case core.Assistant:
+			role = "model"
+		default:
+			role = "user"
+		}
+
 		parts := make([]geminiPart, 0, len(message.Parts))
 		for _, part := range message.Parts {
 			switch p := part.(type) {
@@ -225,8 +292,18 @@ func convertMessages(messages []core.Message) ([]geminiContent, error) {
 				return nil, fmt.Errorf("unsupported gemini part type %T", part)
 			}
 		}
-		contents = append(contents, geminiContent{Role: string(message.Role), Parts: parts})
+		appendContent(role, parts)
 	}
+
+	if systemBuffer.Len() > 0 {
+		systemPart := geminiPart{Text: systemBuffer.String()}
+		if len(contents) > 0 && contents[0].Role == "user" {
+			contents[0].Parts = append([]geminiPart{systemPart}, contents[0].Parts...)
+		} else {
+			contents = append([]geminiContent{{Role: "user", Parts: []geminiPart{systemPart}}}, contents...)
+		}
+	}
+
 	return contents, nil
 }
 

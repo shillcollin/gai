@@ -367,11 +367,22 @@ func (c *Client) convertMessages(messages []core.Message) (any, string) {
 
 		// Convert parts
 		var content []ContentPart
+		contentType := "input_text"
+		switch msg.Role {
+		case core.Assistant:
+			contentType = "output_text"
+		case core.User:
+			contentType = "input_text"
+		default:
+			if role == "tool" {
+				contentType = "output_text"
+			}
+		}
 		for _, part := range msg.Parts {
 			switch p := part.(type) {
 			case core.Text:
 				content = append(content, ContentPart{
-					Type: "input_text",
+					Type: contentType,
 					Text: p.Text,
 				})
 			case core.Image:

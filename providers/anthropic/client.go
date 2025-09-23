@@ -149,9 +149,8 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*anthropicRequest,
 		TopP:        req.TopP,
 		System:      systemPrompt,
 	}
-	if len(req.Messages) > 0 {
-		payload.Metadata = req.Metadata
-	}
+	// Anthropic rejects arbitrary metadata keys ("...: Extra inputs are not permitted").
+	// Omit metadata to preserve compatibility until official guidance changes.
 	return payload, nil
 }
 

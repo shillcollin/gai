@@ -16,6 +16,7 @@ type chatCompletionRequest struct {
 	TopP                float32            `json:"top_p,omitempty"`
 	TopK                int                `json:"top_k,omitempty"`
 	Stream              bool               `json:"stream,omitempty"`
+	StreamOptions       *streamOptions     `json:"stream_options,omitempty"`
 	Tools               []openAITool       `json:"tools,omitempty"`
 	ToolChoice          any                `json:"tool_choice,omitempty"`
 	PresencePenalty     float32            `json:"presence_penalty,omitempty"`
@@ -27,6 +28,10 @@ type chatCompletionRequest struct {
 	Stop                []string           `json:"stop,omitempty"`
 	SafetySettings      map[string]any     `json:"safety_settings,omitempty"`
 	ReasoningEffort     string             `json:"reasoning_effort,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type openAIMessage struct {
@@ -94,6 +99,7 @@ type streamDelta struct {
 	Model   string              `json:"model"`
 	Seq     int                 `json:"created"`
 	Choices []streamDeltaChoice `json:"choices"`
+	Usage   *openAIUsage        `json:"usage,omitempty"`
 }
 
 type streamDeltaChoice struct {
