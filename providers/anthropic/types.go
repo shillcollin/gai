@@ -15,6 +15,8 @@ type anthropicRequest struct {
 	Temperature float32            `json:"temperature,omitempty"`
 	TopP        float32            `json:"top_p,omitempty"`
 	Metadata    map[string]any     `json:"metadata,omitempty"`
+	Tools       []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice  any                `json:"tool_choice,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -23,8 +25,22 @@ type anthropicMessage struct {
 }
 
 type anthropicContent struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type      string                `json:"type"`
+	Text      string                `json:"text,omitempty"`
+	Source    *anthropicImageSource `json:"source,omitempty"`
+	Name      string                `json:"name,omitempty"`
+	ID        string                `json:"id,omitempty"`
+	Input     map[string]any        `json:"input,omitempty"`
+	ToolUseID string                `json:"tool_use_id,omitempty"`
+	Content   any                   `json:"content,omitempty"`
+	IsError   bool                  `json:"is_error,omitempty"`
+}
+
+type anthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 type anthropicResponse struct {
@@ -40,11 +56,19 @@ type anthropicUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+type anthropicTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"input_schema"`
+}
+
 type anthropicContentDelta struct {
 	Model string `json:"model"`
+	Index int    `json:"index"`
 	Delta struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type        string `json:"type"`
+		Text        string `json:"text,omitempty"`
+		PartialJSON string `json:"partial_json,omitempty"`
 	} `json:"delta"`
 }
 
@@ -54,6 +78,15 @@ type anthropicMessageDelta struct {
 	Delta struct {
 		StopReason *string `json:"stop_reason"`
 	} `json:"delta"`
+}
+
+type anthropicContentBlockStart struct {
+	Index        int              `json:"index"`
+	ContentBlock anthropicContent `json:"content_block"`
+}
+
+type anthropicContentBlockStop struct {
+	Index int `json:"index"`
 }
 
 func (r anthropicResponse) JoinText() string {

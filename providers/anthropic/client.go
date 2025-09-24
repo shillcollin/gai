@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/internal/httpclient"
 	"github.com/shillcollin/gai/obs"
+	"github.com/shillcollin/gai/schema"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -149,6 +151,21 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*anthropicRequest,
 		TopP:        req.TopP,
 		System:      systemPrompt,
 	}
+	if len(req.Tools) > 0 {
+		tools, err := convertTools(req.Tools)
+		if err != nil {
+			return nil, err
+		}
+		payload.Tools = tools
+		switch req.ToolChoice {
+		case core.ToolChoiceNone:
+			payload.ToolChoice = map[string]string{"type": "none"}
+		case core.ToolChoiceRequired:
+			payload.ToolChoice = map[string]string{"type": "any"}
+		default:
+			payload.ToolChoice = map[string]string{"type": "auto"}
+		}
+	}
 	// Anthropic rejects arbitrary metadata keys ("...: Extra inputs are not permitted").
 	// Omit metadata to preserve compatibility until official guidance changes.
 	return payload, nil
@@ -192,6 +209,13 @@ func (c *Client) consumeStream(body io.ReadCloser, stream *core.Stream) {
 	usage := anthropicUsage{}
 	var finishReason string
 	var model string
+	type toolAccumulator struct {
+		id     string
+		name   string
+		input  map[string]any
+		buffer strings.Builder
+	}
+	toolBlocks := map[int]*toolAccumulator{}
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event:") {
@@ -204,6 +228,20 @@ func (c *Client) consumeStream(body io.ReadCloser, stream *core.Stream) {
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		seq++
 		switch currentEvent {
+		case "content_block_start":
+			var start anthropicContentBlockStart
+			if err := json.Unmarshal([]byte(data), &start); err != nil {
+				stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic"})
+				continue
+			}
+			if start.ContentBlock.Type == "tool_use" {
+				acc := &toolAccumulator{
+					id:    start.ContentBlock.ID,
+					name:  start.ContentBlock.Name,
+					input: start.ContentBlock.Input,
+				}
+				toolBlocks[start.Index] = acc
+			}
 		case "content_block_delta":
 			var delta anthropicContentDelta
 			if err := json.Unmarshal([]byte(data), &delta); err != nil {
@@ -213,8 +251,52 @@ func (c *Client) consumeStream(body io.ReadCloser, stream *core.Stream) {
 			if delta.Model != "" {
 				model = delta.Model
 			}
-			if delta.Delta.Text != "" {
-				stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: delta.Delta.Text, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic", Model: delta.Model})
+			switch delta.Delta.Type {
+			case "text_delta":
+				if delta.Delta.Text != "" {
+					stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: delta.Delta.Text, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic", Model: delta.Model})
+				}
+			case "input_json_delta":
+				if acc, ok := toolBlocks[delta.Index]; ok {
+					acc.buffer.WriteString(delta.Delta.PartialJSON)
+				}
+			}
+		case "content_block_stop":
+			var stop anthropicContentBlockStop
+			if err := json.Unmarshal([]byte(data), &stop); err != nil {
+				stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Schema: "gai.events.v1", Seq: seq, Timestamp: time.Now(), Provider: "anthropic"})
+				continue
+			}
+			if acc, ok := toolBlocks[stop.Index]; ok {
+				args := acc.input
+				payload := strings.TrimSpace(acc.buffer.String())
+				if payload != "" {
+					var parsed map[string]any
+					if err := json.Unmarshal([]byte(payload), &parsed); err == nil {
+						args = parsed
+					}
+				}
+				if args == nil {
+					args = map[string]any{}
+				}
+				id := acc.id
+				if id == "" {
+					id = fmt.Sprintf("tool-%d", stop.Index)
+				}
+				stream.Push(core.StreamEvent{
+					Type: core.EventToolCall,
+					ToolCall: core.ToolCall{
+						ID:    id,
+						Name:  acc.name,
+						Input: args,
+					},
+					Schema:    "gai.events.v1",
+					Seq:       seq,
+					Timestamp: time.Now(),
+					Provider:  "anthropic",
+					Model:     model,
+				})
+				delete(toolBlocks, stop.Index)
 			}
 		case "message_delta":
 			var delta anthropicMessageDelta
@@ -278,6 +360,52 @@ func convertMessages(messages []core.Message) ([]anthropicMessage, error) {
 			switch p := part.(type) {
 			case core.Text:
 				content = append(content, anthropicContent{Type: "text", Text: p.Text})
+			case core.Image:
+				source, err := buildImageSource(p.Source)
+				if err != nil {
+					return nil, err
+				}
+				content = append(content, anthropicContent{Type: "image", Source: source})
+			case core.ImageURL:
+				source, err := buildImageURLSource(p)
+				if err != nil {
+					return nil, err
+				}
+				content = append(content, anthropicContent{Type: "image", Source: source})
+			case core.ToolCall:
+				input := p.Input
+				if input == nil {
+					input = map[string]any{}
+				}
+				content = append(content, anthropicContent{
+					Type:  "tool_use",
+					Name:  p.Name,
+					ID:    p.ID,
+					Input: input,
+				})
+			case core.ToolResult:
+				var output any
+				switch v := p.Result.(type) {
+				case nil:
+					output = ""
+				case string:
+					output = v
+				default:
+					if data, err := json.Marshal(v); err == nil {
+						output = string(data)
+					} else {
+						output = fmt.Sprintf("%v", v)
+					}
+				}
+				if output == "" && p.Error != "" {
+					output = p.Error
+				}
+				content = append(content, anthropicContent{
+					Type:      "tool_result",
+					ToolUseID: p.ID,
+					Content:   output,
+					IsError:   p.Error != "",
+				})
 			default:
 				return nil, fmt.Errorf("unsupported part type %T", part)
 			}
@@ -285,6 +413,75 @@ func convertMessages(messages []core.Message) ([]anthropicMessage, error) {
 		out = append(out, anthropicMessage{Role: role, Content: content})
 	}
 	return out, nil
+}
+
+func convertTools(handles []core.ToolHandle) ([]anthropicTool, error) {
+	tools := make([]anthropicTool, 0, len(handles))
+	for _, handle := range handles {
+		if handle == nil {
+			continue
+		}
+		schemaMap, err := schemaToMap(handle.InputSchema())
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, anthropicTool{
+			Name:        handle.Name(),
+			Description: handle.Description(),
+			InputSchema: schemaMap,
+		})
+	}
+	return tools, nil
+}
+
+func schemaToMap(s *schema.Schema) (map[string]any, error) {
+	if s == nil {
+		return map[string]any{"type": "object"}, nil
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return nil, fmt.Errorf("marshal schema: %w", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal schema: %w", err)
+	}
+	return out, nil
+}
+
+func buildImageSource(blob core.BlobRef) (*anthropicImageSource, error) {
+	if err := blob.Validate(); err != nil {
+		return nil, fmt.Errorf("validate image blob: %w", err)
+	}
+	if blob.Kind == core.BlobProvider {
+		return nil, errors.New("anthropic image requires inline data or URL; provider references unsupported")
+	}
+	data, err := blob.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read image blob: %w", err)
+	}
+	if blob.MIME == "" {
+		return nil, errors.New("image MIME type required for anthropic")
+	}
+	return &anthropicImageSource{
+		Type:      "base64",
+		MediaType: blob.MIME,
+		Data:      base64.StdEncoding.EncodeToString(data),
+	}, nil
+}
+
+func buildImageURLSource(img core.ImageURL) (*anthropicImageSource, error) {
+	if strings.TrimSpace(img.URL) == "" {
+		return nil, errors.New("image url is required")
+	}
+	source := &anthropicImageSource{
+		Type: "url",
+		URL:  img.URL,
+	}
+	if img.MIME != "" {
+		source.MediaType = img.MIME
+	}
+	return source, nil
 }
 
 func chooseModel(requestModel, defaultModel string) string {

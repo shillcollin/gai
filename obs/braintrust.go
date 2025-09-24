@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -91,7 +94,9 @@ func (b *braintrustSink) run(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
-		_ = b.flushBatch(ctx, batch)
+		if err := b.flushBatch(ctx, batch); err != nil {
+			log.Printf("braintrust flush error: %v", err)
+		}
 		batch = batch[:0]
 		if force {
 			return
@@ -146,7 +151,8 @@ func (b *braintrustSink) flushBatch(ctx context.Context, batch []Completion) err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("braintrust status %s", resp.Status)
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("braintrust status %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
 	return nil
 }

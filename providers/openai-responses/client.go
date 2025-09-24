@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/internal/httpclient"
@@ -23,6 +26,29 @@ import (
 type Client struct {
 	httpClient *http.Client
 	opts       options
+}
+
+type pendingToolCall struct {
+	CallID  string
+	Name    string
+	builder strings.Builder
+}
+
+func (p *pendingToolCall) appendDelta(delta string) {
+	p.builder.WriteString(delta)
+}
+
+func (p *pendingToolCall) setArguments(args string) {
+	p.builder.Reset()
+	p.builder.WriteString(args)
+}
+
+func (p *pendingToolCall) arguments() map[string]any {
+	var args map[string]any
+	if err := json.Unmarshal([]byte(p.builder.String()), &args); err != nil || args == nil {
+		return map[string]any{"raw": p.builder.String()}
+	}
+	return args
 }
 
 func warnDroppedParam(field, model, reason string) core.Warning {
@@ -256,7 +282,7 @@ func (c *Client) Capabilities() core.Capabilities {
 		Provider:          "openai-responses",
 		Models: []string{
 			"gpt-4o-mini", "gpt-4o", "gpt-4.1",
-			"o3", "o4-mini", "gpt-5",
+			"o3", "o4-mini", "gpt-5", "gpt-5-codex",
 		},
 	}
 }
@@ -264,14 +290,21 @@ func (c *Client) Capabilities() core.Capabilities {
 // buildPayload converts a core.Request to a ResponsesRequest.
 func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest, []core.Warning, error) {
 	// Convert messages to input format
-	input, instructions := c.convertMessages(req.Messages)
+	inputs, instructions, err := c.convertMessages(req.Messages)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	payload := &ResponsesRequest{
 		Model:        c.chooseModel(req.Model),
-		Input:        input,
+		Input:        inputs,
 		Instructions: instructions,
 		Stream:       stream,
 		Store:        c.opts.store,
+	}
+
+	if len(inputs) == 0 {
+		payload.Input = []any{}
 	}
 	policy := policyForModel(payload.Model)
 	warnings := make([]core.Warning, 0, 2)
@@ -279,6 +312,14 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest,
 	// Apply default instructions if none provided
 	if payload.Instructions == "" && c.opts.defaultInstructions != "" {
 		payload.Instructions = c.opts.defaultInstructions
+	}
+
+	if req.Metadata != nil && len(req.Metadata) > 0 {
+		payload.Metadata = req.Metadata
+	}
+
+	if req.Session != nil && req.Session.ID != "" && payload.PreviousResponseID == "" {
+		payload.PreviousResponseID = req.Session.ID
 	}
 
 	// Handle provider-specific options
@@ -295,6 +336,14 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest,
 	// Convert tools if present
 	if len(req.Tools) > 0 {
 		payload.Tools = c.convertTools(req.Tools)
+		switch req.ToolChoice {
+		case core.ToolChoiceRequired:
+			payload.ToolChoice = "required"
+		case core.ToolChoiceNone:
+			payload.ToolChoice = "none"
+		default:
+			payload.ToolChoice = "auto"
+		}
 	}
 
 	// Apply temperature and other generation parameters
@@ -320,6 +369,10 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest,
 		}
 	}
 
+	if req.TopK > 0 {
+		payload.TopK = req.TopK
+	}
+
 	// Apply default reasoning if configured
 	if c.opts.defaultReasoning != nil && payload.Reasoning == nil && policy.AllowReasoning {
 		if policy.AllowedReasoningEffort != nil {
@@ -333,20 +386,34 @@ func (c *Client) buildPayload(req core.Request, stream bool) (*ResponsesRequest,
 		}
 	}
 
+	if os.Getenv("GAI_DEBUG_PAYLOAD") == "1" {
+		if data, err := json.MarshalIndent(payload, "", "  "); err == nil {
+			fmt.Fprintf(os.Stderr, "[GAI] OpenAI Responses payload:\n%s\n", string(data))
+		}
+	}
+
 	return payload, warnings, nil
 }
 
 // convertMessages converts core messages to Responses API input format.
-func (c *Client) convertMessages(messages []core.Message) (any, string) {
+func (c *Client) convertMessages(messages []core.Message) ([]any, string, error) {
 	if len(messages) == 0 {
-		return "", ""
+		return nil, "", nil
 	}
 
-	var instructions string
-	var inputMessages []ResponseInputParam
+	var (
+		instructions string
+		inputs       []any
+	)
+
+	appendMessage := func(role string, parts []ContentPart) {
+		if len(parts) == 0 {
+			return
+		}
+		inputs = append(inputs, ResponseInputParam{Role: role, Content: parts})
+	}
 
 	for _, msg := range messages {
-		// Extract system/developer instructions
 		if msg.Role == core.System {
 			for _, part := range msg.Parts {
 				if text, ok := part.(core.Text); ok {
@@ -359,97 +426,104 @@ func (c *Client) convertMessages(messages []core.Message) (any, string) {
 			continue
 		}
 
-		// Convert role
 		role := string(msg.Role)
-		if msg.Role == core.System {
+		switch msg.Role {
+		case core.System:
 			role = "developer"
+		case core.Assistant:
+			role = "assistant"
+		case core.User:
+			role = "user"
 		}
 
-		// Convert parts
-		var content []ContentPart
 		contentType := "input_text"
-		switch msg.Role {
-		case core.Assistant:
+		if msg.Role == core.Assistant {
 			contentType = "output_text"
-		case core.User:
-			contentType = "input_text"
-		default:
-			if role == "tool" {
-				contentType = "output_text"
-			}
 		}
+
+		var messageParts []ContentPart
+
 		for _, part := range msg.Parts {
 			switch p := part.(type) {
 			case core.Text:
-				content = append(content, ContentPart{
-					Type: contentType,
-					Text: p.Text,
-				})
+				if trimmed := strings.TrimSpace(p.Text); trimmed != "" {
+					messageParts = append(messageParts, ContentPart{Type: contentType, Text: p.Text})
+				}
 			case core.Image:
-				// Convert BlobRef to appropriate format
-				if p.Source.Kind == core.BlobBytes {
-					dataURL := fmt.Sprintf("data:%s;base64,%s",
-						p.Source.MIME,
-						base64.StdEncoding.EncodeToString(p.Source.Bytes))
-					content = append(content, ContentPart{
-						Type:     "input_image",
-						ImageURL: dataURL,
-					})
-				} else if p.Source.Kind == core.BlobURL {
-					content = append(content, ContentPart{
-						Type:     "input_image",
-						ImageURL: p.Source.URL,
-					})
+				switch p.Source.Kind {
+				case core.BlobBytes:
+					dataURL := fmt.Sprintf("data:%s;base64,%s", p.Source.MIME, base64.StdEncoding.EncodeToString(p.Source.Bytes))
+					messageParts = append(messageParts, ContentPart{Type: "input_image", ImageURL: dataURL})
+				case core.BlobPath:
+					data, err := p.Source.Read()
+					if err != nil {
+						return nil, "", fmt.Errorf("read image from path %s: %w", p.Source.Path, err)
+					}
+					dataURL := fmt.Sprintf("data:%s;base64,%s", p.Source.MIME, base64.StdEncoding.EncodeToString(data))
+					messageParts = append(messageParts, ContentPart{Type: "input_image", ImageURL: dataURL})
+				case core.BlobURL:
+					messageParts = append(messageParts, ContentPart{Type: "input_image", ImageURL: p.Source.URL})
+				case core.BlobProvider:
+					return nil, "", fmt.Errorf("image blob provider references are not supported; upload file and pass file_id instead")
 				}
 			case core.ImageURL:
-				content = append(content, ContentPart{
-					Type:     "input_image",
-					ImageURL: p.URL,
-					Detail:   p.Detail,
-				})
+				messageParts = append(messageParts, ContentPart{Type: "input_image", ImageURL: p.URL, Detail: p.Detail})
 			case core.Audio:
 				if p.Source.Kind == core.BlobBytes {
-					content = append(content, ContentPart{
-						Type: "input_audio",
-						InputAudio: &InputAudioData{
-							Data:   base64.StdEncoding.EncodeToString(p.Source.Bytes),
-							Format: p.Format,
-						},
+					messageParts = append(messageParts, ContentPart{
+						Type:       "input_audio",
+						InputAudio: &InputAudioData{Data: base64.StdEncoding.EncodeToString(p.Source.Bytes), Format: p.Format},
 					})
 				}
 			case core.File:
 				if p.Source.Kind == core.BlobProvider {
-					content = append(content, ContentPart{
-						Type:   "input_file",
-						FileID: p.Source.ProviderID,
-					})
+					messageParts = append(messageParts, ContentPart{Type: "input_file", FileID: p.Source.ProviderID})
 				}
-			case core.ToolResult:
-				// Tool results become tool role messages
-				role = "tool"
-				content = append(content, ContentPart{
-					Type: "output_text",
-					Text: fmt.Sprintf("%v", p.Result),
+			case core.ToolCall:
+				// Preserve tool call history so the model can reference previous invocations.
+				inputs = append(inputs, FunctionCallParam{
+					Type:      "function_call",
+					CallID:    p.ID,
+					Name:      p.Name,
+					Arguments: mustJSONString(p.Input),
 				})
+			case core.ToolResult:
+				output := ""
+				if str, ok := p.Result.(string); ok {
+					output = str
+				} else if p.Result != nil {
+					output = mustJSONString(p.Result)
+				}
+				if output == "" && p.Error != "" {
+					output = p.Error
+				}
+				if output == "" {
+					continue
+				}
+				inputs = append(inputs, FunctionCallOutputParam{
+					Type:   "function_call_output",
+					CallID: p.ID,
+					Output: output,
+				})
+			default:
+				continue
 			}
 		}
 
-		if len(content) > 0 {
-			inputMessages = append(inputMessages, ResponseInputParam{
-				Role:    role,
-				Content: content,
-			})
-		}
+		appendMessage(role, messageParts)
 	}
 
-	// If only one message and it's simple text, return as string
-	if len(inputMessages) == 1 && len(inputMessages[0].Content) == 1 {
-		if inputMessages[0].Content[0].Type == "input_text" {
-			return inputMessages[0].Content[0].Text, instructions
-		}
-	}
+	return inputs, instructions, nil
+}
 
-	return inputMessages, instructions
+func mustJSONString(v any) string {
+	if v == nil {
+		return "null"
+	}
+	if data, err := json.Marshal(v); err == nil {
+		return string(data)
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 // convertTools converts core tool handles to Responses API tools.
@@ -488,6 +562,8 @@ func (c *Client) applyProviderOptions(payload *ResponsesRequest, options map[str
 			if bg, ok := value.(bool); ok {
 				payload.Background = bg
 			}
+		case "openai-responses.modalities":
+			payload.Modalities = toStringSlice(value)
 		case "openai-responses.reasoning":
 			if reasoning, ok := value.(map[string]any); ok {
 				if !policy.AllowReasoning {
@@ -553,6 +629,50 @@ func (c *Client) applyProviderOptions(payload *ResponsesRequest, options map[str
 		case "openai-responses.max_output_tokens":
 			if val, err := toInt(value); err == nil {
 				payload.MaxOutputTokens = val
+			}
+		case "openai-responses.max_prompt_tokens":
+			if val, err := toInt(value); err == nil {
+				payload.MaxPromptTokens = val
+			}
+		case "openai-responses.max_tool_calls":
+			if val, err := toInt(value); err == nil {
+				payload.MaxToolCalls = val
+			}
+		case "openai-responses.parallel_tool_calls":
+			if b, ok := value.(bool); ok {
+				payload.ParallelToolCalls = &b
+			}
+		case "openai-responses.parallel_tool_call_limit":
+			if val, err := toInt(value); err == nil {
+				payload.ParallelToolLimit = val
+			}
+		case "openai-responses.tool_choice":
+			payload.ToolChoice = value
+		case "openai-responses.user":
+			if val, ok := value.(string); ok {
+				payload.User = val
+			}
+		case "openai-responses.seed":
+			if val, err := toInt(value); err == nil {
+				payload.Seed = &val
+			}
+		case "openai-responses.truncation":
+			if val, ok := value.(string); ok {
+				payload.Truncation = val
+			}
+		case "openai-responses.prediction":
+			if val, ok := value.(map[string]any); ok {
+				payload.Prediction = val
+			}
+		case "openai-responses.stop":
+			payload.Stop = toStringSlice(value)
+		case "openai-responses.text":
+			if params := toTextFormatParams(value); params != nil {
+				payload.Text = params
+			}
+		case "openai-responses.audio":
+			if params := toAudioParams(value); params != nil {
+				payload.Audio = params
 			}
 		}
 	}
@@ -649,119 +769,289 @@ func (c *Client) doRequestSSE(ctx context.Context, method, path string, payload 
 }
 
 // consumeSSEStream processes the SSE stream and emits normalized events.
-func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, stream *core.Stream, modelName string) {
+func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, stream *core.Stream, defaultModel string) {
 	defer body.Close()
 	defer stream.Close()
 
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 1024*64), 1024*64) // 64KB buffer
+	scanner.Buffer(make([]byte, 1024*64), 1024*1024)
+
+	debug := os.Getenv("GAI_DEBUG_SSE") == "1"
+
+	responseID := ""
+	modelName := defaultModel
+	lastUsage := core.Usage{}
+	started := false
+	pendingCalls := make(map[string]*pendingToolCall)
 
 	var currentEvent string
-	var textBuilder strings.Builder
-	var reasoningBuilder strings.Builder
-	var usage core.Usage
-	var responseID string
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// SSE format: "event: <type>" or "data: <json>"
 		if strings.HasPrefix(line, "event: ") {
 			currentEvent = strings.TrimPrefix(line, "event: ")
-		} else if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
 
-			// Skip [DONE] marker
-			if data == "[DONE]" {
+		data := strings.TrimPrefix(line, "data: ")
+		if debug {
+			fmt.Fprintf(os.Stderr, "[GAI] SSE %s: %s\n", currentEvent, data)
+		}
+		if data == "[DONE]" {
+			continue
+		}
+
+		var envelope struct {
+			Type     string `json:"type"`
+			Sequence int    `json:"sequence_number"`
+		}
+		if err := json.Unmarshal([]byte(data), &envelope); err != nil {
+			stream.Fail(err)
+			continue
+		}
+
+		seq := envelope.Sequence
+
+		switch envelope.Type {
+		case "response.created", "response.in_progress":
+			var evt StreamEventResponseCreated
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
 				continue
 			}
-
-			// Process based on event type
-			switch currentEvent {
-			case "response.created":
-				var evt StreamEventResponseCreated
-				if err := json.Unmarshal([]byte(data), &evt); err == nil {
-					responseID = evt.ID
-					stream.Push(core.StreamEvent{
-						Type:     core.EventStart,
-						StreamID: responseID,
-					})
+			responseID = evt.Response.ID
+			if evt.Response.Model != "" {
+				modelName = evt.Response.Model
+			}
+			if !started {
+				stream.Push(core.StreamEvent{
+					Type:      core.EventStart,
+					Timestamp: time.Now(),
+					Schema:    "gai.events.v1",
+					Seq:       seq,
+					StreamID:  responseID,
+					Provider:  "openai-responses",
+					Model:     modelName,
+				})
+				started = true
+			}
+		case "response.output_item.added":
+			var evt StreamEventOutputItemAdded
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			if evt.Item.Type == "function_call" {
+				pendingCalls[evt.Item.ID] = &pendingToolCall{CallID: evt.Item.CallID, Name: evt.Item.Name}
+			}
+		case "response.output_text.delta":
+			var evt StreamEventTextDelta
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			ext := map[string]any{}
+			if len(evt.Logprobs) > 0 {
+				ext["logprobs"] = evt.Logprobs
+			}
+			if evt.Obfuscation != "" {
+				ext["obfuscation"] = evt.Obfuscation
+			}
+			stream.Push(core.StreamEvent{
+				Type:      core.EventTextDelta,
+				TextDelta: evt.Delta,
+				Timestamp: time.Now(),
+				Schema:    "gai.events.v1",
+				Seq:       seq,
+				StreamID:  evt.ItemID,
+				Provider:  "openai-responses",
+				Model:     modelName,
+				Ext:       extOrNil(ext),
+			})
+		case "response.output_text.done":
+			// no-op; the deltas already emitted the content
+		case "response.reasoning_text.delta":
+			var evt StreamEventReasoningDelta
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			stream.Push(core.StreamEvent{
+				Type:           core.EventReasoningDelta,
+				ReasoningDelta: evt.Delta,
+				Timestamp:      time.Now(),
+				Schema:         "gai.events.v1",
+				Seq:            seq,
+				StreamID:       evt.ItemID,
+				Provider:       "openai-responses",
+				Model:          modelName,
+			})
+		case "response.reasoning_text.done":
+			var evt StreamEventReasoningDone
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			if evt.Summary != "" {
+				stream.Push(core.StreamEvent{
+					Type:             core.EventReasoningSummary,
+					ReasoningSummary: evt.Summary,
+					Timestamp:        time.Now(),
+					Schema:           "gai.events.v1",
+					Seq:              seq,
+					StreamID:         evt.ItemID,
+					Provider:         "openai-responses",
+					Model:            modelName,
+				})
+			}
+		case "response.content_part.done":
+			var evt StreamEventContentPart
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			if citations := annotationsToCitations(evt.Part.Annotations); len(citations) > 0 {
+				stream.Push(core.StreamEvent{
+					Type:      core.EventCitations,
+					Citations: citations,
+					Timestamp: time.Now(),
+					Schema:    "gai.events.v1",
+					Seq:       seq,
+					StreamID:  evt.ItemID,
+					Provider:  "openai-responses",
+					Model:     modelName,
+				})
+			}
+		case "response.output_audio.delta":
+			var evt StreamEventOutputAudioDelta
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			ext := map[string]any{
+				"audio_b64": evt.Delta.Audio.Data,
+			}
+			if evt.Delta.Audio.Format != "" {
+				ext["format"] = evt.Delta.Audio.Format
+			}
+			stream.Push(core.StreamEvent{
+				Type:      core.EventAudioDelta,
+				Timestamp: time.Now(),
+				Schema:    "gai.events.v1",
+				Seq:       seq,
+				StreamID:  evt.ItemID,
+				Provider:  "openai-responses",
+				Model:     modelName,
+				Ext:       ext,
+			})
+		case "response.function_call_arguments.delta", "response.output_tool_call.arguments.delta":
+			var evt StreamEventFunctionCallArgumentsDelta
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			if call, ok := pendingCalls[evt.ItemID]; ok {
+				call.appendDelta(evt.Delta)
+			}
+		case "response.function_call_arguments.done", "response.output_tool_call.arguments.done":
+			var evt StreamEventFunctionCallArgumentsDone
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			if call, ok := pendingCalls[evt.ItemID]; ok {
+				if evt.Arguments != "" {
+					call.setArguments(evt.Arguments)
 				}
-
-			case "response.output_text.delta":
-				var evt StreamEventTextDelta
-				if err := json.Unmarshal([]byte(data), &evt); err == nil {
-					textBuilder.WriteString(evt.Delta)
-					stream.Push(core.StreamEvent{
-						Type:      core.EventTextDelta,
-						TextDelta: evt.Delta,
-						StreamID:  responseID,
-					})
+				args := call.arguments()
+				id := call.CallID
+				if id == "" {
+					id = evt.ItemID
 				}
-
-			case "response.output_text.done":
-				// Final text event - nothing special to do
-
-			case "response.reasoning_text.delta":
-				var evt StreamEventReasoningDelta
-				if err := json.Unmarshal([]byte(data), &evt); err == nil {
-					reasoningBuilder.WriteString(evt.Delta)
-					stream.Push(core.StreamEvent{
-						Type:           core.EventReasoningDelta,
-						ReasoningDelta: evt.Delta,
-						StreamID:       responseID,
-					})
-				}
-
-			case "response.reasoning_text.done":
-				var evt StreamEventReasoningDone
-				if err := json.Unmarshal([]byte(data), &evt); err == nil {
-					if evt.Summary != "" {
-						stream.Push(core.StreamEvent{
-							Type:             core.EventReasoningSummary,
-							ReasoningSummary: evt.Summary,
-							StreamID:         responseID,
-						})
-					}
-				}
-
-			case "response.tool_call":
-				var evt StreamEventToolCall
-				if err := json.Unmarshal([]byte(data), &evt); err == nil {
-					stream.Push(core.StreamEvent{
-						Type: core.EventToolCall,
-						ToolCall: core.ToolCall{
-							ID:    evt.ID,
-							Name:  evt.Name,
-							Input: evt.Arguments,
-						},
-						StreamID: responseID,
-					})
-				}
-
-			case "response.completed":
-				var evt StreamEventCompleted
-				if err := json.Unmarshal([]byte(data), &evt); err == nil {
-					if evt.Usage != nil {
-						usage = c.convertActualUsage(evt.Usage)
-					}
-					stream.Push(core.StreamEvent{
-						Type:     core.EventFinish,
-						Usage:    usage,
-						StreamID: responseID,
-						FinishReason: &core.StopReason{
-							Type: core.StopReasonComplete,
-						},
-					})
-				}
-
-			case "response.error":
-				var evt StreamEventError
-				if err := json.Unmarshal([]byte(data), &evt); err == nil {
-					// Error event - fail the stream
-					stream.Fail(errors.New(evt.Message))
+				stream.Push(core.StreamEvent{
+					Type: core.EventToolCall,
+					ToolCall: core.ToolCall{
+						ID:    id,
+						Name:  call.Name,
+						Input: args,
+					},
+					Timestamp: time.Now(),
+					Schema:    "gai.events.v1",
+					Seq:       seq,
+					StreamID:  evt.ItemID,
+					Provider:  "openai-responses",
+					Model:     modelName,
+				})
+				delete(pendingCalls, evt.ItemID)
+			}
+		case "response.completed":
+			var evt StreamEventCompleted
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			if evt.Response.Model != "" {
+				modelName = evt.Response.Model
+			}
+			if evt.Response.Usage != nil {
+				lastUsage = c.convertActualUsage(evt.Response.Usage)
+			}
+			finish := core.StopReason{Type: core.StopReasonComplete}
+			if evt.Response.Status != "" && evt.Response.Status != "completed" {
+				finish.Type = evt.Response.Status
+			}
+			stream.Push(core.StreamEvent{
+				Type:         core.EventFinish,
+				Timestamp:    time.Now(),
+				Schema:       "gai.events.v1",
+				Seq:          seq,
+				StreamID:     responseID,
+				Provider:     "openai-responses",
+				Model:        modelName,
+				Usage:        lastUsage,
+				FinishReason: &finish,
+			})
+		case "response.completed_with_error":
+			var evt StreamEventCompleted
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			errMsg := "openai responses error"
+			if evt.Response.Error != nil && evt.Response.Error.Message != "" {
+				errMsg = evt.Response.Error.Message
+			}
+			stream.Fail(errors.New(errMsg))
+			return
+		case "response.error":
+			var evt StreamEventError
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				stream.Fail(err)
+				continue
+			}
+			stream.Fail(errors.New(evt.Message))
+			return
+		case "response.warning":
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(data), &payload); err == nil {
+				if msg, ok := toString(payload["message"]); ok && msg != "" {
+					stream.AddWarnings(core.Warning{Code: "openai_responses_warning", Message: msg})
 				}
 			}
+		case "response.usage.delta":
+			var payload struct {
+				Usage *ActualUsage `json:"usage"`
+			}
+			if err := json.Unmarshal([]byte(data), &payload); err == nil && payload.Usage != nil {
+				lastUsage = c.convertActualUsage(payload.Usage)
+				stream.SetMeta(core.StreamMeta{Model: modelName, Provider: "openai-responses", Usage: lastUsage})
+			}
+		default:
+			// Unknown events are ignored but logged in debug mode.
 		}
 	}
 
@@ -770,12 +1060,7 @@ func (c *Client) consumeSSEStream(ctx context.Context, body io.ReadCloser, strea
 		return
 	}
 
-	// Set final metadata
-	stream.SetMeta(core.StreamMeta{
-		Model:    modelName,
-		Provider: "openai-responses",
-		Usage:    usage,
-	})
+	stream.SetMeta(core.StreamMeta{Model: modelName, Provider: "openai-responses", Usage: lastUsage})
 }
 
 // Helper methods
@@ -798,7 +1083,9 @@ func (c *Client) extractActualOutputContent(items []ActualResponseItem) (string,
 			for _, part := range item.Content {
 				if part.Type == "output_text" {
 					textBuilder.WriteString(part.Text)
-					// Annotations would need parsing from json.RawMessage if needed
+					if cites := annotationsToCitations(part.Annotations); len(cites) > 0 {
+						citations = append(citations, cites...)
+					}
 				}
 			}
 
@@ -806,7 +1093,7 @@ func (c *Client) extractActualOutputContent(items []ActualResponseItem) (string,
 			toolCalls = append(toolCalls, core.ToolCall{
 				ID:    item.ID,
 				Name:  item.Name,
-				Input: item.Arguments,
+				Input: parseToolArguments(item.Arguments),
 			})
 		}
 	}
@@ -870,6 +1157,27 @@ func (c *Client) wrapError(apiErr ResponseError, statusCode int) error {
 	}
 }
 
+func parseToolArguments(raw json.RawMessage) map[string]any {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(trimmed, &obj); err == nil && obj != nil {
+		return obj
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		if err := json.Unmarshal([]byte(str), &obj); err == nil && obj != nil {
+			return obj
+		}
+		if str != "" {
+			return map[string]any{"raw": str}
+		}
+	}
+	return map[string]any{"raw": string(trimmed)}
+}
+
 // Helper function
 func schemaToMap(s *schema.Schema) map[string]any {
 	// Convert our schema format to OpenAI's expected format
@@ -919,5 +1227,238 @@ func toInt(value any) (int, error) {
 		return int(i), err
 	default:
 		return 0, fmt.Errorf("invalid number type %T", value)
+	}
+}
+
+func extOrNil(m map[string]any) map[string]any {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+func annotationsToCitations(raw []json.RawMessage) []core.Citation {
+	if len(raw) == 0 {
+		return nil
+	}
+	citations := make([]core.Citation, 0, len(raw))
+	for _, annRaw := range raw {
+		var ann map[string]any
+		if err := json.Unmarshal(annRaw, &ann); err != nil {
+			continue
+		}
+		typeVal, _ := toString(ann["type"])
+		if typeVal != "citation" {
+			continue
+		}
+		cite := core.Citation{}
+		if uri, ok := toString(ann["uri"]); ok && uri != "" {
+			cite.URI = uri
+		} else if uri, ok := toString(ann["url"]); ok && uri != "" {
+			cite.URI = uri
+		}
+		if title, ok := toString(ann["title"]); ok {
+			cite.Title = title
+		}
+		if snippet, ok := toString(ann["snippet"]); ok {
+			cite.Snippet = snippet
+		}
+		if start, ok := toIntFromAny(ann["start_index"]); ok {
+			cite.Start = start
+		} else if start, ok := toIntFromAny(ann["start"]); ok {
+			cite.Start = start
+		}
+		if end, ok := toIntFromAny(ann["end_index"]); ok {
+			cite.End = end
+		} else if end, ok := toIntFromAny(ann["end"]); ok {
+			cite.End = end
+		}
+		if score, ok := toFloatFromAny(ann["score"]); ok {
+			cite.Score = float32(score)
+		}
+		citations = append(citations, cite)
+	}
+	return citations
+}
+
+func toIntFromAny(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return int(i), true
+		}
+	case string:
+		if v == "" {
+			return 0, false
+		}
+		if i, err := strconv.Atoi(v); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func toFloatFromAny(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f, true
+		}
+	case string:
+		if v == "" {
+			return 0, false
+		}
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func toStringSlice(value any) []string {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if str, ok := toString(item); ok {
+				out = append(out, str)
+			}
+		}
+		return out
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []string{v}
+	default:
+		if str, ok := toString(v); ok && str != "" {
+			return []string{str}
+		}
+	}
+	return nil
+}
+
+func toString(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return v, true
+	case fmt.Stringer:
+		return v.String(), true
+	default:
+		return "", false
+	}
+}
+
+func toAudioParams(value any) *AudioParams {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case AudioParams:
+		cp := v
+		return &cp
+	case *AudioParams:
+		if v == nil {
+			return nil
+		}
+		cp := *v
+		return &cp
+	case map[string]any:
+		params := &AudioParams{}
+		if voice, ok := toString(v["voice"]); ok {
+			params.Voice = voice
+		}
+		if format, ok := toString(v["format"]); ok {
+			params.Format = format
+		}
+		if lang, ok := toString(v["language"]); ok {
+			params.Language = lang
+		}
+		if quality, ok := toString(v["quality"]); ok {
+			params.Quality = quality
+		}
+		if sr, err := toInt(v["sample_rate"]); err == nil && sr > 0 {
+			params.SampleRate = sr
+		}
+		return params
+	default:
+		return nil
+	}
+}
+
+func toTextFormatParams(value any) *TextFormatParams {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case TextFormatParams:
+		cp := v
+		return &cp
+	case *TextFormatParams:
+		if v == nil {
+			return nil
+		}
+		cp := *v
+		return &cp
+	case map[string]any:
+		params := &TextFormatParams{}
+		if strict, ok := v["strict"].(bool); ok {
+			params.Strict = strict
+		}
+		if stop := toStringSlice(v["stop"]); len(stop) > 0 {
+			params.Stop = stop
+		}
+		if verbosity, ok := toString(v["verbosity"]); ok {
+			params.Verbosity = strings.ToLower(verbosity)
+		}
+		if formatVal, ok := v["format"]; ok {
+			switch fmtVal := formatVal.(type) {
+			case string:
+				params.Format = &TextFormat{Type: fmtVal}
+			case map[string]any:
+				tf := &TextFormat{}
+				if t, ok := toString(fmtVal["type"]); ok {
+					tf.Type = t
+				}
+				if schemaVal, ok := fmtVal["json_schema"].(map[string]any); ok {
+					tf.JSONSchema = &JSONSchema{}
+					if name, ok := toString(schemaVal["name"]); ok {
+						tf.JSONSchema.Name = name
+					}
+					if raw, ok := schemaVal["schema"].(map[string]any); ok {
+						tf.JSONSchema.Schema = raw
+					}
+					if strict, ok := schemaVal["strict"].(bool); ok {
+						tf.JSONSchema.Strict = strict
+					}
+				}
+				params.Format = tf
+			}
+		}
+		return params
+	default:
+		return nil
 	}
 }

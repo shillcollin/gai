@@ -1,9 +1,13 @@
 package core
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 )
 
 // Role identifies the author of a message.
@@ -183,5 +187,54 @@ func (b BlobRef) Base64() (string, error) {
 		return base64.StdEncoding.EncodeToString(b.Bytes), nil
 	default:
 		return "", fmt.Errorf("base64 conversion unsupported for kind %s", b.Kind)
+	}
+}
+
+// Read materializes the blob contents into memory. Callers should prefer Stream when
+// dealing with large payloads.
+func (b BlobRef) Read() ([]byte, error) {
+	reader, err := b.Stream()
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// Stream returns an io.ReadCloser for the blob contents. The caller is responsible
+// for closing the returned reader. Network-based blobs use the default HTTP client.
+func (b BlobRef) Stream() (io.ReadCloser, error) {
+	switch b.Kind {
+	case BlobBytes:
+		// Return a defensive copy-backed reader to prevent mutation while streaming.
+		buf := make([]byte, len(b.Bytes))
+		copy(buf, b.Bytes)
+		return io.NopCloser(bytes.NewReader(buf)), nil
+	case BlobPath:
+		if b.Path == "" {
+			return nil, errors.New("blob path is empty")
+		}
+		return os.Open(b.Path)
+	case BlobURL:
+		if b.URL == "" {
+			return nil, errors.New("blob url is empty")
+		}
+		resp, err := http.Get(b.URL)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			defer resp.Body.Close()
+			return nil, fmt.Errorf("blob url returned status %s", resp.Status)
+		}
+		return resp.Body, nil
+	case BlobProvider:
+		return nil, errors.New("provider-managed blobs must be resolved by the provider")
+	default:
+		return nil, fmt.Errorf("unsupported blob kind %q", b.Kind)
 	}
 }

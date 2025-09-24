@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -464,9 +467,31 @@ func convertMessages(messages []core.Message) ([]openAIMessage, error) {
 		for _, part := range msg.Parts {
 			switch p := part.(type) {
 			case core.Text:
-				omsg.Content = append(omsg.Content, openAIContent{Type: "text", Text: p.Text})
+				if trimmed := strings.TrimSpace(p.Text); trimmed != "" {
+					omsg.Content = append(omsg.Content, openAIContent{Type: "text", Text: p.Text})
+				}
+			case core.Image:
+				contents, err := buildImageContent(p)
+				if err != nil {
+					return nil, err
+				}
+				omsg.Content = append(omsg.Content, contents...)
 			case core.ImageURL:
 				omsg.Content = append(omsg.Content, openAIContent{Type: "image_url", ImageURL: &openAIImageURL{URL: p.URL, Detail: p.Detail}})
+			case core.Audio:
+				content, err := buildAudioContent(p)
+				if err != nil {
+					return nil, err
+				}
+				omsg.Content = append(omsg.Content, content)
+			case core.Video:
+				content, err := buildVideoContent(p)
+				if err != nil {
+					return nil, err
+				}
+				omsg.Content = append(omsg.Content, content)
+			case core.File:
+				return nil, fmt.Errorf("openai chat completions does not support file attachments; provide a URL or convert the file into text/image/audio/video content")
 			case core.ToolCall:
 				args, err := json.Marshal(p.Input)
 				if err != nil {
@@ -515,6 +540,160 @@ func extractToolResults(msg core.Message) []openAIMessage {
 		})
 	}
 	return results
+}
+
+func buildImageContent(img core.Image) ([]openAIContent, error) {
+	if err := img.Source.Validate(); err != nil {
+		return nil, fmt.Errorf("validate image blob: %w", err)
+	}
+	switch img.Source.Kind {
+	case core.BlobURL:
+		return []openAIContent{{Type: "image_url", ImageURL: &openAIImageURL{URL: img.Source.URL}}}, nil
+	case core.BlobBytes, core.BlobPath:
+		data, err := img.Source.Read()
+		if err != nil {
+			return nil, fmt.Errorf("read image content: %w", err)
+		}
+		encoded := base64.StdEncoding.EncodeToString(data)
+		mimeType := img.Source.MIME
+		return []openAIContent{{
+			Type:  "input_image",
+			Image: &openAIImageInput{B64JSON: encoded, MimeType: mimeType},
+		}}, nil
+	case core.BlobProvider:
+		return nil, errors.New("image blob with provider reference must be resolved to bytes or URL before sending")
+	default:
+		return nil, fmt.Errorf("unsupported image blob kind %s", img.Source.Kind)
+	}
+}
+
+func buildAudioContent(audio core.Audio) (openAIContent, error) {
+	if err := audio.Source.Validate(); err != nil {
+		return openAIContent{}, fmt.Errorf("validate audio blob: %w", err)
+	}
+	data, err := audio.Source.Read()
+	if err != nil {
+		return openAIContent{}, fmt.Errorf("read audio content: %w", err)
+	}
+	format, err := resolveAudioFormat(audio.Format, audio.Source)
+	if err != nil {
+		return openAIContent{}, err
+	}
+	return openAIContent{
+		Type: "input_audio",
+		InputAudio: &openAIInputAudio{
+			Data:   base64.StdEncoding.EncodeToString(data),
+			Format: format,
+		},
+	}, nil
+}
+
+func buildVideoContent(video core.Video) (openAIContent, error) {
+	if err := video.Source.Validate(); err != nil {
+		return openAIContent{}, fmt.Errorf("validate video blob: %w", err)
+	}
+	data, err := video.Source.Read()
+	if err != nil {
+		return openAIContent{}, fmt.Errorf("read video content: %w", err)
+	}
+	format, err := resolveVideoFormat(video.Format, video.Source)
+	if err != nil {
+		return openAIContent{}, err
+	}
+	return openAIContent{
+		Type: "input_video",
+		InputVideo: &openAIInputVideo{
+			Data:   base64.StdEncoding.EncodeToString(data),
+			Format: format,
+		},
+	}, nil
+}
+
+var audioMIMEMapping = map[string]string{
+	"wav":   "wav",
+	"x-wav": "wav",
+	"wave":  "wav",
+	"mpeg":  "mp3",
+	"mp3":   "mp3",
+	"flac":  "flac",
+	"ogg":   "ogg",
+	"opus":  "opus",
+	"webm":  "webm",
+	"aac":   "aac",
+	"m4a":   "m4a",
+}
+
+var videoMIMEMapping = map[string]string{
+	"mp4":        "mp4",
+	"quicktime":  "mov",
+	"x-matroska": "mkv",
+	"webm":       "webm",
+	"ogg":        "ogg",
+}
+
+func resolveAudioFormat(explicit string, blob core.BlobRef) (string, error) {
+	if f := normalizeFormat(explicit); f != "" {
+		return f, nil
+	}
+	if format := formatFromMIME(blob.MIME, audioMIMEMapping); format != "" {
+		return format, nil
+	}
+	if format := formatFromPath(blob.Path, audioMIMEMapping); format != "" {
+		return format, nil
+	}
+	return "", fmt.Errorf("audio format required; set Audio.Format or MIME for blob %s", blob.Path)
+}
+
+func resolveVideoFormat(explicit string, blob core.BlobRef) (string, error) {
+	if f := normalizeFormat(explicit); f != "" {
+		return f, nil
+	}
+	if format := formatFromMIME(blob.MIME, videoMIMEMapping); format != "" {
+		return format, nil
+	}
+	if format := formatFromPath(blob.Path, videoMIMEMapping); format != "" {
+		return format, nil
+	}
+	return "", fmt.Errorf("video format required; set Video.Format or MIME for blob %s", blob.Path)
+}
+
+func normalizeFormat(format string) string {
+	format = strings.TrimSpace(strings.ToLower(format))
+	return strings.TrimPrefix(format, ".")
+}
+
+func formatFromMIME(mimeType string, lookup map[string]string) string {
+	if mimeType == "" {
+		return ""
+	}
+	if format, ok := lookup[strings.ToLower(mimeType)]; ok {
+		return format
+	}
+	if slash := strings.Index(mimeType, "/"); slash >= 0 {
+		sub := mimeType[slash+1:]
+		if format, ok := lookup[strings.ToLower(sub)]; ok {
+			return format
+		}
+	}
+	if exts, err := mime.ExtensionsByType(mimeType); err == nil {
+		for _, candidate := range exts {
+			if format, ok := lookup[strings.TrimPrefix(strings.ToLower(candidate), ".")]; ok {
+				return format
+			}
+		}
+	}
+	return ""
+}
+
+func formatFromPath(path string, lookup map[string]string) string {
+	if path == "" {
+		return ""
+	}
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
+	if ext == "" {
+		return ""
+	}
+	return lookup[ext]
 }
 
 func convertTools(tools []core.ToolHandle) ([]openAITool, error) {

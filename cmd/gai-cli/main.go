@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,9 +24,6 @@ import (
 	openairesponses "github.com/shillcollin/gai/providers/openai-responses"
 	"github.com/shillcollin/gai/runner"
 	"github.com/shillcollin/gai/tools"
-	"go/ast"
-	"go/parser"
-	"go/token"
 )
 
 type providerEntry struct {
@@ -58,6 +55,9 @@ type conversation struct {
 	messages       []core.Message
 	conversationID string
 	turn           int
+	systemPrompt   string
+	counterMu      sync.Mutex
+	counter        int
 }
 
 func main() {
@@ -71,8 +71,7 @@ func main() {
 
 	shutdownObs, err := initObservability(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "observability init error: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "observability init warning: %v\n", err)
 	}
 	defer func() {
 		if shutdownObs != nil {
@@ -94,7 +93,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	calcTool := newCalculatorTool()
+	systemPrompt := "You are being evaluated for tool usage. A tool named `increment_counter` is available. Call it repeatedly to increment and observe the counter value. Keep calling it until it reaches 5, then acknowledge success succinctly."
 
 	conv := &conversation{
 		reader:         bufio.NewReader(os.Stdin),
@@ -102,12 +101,14 @@ func main() {
 		current:        providers[0],
 		currentModel:   providers[0].Default,
 		runner:         newRunner(providers[0].Client),
-		toolHandle:     calcTool,
-		messages:       make([]core.Message, 0, 32),
 		conversationID: uuid.NewString(),
+		systemPrompt:   systemPrompt,
 	}
+	conv.toolHandle = newCounterTool(conv)
+	conv.messages = []core.Message{core.SystemMessage(systemPrompt)}
 
 	fmt.Println("gai CLI — type 'model' to switch provider/model, Ctrl+C to exit.")
+	fmt.Println("Tool test: the assistant should call `increment_counter` until the counter reaches 5.")
 	fmt.Printf("Current provider: %s (%s)\n\n", conv.current.Label, conv.currentModel)
 
 	for {
@@ -156,7 +157,7 @@ func (c *conversation) processTurn(ctx context.Context, userInput string) error 
 		Tools:           []core.ToolHandle{c.toolHandle},
 		ToolChoice:      core.ToolChoiceAuto,
 		StopWhen:        core.NoMoreTools(),
-		Metadata:        map[string]any{"conversation_id": c.conversationID, "turn": c.turn + 1},
+		Metadata:        map[string]any{"conversation_id": c.conversationID, "turn": strconv.Itoa(c.turn + 1)},
 		ProviderOptions: map[string]any{},
 	}
 
@@ -222,8 +223,10 @@ func (c *conversation) processTurn(ctx context.Context, userInput string) error 
 		}
 	}
 
-	assistantMsg := core.AssistantMessage(finalText)
-	c.messages = append(c.messages, assistantMsg)
+	if strings.TrimSpace(finalText) != "" && finalText != "(no assistant response)" {
+		assistantMsg := core.AssistantMessage(finalText)
+		c.messages = append(c.messages, assistantMsg)
+	}
 
 	elapsed := time.Since(start)
 	meta := stream.Meta()
@@ -264,7 +267,7 @@ func (c *conversation) processTurn(ctx context.Context, userInput string) error 
 		Output:       obs.MessageFromCore(core.AssistantMessage(finalText)),
 		Usage:        obs.UsageFromCore(meta.Usage),
 		LatencyMS:    elapsed.Milliseconds(),
-		Metadata:     map[string]any{"conversation_id": c.conversationID, "turn": c.turn + 1},
+		Metadata:     map[string]any{"conversation_id": c.conversationID, "turn": strconv.Itoa(c.turn + 1)},
 		CreatedAtUTC: time.Now().UTC().UnixMilli(),
 	})
 
@@ -534,25 +537,85 @@ func loadDotEnv() error {
 func initObservability(ctx context.Context) (func(context.Context) error, error) {
 	opts := obs.DefaultOptions()
 	opts.ServiceName = "gai-cli"
-	if eps := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); eps != "" {
-		opts.Endpoint = eps
+
+	setExporterFromEnv(&opts)
+	configureMetricsFromEnv(&opts)
+	configureBraintrustFromEnv(&opts)
+
+	if opts.Exporter == obs.ExporterNone && !opts.Braintrust.Enabled {
+		fmt.Fprintln(os.Stderr, "GAI CLI: observability disabled (no exporter or Braintrust configured)")
+		return func(context.Context) error { return nil }, nil
 	}
-	if os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true" {
-		opts.Insecure = true
+
+	shutdown, err := obs.Init(ctx, opts)
+	if err != nil {
+		return func(context.Context) error { return nil }, fmt.Errorf("init observability: %w", err)
 	}
-	btKey := os.Getenv("BRAINTRUST_API_KEY")
-	if btKey == "" {
-		return nil, fmt.Errorf("BRAINTRUST_API_KEY must be set to log completions")
+	return shutdown, nil
+}
+
+func setExporterFromEnv(opts *obs.Options) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GAI_OBS_EXPORTER"))) {
+	case "stdout":
+		opts.Exporter = obs.ExporterStdout
+	case "otlp":
+		opts.Exporter = obs.ExporterOTLP
+	case "none":
+		opts.Exporter = obs.ExporterNone
+	}
+
+	if opts.Exporter == obs.ExporterOTLP {
+		if endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); endpoint != "" {
+			opts.Endpoint = endpoint
+		}
+		if strings.EqualFold(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE"), "true") {
+			opts.Insecure = true
+		}
+	}
+
+	if opts.Exporter == obs.ExporterOTLP && opts.Endpoint == "" {
+		// Require explicit endpoint; otherwise default to disabling exporter
+		opts.Exporter = obs.ExporterNone
+	}
+
+	if opts.Exporter != obs.ExporterOTLP {
+		opts.Endpoint = ""
+		opts.Insecure = false
+	}
+}
+
+func configureMetricsFromEnv(opts *obs.Options) {
+	if strings.EqualFold(os.Getenv("GAI_OBS_DISABLE_METRICS"), "true") {
+		opts.DisableMetrics = true
+	}
+	if ratio := strings.TrimSpace(os.Getenv("GAI_OBS_SAMPLE_RATIO")); ratio != "" {
+		if v, err := strconv.ParseFloat(ratio, 64); err == nil && v > 0 && v <= 1 {
+			opts.SampleRatio = v
+		}
+	}
+}
+
+func configureBraintrustFromEnv(opts *obs.Options) {
+	key := strings.TrimSpace(os.Getenv("BRAINTRUST_API_KEY"))
+	if key == "" {
+		opts.Braintrust.Enabled = false
+		return
+	}
+	proj := strings.TrimSpace(os.Getenv("BRAINTRUST_PROJECT_NAME"))
+	projID := strings.TrimSpace(os.Getenv("BRAINTRUST_PROJECT_ID"))
+	if proj == "" && projID == "" {
+		fmt.Fprintln(os.Stderr, "GAI CLI: BRAINTRUST_API_KEY set without project; disabling Braintrust sink")
+		opts.Braintrust.Enabled = false
+		return
 	}
 	opts.Braintrust.Enabled = true
-	opts.Braintrust.APIKey = btKey
-	opts.Braintrust.Project = os.Getenv("BRAINTRUST_PROJECT_NAME")
-	opts.Braintrust.ProjectID = os.Getenv("BRAINTRUST_PROJECT_ID")
-	opts.Braintrust.Dataset = os.Getenv("BRAINTRUST_DATASET")
-	if opts.Braintrust.Project == "" && opts.Braintrust.ProjectID == "" {
-		return nil, fmt.Errorf("set BRAINTRUST_PROJECT_NAME or BRAINTRUST_PROJECT_ID")
+	opts.Braintrust.APIKey = key
+	opts.Braintrust.Project = proj
+	opts.Braintrust.ProjectID = projID
+	opts.Braintrust.Dataset = strings.TrimSpace(os.Getenv("BRAINTRUST_DATASET"))
+	if baseURL := strings.TrimSpace(os.Getenv("BRAINTRUST_BASE_URL")); baseURL != "" {
+		opts.Braintrust.BaseURL = baseURL
 	}
-	return obs.Init(ctx, opts)
 }
 
 func buildProviders() ([]*providerEntry, error) {
@@ -577,7 +640,7 @@ func buildProviders() ([]*providerEntry, error) {
 		providers = append(providers, &providerEntry{
 			Name:    "openai-responses",
 			Label:   "OpenAI Responses",
-			Models:  []string{"o4-mini", "o4", "gpt-4.1-mini"},
+			Models:  []string{"o4-mini", "o4", "gpt-4.1-mini", "gpt-5-codex"},
 			Default: "o4-mini",
 			Client:  respClient,
 		})
@@ -626,98 +689,27 @@ func newRunner(p core.Provider) *runner.Runner {
 	)
 }
 
-func newCalculatorTool() core.ToolHandle {
-	type calcInput struct {
-		Expression string `json:"expression"`
+func newCounterTool(conv *conversation) core.ToolHandle {
+	type counterInput struct {
+		Amount int `json:"amount,omitempty"` // Optional increment amount (defaults to 1)
 	}
-	type calcOutput struct {
-		Result float64 `json:"result"`
+	type counterOutput struct {
+		Count int `json:"count"`
 	}
-	tool := tools.New[calcInput, calcOutput]("calculator", "Evaluate arithmetic expressions", func(ctx context.Context, in calcInput, meta core.ToolMeta) (calcOutput, error) {
-		if strings.TrimSpace(in.Expression) == "" {
-			return calcOutput{}, fmt.Errorf("expression required")
-		}
-		value, err := evaluateExpression(in.Expression)
-		if err != nil {
-			return calcOutput{}, err
-		}
-		return calcOutput{Result: value}, nil
-	})
+	tool := tools.New[counterInput, counterOutput](
+		"increment_counter",
+		"Increment and return the latest counter value.",
+		func(ctx context.Context, in counterInput, meta core.ToolMeta) (counterOutput, error) {
+			conv.counterMu.Lock()
+			increment := in.Amount
+			if increment == 0 {
+				increment = 1
+			}
+			conv.counter += increment
+			count := conv.counter
+			conv.counterMu.Unlock()
+			return counterOutput{Count: count}, nil
+		},
+	)
 	return tools.NewCoreAdapter(tool)
-}
-
-func evaluateExpression(expr string) (float64, error) {
-	parsed, err := parser.ParseExpr(expr)
-	if err != nil {
-		return 0, err
-	}
-	return evalNode(parsed)
-}
-
-func evalNode(node ast.Expr) (float64, error) {
-	switch n := node.(type) {
-	case *ast.BasicLit:
-		switch n.Kind {
-		case token.INT:
-			v, err := strconv.ParseInt(n.Value, 10, 64)
-			if err != nil {
-				return 0, err
-			}
-			return float64(v), nil
-		case token.FLOAT:
-			v, err := strconv.ParseFloat(n.Value, 64)
-			if err != nil {
-				return 0, err
-			}
-			return v, nil
-		default:
-			return 0, fmt.Errorf("unsupported literal: %s", n.Value)
-		}
-	case *ast.ParenExpr:
-		return evalNode(n.X)
-	case *ast.UnaryExpr:
-		val, err := evalNode(n.X)
-		if err != nil {
-			return 0, err
-		}
-		switch n.Op {
-		case token.ADD:
-			return val, nil
-		case token.SUB:
-			return -val, nil
-		default:
-			return 0, fmt.Errorf("unsupported unary operator: %s", n.Op)
-		}
-	case *ast.BinaryExpr:
-		left, err := evalNode(n.X)
-		if err != nil {
-			return 0, err
-		}
-		right, err := evalNode(n.Y)
-		if err != nil {
-			return 0, err
-		}
-		switch n.Op {
-		case token.ADD:
-			return left + right, nil
-		case token.SUB:
-			return left - right, nil
-		case token.MUL:
-			return left * right, nil
-		case token.QUO:
-			if right == 0 {
-				return 0, fmt.Errorf("division by zero")
-			}
-			return left / right, nil
-		case token.REM:
-			if right == 0 {
-				return 0, fmt.Errorf("modulo by zero")
-			}
-			return math.Mod(left, right), nil
-		default:
-			return 0, fmt.Errorf("unsupported operator: %s", n.Op)
-		}
-	default:
-		return 0, fmt.Errorf("unsupported expression")
-	}
 }

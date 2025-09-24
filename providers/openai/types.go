@@ -43,14 +43,32 @@ type openAIMessage struct {
 }
 
 type openAIContent struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitempty"`
-	ImageURL *openAIImageURL `json:"image_url,omitempty"`
+	Type       string            `json:"type"`
+	Text       string            `json:"text,omitempty"`
+	ImageURL   *openAIImageURL   `json:"image_url,omitempty"`
+	Image      *openAIImageInput `json:"image,omitempty"`
+	InputAudio *openAIInputAudio `json:"input_audio,omitempty"`
+	InputVideo *openAIInputVideo `json:"input_video,omitempty"`
 }
 
 type openAIImageURL struct {
 	URL    string `json:"url"`
 	Detail string `json:"detail,omitempty"`
+}
+
+type openAIImageInput struct {
+	B64JSON  string `json:"b64_json"`
+	MimeType string `json:"mime_type,omitempty"`
+}
+
+type openAIInputAudio struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
+}
+
+type openAIInputVideo struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
 }
 
 type openAITool struct {

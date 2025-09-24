@@ -7,20 +7,32 @@ import (
 // ResponsesRequest represents a request to the OpenAI Responses API.
 type ResponsesRequest struct {
 	Model              string            `json:"model"`
-	Input              any               `json:"input"`                  // string | ResponseInputParam | []ResponseInputParam
-	Instructions       string            `json:"instructions,omitempty"` // System/developer instructions
+	Input              any               `json:"input"`
+	Instructions       string            `json:"instructions,omitempty"`
+	Modalities         []string          `json:"modalities,omitempty"`
 	Tools              []ResponseTool    `json:"tools,omitempty"`
-	PreviousResponseID string            `json:"previous_response_id,omitempty"` // For stateful multi-turn
+	ToolChoice         any               `json:"tool_choice,omitempty"`
+	PreviousResponseID string            `json:"previous_response_id,omitempty"`
 	Stream             bool              `json:"stream,omitempty"`
-	Background         bool              `json:"background,omitempty"` // Async mode
+	Background         bool              `json:"background,omitempty"`
 	Reasoning          *ReasoningParams  `json:"reasoning,omitempty"`
-	Store              *bool             `json:"store,omitempty"` // Default: true
+	Store              *bool             `json:"store,omitempty"`
 	Metadata           map[string]any    `json:"metadata,omitempty"`
-	Text               *TextFormatParams `json:"text,omitempty"` // For structured outputs
+	User               string            `json:"user,omitempty"`
+	Text               *TextFormatParams `json:"text,omitempty"`
+	Audio              *AudioParams      `json:"audio,omitempty"`
 	Temperature        float32           `json:"temperature,omitempty"`
 	TopP               float32           `json:"top_p,omitempty"`
+	TopK               int               `json:"top_k,omitempty"`
+	Seed               *int              `json:"seed,omitempty"`
+	Stop               []string          `json:"stop,omitempty"`
+	MaxPromptTokens    int               `json:"max_prompt_tokens,omitempty"`
 	MaxOutputTokens    int               `json:"max_output_tokens,omitempty"`
-	ToolChoice         string            `json:"tool_choice,omitempty"` // auto | none | required
+	ParallelToolCalls  *bool             `json:"parallel_tool_calls,omitempty"`
+	ParallelToolLimit  int               `json:"parallel_tool_call_limit,omitempty"`
+	MaxToolCalls       int               `json:"max_tool_calls,omitempty"`
+	Truncation         string            `json:"truncation,omitempty"`
+	Prediction         map[string]any    `json:"prediction,omitempty"`
 }
 
 // ActualResponsesResponse represents the actual response structure from the API
@@ -71,8 +83,8 @@ type ActualResponseItem struct {
 	Role    string              `json:"role,omitempty"`
 
 	// For tool calls
-	Name      string         `json:"name,omitempty"`
-	Arguments map[string]any `json:"arguments,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
 
 // ActualContentPart represents actual content structure
@@ -163,6 +175,15 @@ type TextFormat struct {
 	JSONSchema *JSONSchema `json:"json_schema,omitempty"`
 }
 
+// AudioParams configures audio output settings when modalities include audio.
+type AudioParams struct {
+	Voice      string `json:"voice,omitempty"`
+	Format     string `json:"format,omitempty"`
+	SampleRate int    `json:"sample_rate,omitempty"`
+	Language   string `json:"language,omitempty"`
+	Quality    string `json:"quality,omitempty"`
+}
+
 // JSONSchema represents a JSON Schema definition.
 type JSONSchema struct {
 	Name   string         `json:"name"`
@@ -200,6 +221,32 @@ type ResponseError struct {
 	Code    string `json:"code,omitempty"`
 }
 
+// ToolChoiceOption allows forcing a specific tool call strategy.
+type ToolChoiceOption struct {
+	Type     string              `json:"type"`
+	Function *ToolChoiceFunction `json:"function,omitempty"`
+}
+
+// ToolChoiceFunction describes a targeted function tool selection.
+type ToolChoiceFunction struct {
+	Name string `json:"name"`
+}
+
+// FunctionCallParam encodes a model-issued function call in the request history.
+type FunctionCallParam struct {
+	Type      string `json:"type"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+// FunctionCallOutputParam encodes the tool result returned to the model.
+type FunctionCallOutputParam struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Output string `json:"output"`
+}
+
 // StreamEvent types for SSE streaming
 type StreamEvent struct {
 	Event string          `json:"-"`    // The event type (e.g., "response.created")
@@ -207,29 +254,39 @@ type StreamEvent struct {
 }
 
 type StreamEventResponseCreated struct {
-	ID     string `json:"id"`
-	Object string `json:"object"`
+	Response ActualResponsesResponse `json:"response"`
 }
 
 type StreamEventTextDelta struct {
-	OutputIndex  int    `json:"output_index"`
-	ContentIndex int    `json:"content_index"`
-	Delta        string `json:"delta"`
+	ItemID       string            `json:"item_id"`
+	OutputIndex  int               `json:"output_index"`
+	ContentIndex int               `json:"content_index"`
+	Delta        string            `json:"delta"`
+	Logprobs     []json.RawMessage `json:"logprobs,omitempty"`
+	Obfuscation  string            `json:"obfuscation,omitempty"`
 }
 
 type StreamEventTextDone struct {
-	OutputIndex  int    `json:"output_index"`
-	ContentIndex int    `json:"content_index"`
-	Text         string `json:"text"`
+	ItemID       string            `json:"item_id"`
+	OutputIndex  int               `json:"output_index"`
+	ContentIndex int               `json:"content_index"`
+	Text         string            `json:"text"`
+	Logprobs     []json.RawMessage `json:"logprobs,omitempty"`
 }
 
 type StreamEventReasoningDelta struct {
-	Delta string `json:"delta"`
+	ItemID       string `json:"item_id,omitempty"`
+	OutputIndex  int    `json:"output_index,omitempty"`
+	ContentIndex int    `json:"content_index,omitempty"`
+	Delta        string `json:"delta"`
 }
 
 type StreamEventReasoningDone struct {
-	Content string `json:"content"`
-	Summary string `json:"summary,omitempty"`
+	ItemID       string `json:"item_id,omitempty"`
+	OutputIndex  int    `json:"output_index,omitempty"`
+	ContentIndex int    `json:"content_index,omitempty"`
+	Content      string `json:"content"`
+	Summary      string `json:"summary,omitempty"`
 }
 
 type StreamEventToolCall struct {
@@ -241,11 +298,62 @@ type StreamEventToolCall struct {
 }
 
 type StreamEventCompleted struct {
-	ID    string       `json:"id"`
-	Usage *ActualUsage `json:"usage,omitempty"`
+	Response ActualResponsesResponse `json:"response"`
 }
 
 type StreamEventError struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+}
+
+type StreamEventOutputItemAdded struct {
+	Item struct {
+		ID        string `json:"id"`
+		Type      string `json:"type"`
+		Status    string `json:"status,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+		CallID    string `json:"call_id,omitempty"`
+		Name      string `json:"name,omitempty"`
+		Summary   any    `json:"summary,omitempty"`
+	} `json:"item"`
+}
+
+type StreamEventFunctionCallArgumentsDelta struct {
+	ItemID string `json:"item_id"`
+	Delta  string `json:"delta"`
+}
+
+type StreamEventFunctionCallArgumentsDone struct {
+	ItemID    string `json:"item_id"`
+	Arguments string `json:"arguments"`
+}
+
+type StreamEventContentPart struct {
+	ItemID       string              `json:"item_id"`
+	OutputIndex  int                 `json:"output_index"`
+	ContentIndex int                 `json:"content_index"`
+	Part         ResponseContentPart `json:"part"`
+}
+
+type ResponseContentPart struct {
+	Type        string            `json:"type"`
+	Text        string            `json:"text,omitempty"`
+	Annotations []json.RawMessage `json:"annotations,omitempty"`
+	Logprobs    []json.RawMessage `json:"logprobs,omitempty"`
+}
+
+type StreamEventOutputAudioDelta struct {
+	ItemID       string            `json:"item_id"`
+	OutputIndex  int               `json:"output_index"`
+	ContentIndex int               `json:"content_index"`
+	Delta        AudioDeltaPayload `json:"delta"`
+}
+
+type AudioDeltaPayload struct {
+	Audio AudioChunk `json:"audio"`
+}
+
+type AudioChunk struct {
+	Data   string `json:"data"`
+	Format string `json:"format,omitempty"`
 }

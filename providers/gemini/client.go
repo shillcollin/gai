@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/internal/httpclient"
 	"github.com/shillcollin/gai/obs"
+	"github.com/shillcollin/gai/schema"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -169,7 +171,7 @@ func buildRequest(req core.Request, model string) (*geminiRequest, error) {
 	if len(contents) == 0 {
 		return nil, errors.New("gemini: request requires messages")
 	}
-	return &geminiRequest{
+	request := &geminiRequest{
 		Model:    model,
 		Contents: contents,
 		GenerationConfig: geminiGenerationConfig{
@@ -178,7 +180,27 @@ func buildRequest(req core.Request, model string) (*geminiRequest, error) {
 			TopP:            req.TopP,
 		},
 		SafetySettings: convertSafety(req.Safety),
-	}, nil
+	}
+	if len(req.Tools) > 0 {
+		tools, err := convertTools(req.Tools)
+		if err != nil {
+			return nil, err
+		}
+		request.Tools = tools
+		request.ToolConfig = &geminiToolConfig{FunctionCallingConfig: &geminiFunctionCallingConfig{Mode: toGeminiToolMode(req.ToolChoice)}}
+		if request.ToolConfig.FunctionCallingConfig.Mode == "ANY" {
+			names := make([]string, 0, len(req.Tools))
+			for _, handle := range req.Tools {
+				if handle != nil {
+					names = append(names, handle.Name())
+				}
+			}
+			if len(names) > 0 {
+				request.ToolConfig.FunctionCallingConfig.AllowedFunctionNames = names
+			}
+		}
+	}
+	return request, nil
 }
 
 func consumeStream(body io.ReadCloser, stream *core.Stream) {
@@ -241,6 +263,28 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 		if text := resp.JoinText(); text != "" {
 			stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
 		}
+		for _, cand := range resp.Candidates {
+			for _, part := range cand.Content.Parts {
+				if part.FunctionCall != nil {
+					args := part.FunctionCall.Args
+					if args == nil {
+						args = map[string]any{}
+					}
+					stream.Push(core.StreamEvent{
+						Type: core.EventToolCall,
+						ToolCall: core.ToolCall{
+							ID:    "function_call",
+							Name:  part.FunctionCall.Name,
+							Input: args,
+						},
+						Seq:       seq,
+						Schema:    "gai.events.v1",
+						Timestamp: time.Now(),
+						Provider:  "gemini",
+					})
+				}
+			}
+		}
 		flushBuffer()
 	}
 	if err := scanner.Err(); err != nil {
@@ -288,6 +332,33 @@ func convertMessages(messages []core.Message) ([]geminiContent, error) {
 			switch p := part.(type) {
 			case core.Text:
 				parts = append(parts, geminiPart{Text: p.Text})
+			case core.Image:
+				inline, err := inlineDataFromBlob(p.Source)
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, geminiPart{InlineData: inline})
+			case core.ImageURL:
+				inline, err := inlineDataFromURL(p.URL, p.MIME)
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, geminiPart{InlineData: inline})
+			case core.Video:
+				inline, err := inlineDataFromVideo(p)
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, geminiPart{InlineData: inline})
+			case core.ToolCall:
+				args := p.Input
+				if args == nil {
+					args = map[string]any{}
+				}
+				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: p.Name, Args: args}})
+			case core.ToolResult:
+				response := makeFunctionResponsePayload(p)
+				parts = append(parts, geminiPart{FunctionResponse: &geminiFunctionResponse{Name: p.Name, Response: response}})
 			default:
 				return nil, fmt.Errorf("unsupported gemini part type %T", part)
 			}
@@ -305,6 +376,86 @@ func convertMessages(messages []core.Message) ([]geminiContent, error) {
 	}
 
 	return contents, nil
+}
+
+func inlineDataFromBlob(blob core.BlobRef) (*geminiInlineData, error) {
+	return inlineDataFromBlobWithMIME(blob, "")
+}
+
+func inlineDataFromVideo(video core.Video) (*geminiInlineData, error) {
+	mimeType := video.Source.MIME
+	if mimeType == "" {
+		if candidate := videoMIMEMapping[strings.TrimPrefix(strings.ToLower(video.Format), ".")]; candidate != "" {
+			mimeType = candidate
+		}
+	}
+	return inlineDataFromBlobWithMIME(video.Source, mimeType)
+}
+
+func inlineDataFromBlobWithMIME(blob core.BlobRef, override string) (*geminiInlineData, error) {
+	if err := blob.Validate(); err != nil {
+		return nil, fmt.Errorf("validate blob: %w", err)
+	}
+	if blob.Kind == core.BlobProvider {
+		return nil, errors.New("gemini requires inline data or fileUri; provider-managed blobs are not supported")
+	}
+	data, err := blob.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read blob: %w", err)
+	}
+	mimeType := override
+	if mimeType == "" {
+		mimeType = blob.MIME
+	}
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	if mimeType == "" {
+		return nil, errors.New("unable to determine MIME type for inline data")
+	}
+	return &geminiInlineData{MimeType: mimeType, Data: base64.StdEncoding.EncodeToString(data)}, nil
+}
+
+func inlineDataFromURL(resourceURL, mimeHint string) (*geminiInlineData, error) {
+	if strings.TrimSpace(resourceURL) == "" {
+		return nil, errors.New("url is required for inline data")
+	}
+	resp, err := http.Get(resourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", resourceURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("fetch %s: status %s", resourceURL, resp.Status)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", resourceURL, err)
+	}
+	mimeType := strings.TrimSpace(mimeHint)
+	if mimeType == "" {
+		mimeType = strings.TrimSpace(resp.Header.Get("Content-Type"))
+		if idx := strings.Index(mimeType, ";"); idx >= 0 {
+			mimeType = strings.TrimSpace(mimeType[:idx])
+		}
+	}
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	if mimeType == "" {
+		return nil, fmt.Errorf("unable to determine MIME type for %s", resourceURL)
+	}
+	return &geminiInlineData{MimeType: mimeType, Data: base64.StdEncoding.EncodeToString(data)}, nil
+}
+
+var videoMIMEMapping = map[string]string{
+	"mp4":  "video/mp4",
+	"mov":  "video/quicktime",
+	"m4v":  "video/x-m4v",
+	"webm": "video/webm",
+	"mkv":  "video/x-matroska",
+	"ogg":  "video/ogg",
+	"ogv":  "video/ogg",
 }
 
 func convertSafety(cfg *core.SafetyConfig) []geminiSafetySetting {
@@ -333,6 +484,81 @@ func toThreshold(level core.SafetyLevel) string {
 	default:
 		return "BLOCK_MEDIUM_AND_ABOVE"
 	}
+}
+
+func convertTools(handles []core.ToolHandle) ([]geminiTool, error) {
+	if len(handles) == 0 {
+		return nil, nil
+	}
+	decls := make([]geminiFunctionDeclaration, 0, len(handles))
+	for _, handle := range handles {
+		if handle == nil {
+			continue
+		}
+		schemaMap, err := schemaToMap(handle.InputSchema())
+		if err != nil {
+			return nil, err
+		}
+		decls = append(decls, geminiFunctionDeclaration{
+			Name:        handle.Name(),
+			Description: handle.Description(),
+			Parameters:  schemaMap,
+		})
+	}
+	if len(decls) == 0 {
+		return nil, nil
+	}
+	return []geminiTool{{FunctionDeclarations: decls}}, nil
+}
+
+func schemaToMap(s *schema.Schema) (map[string]any, error) {
+	if s == nil {
+		return map[string]any{"type": "object"}, nil
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return nil, fmt.Errorf("marshal schema: %w", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal schema: %w", err)
+	}
+	return out, nil
+}
+
+func toGeminiToolMode(choice core.ToolChoice) string {
+	switch choice {
+	case core.ToolChoiceNone:
+		return "NONE"
+	case core.ToolChoiceRequired:
+		return "ANY"
+	default:
+		return "AUTO"
+	}
+}
+
+func makeFunctionResponsePayload(result core.ToolResult) map[string]any {
+	response := map[string]any{}
+	switch v := result.Result.(type) {
+	case nil:
+		// no data
+	case map[string]any:
+		for key, value := range v {
+			response[key] = value
+		}
+	case string:
+		response["text"] = v
+	default:
+		if data, err := json.Marshal(v); err == nil {
+			response["json"] = string(data)
+		} else {
+			response["value"] = fmt.Sprintf("%v", v)
+		}
+	}
+	if result.Error != "" {
+		response["error"] = result.Error
+	}
+	return response
 }
 
 func chooseModel(request, fallback string) string {
