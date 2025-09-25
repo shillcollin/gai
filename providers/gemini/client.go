@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,15 @@ type Client struct {
 	opts       options
 	httpClient *http.Client
 }
+
+const (
+	metadataKeyRawContent        = "gemini.raw_content"
+	metadataKeyThoughtSignature  = "gemini.thought_signature"
+	metadataKeyThought           = "gemini.thought"
+	providerOptionThinkingBudget = "gemini.thinking.budget"
+	providerOptionIncludeThought = "gemini.thinking.include_thoughts"
+	providerOptionResponseMIME   = "gemini.response_mime_type"
+)
 
 func New(opts ...Option) *Client {
 	o := defaultOptions()
@@ -67,14 +77,14 @@ func (c *Client) GenerateText(ctx context.Context, req core.Request) (_ *core.Te
 	if text == "" {
 		return nil, errors.New("gemini: empty response")
 	}
-	if len(resp.Candidates) > 0 {
-		usageTokens = obs.UsageFromCore(core.Usage{})
-	}
+	usage := resp.UsageMetadata.toCore()
+	usageTokens = obs.UsageFromCore(usage)
 	return &core.TextResult{
 		Text:         text,
 		Model:        model,
 		Provider:     "gemini",
 		FinishReason: core.StopReason{Type: resp.Candidates[0].FinishReason},
+		Usage:        usage,
 	}, nil
 }
 
@@ -104,19 +114,93 @@ func (c *Client) StreamText(ctx context.Context, req core.Request) (*core.Stream
 	return stream, nil
 }
 
-func (c *Client) GenerateObject(ctx context.Context, req core.Request) (*core.ObjectResultRaw, error) {
-	res, err := c.GenerateText(ctx, req)
+func (c *Client) GenerateObject(ctx context.Context, req core.Request) (_ *core.ObjectResultRaw, err error) {
+	ctx, recorder := obs.StartRequest(ctx, "providers.gemini.GenerateObject",
+		attribute.String("ai.provider", "gemini"),
+		attribute.String("ai.operation", "generateContent"),
+	)
+	var usageTokens obs.UsageTokens
+	defer func() {
+		recorder.End(err, usageTokens)
+	}()
+
+	clone := req.Clone()
+	clone.ProviderOptions = cloneAnyMap(clone.ProviderOptions)
+	if clone.ProviderOptions == nil {
+		clone.ProviderOptions = map[string]any{}
+	}
+	if _, ok := clone.ProviderOptions[providerOptionResponseMIME]; !ok {
+		clone.ProviderOptions[providerOptionResponseMIME] = "application/json"
+	}
+
+	model := chooseModel(clone.Model, c.opts.model)
+	clone.Model = model
+	payload, err := buildRequest(clone, model)
 	if err != nil {
 		return nil, err
 	}
-	return &core.ObjectResultRaw{JSON: []byte(res.Text), Model: res.Model, Provider: res.Provider, Usage: res.Usage}, nil
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
+	body, err := c.doRequest(ctx, payload, false)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+
+	var resp geminiResponse
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("decode gemini response: %w", err)
+	}
+	text := strings.TrimSpace(resp.JoinText())
+	if text == "" {
+		return nil, errors.New("gemini: empty structured response")
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(text)); err != nil {
+		return nil, fmt.Errorf("gemini: structured output is not valid json: %w", err)
+	}
+	usage := resp.UsageMetadata.toCore()
+	usageTokens = obs.UsageFromCore(usage)
+	return &core.ObjectResultRaw{
+		JSON:     compact.Bytes(),
+		Model:    model,
+		Provider: "gemini",
+		Usage:    usage,
+	}, nil
 }
 
 func (c *Client) StreamObject(ctx context.Context, req core.Request) (*core.ObjectStreamRaw, error) {
-	stream, err := c.StreamText(ctx, req)
+	ctx, recorder := obs.StartRequest(ctx, "providers.gemini.StreamObject",
+		attribute.String("ai.provider", "gemini"),
+		attribute.String("ai.operation", "streamGenerateContent"),
+	)
+	clone := req.Clone()
+	clone.ProviderOptions = cloneAnyMap(clone.ProviderOptions)
+	if clone.ProviderOptions == nil {
+		clone.ProviderOptions = map[string]any{}
+	}
+	if _, ok := clone.ProviderOptions[providerOptionResponseMIME]; !ok {
+		clone.ProviderOptions[providerOptionResponseMIME] = "application/json"
+	}
+
+	model := chooseModel(clone.Model, c.opts.model)
+	clone.Model = model
+	payload, err := buildRequest(clone, model)
 	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
 		return nil, err
 	}
+	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
+	body, err := c.doRequest(ctx, payload, true)
+	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
+		return nil, err
+	}
+	stream := core.NewStream(ctx, 64)
+	go func() {
+		consumeStream(body, stream)
+		meta := stream.Meta()
+		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+	}()
 	return core.NewObjectStreamRaw(stream), nil
 }
 
@@ -200,6 +284,11 @@ func buildRequest(req core.Request, model string) (*geminiRequest, error) {
 			}
 		}
 	}
+	if len(req.ProviderOptions) > 0 {
+		if err := applyProviderOptions(request, req.ProviderOptions); err != nil {
+			return nil, err
+		}
+	}
 	return request, nil
 }
 
@@ -244,10 +333,7 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 				var respArr []geminiStreamResponse
 				if errArr := json.Unmarshal([]byte(buffer.String()), &respArr); errArr == nil {
 					for _, item := range respArr {
-						seq++
-						if text := item.JoinText(); text != "" {
-							stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-						}
+						emitStreamEvents(stream, item, &seq)
 					}
 					flushBuffer()
 					continue
@@ -259,36 +345,63 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 			continue
 		}
 
-		seq++
-		if text := resp.JoinText(); text != "" {
-			stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-		}
-		for _, cand := range resp.Candidates {
-			for _, part := range cand.Content.Parts {
-				if part.FunctionCall != nil {
-					args := part.FunctionCall.Args
-					if args == nil {
-						args = map[string]any{}
-					}
-					stream.Push(core.StreamEvent{
-						Type: core.EventToolCall,
-						ToolCall: core.ToolCall{
-							ID:    "function_call",
-							Name:  part.FunctionCall.Name,
-							Input: args,
-						},
-						Seq:       seq,
-						Schema:    "gai.events.v1",
-						Timestamp: time.Now(),
-						Provider:  "gemini",
-					})
-				}
-			}
-		}
+		emitStreamEvents(stream, resp, &seq)
 		flushBuffer()
 	}
 	if err := scanner.Err(); err != nil {
 		stream.Fail(err)
+	}
+}
+
+func emitStreamEvents(stream *core.Stream, resp geminiStreamResponse, seq *int) {
+	if text := resp.JoinText(); text != "" {
+		*seq++
+		stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: *seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+	}
+	for _, cand := range resp.Candidates {
+		rawContent := marshalGeminiContent(cand.Content)
+		for _, part := range cand.Content.Parts {
+			if part.FunctionCall == nil {
+				continue
+			}
+			callID := strings.TrimSpace(part.FunctionCall.ID)
+			if callID == "" {
+				callID = fmt.Sprintf("call_%d", *seq+1)
+			}
+			args := cloneMap(part.FunctionCall.Args)
+			metadata := map[string]any{}
+			if rawContent != "" {
+				metadata[metadataKeyRawContent] = rawContent
+			}
+			if sig := strings.TrimSpace(part.ThoughtSignature); sig != "" {
+				metadata[metadataKeyThoughtSignature] = sig
+			}
+			if part.Thought {
+				metadata[metadataKeyThought] = true
+			}
+			toolCall := core.ToolCall{
+				ID:       callID,
+				Name:     part.FunctionCall.Name,
+				Input:    args,
+				Metadata: nil,
+			}
+			if len(metadata) > 0 {
+				toolCall.Metadata = metadata
+			}
+			if toolCall.Input == nil {
+				toolCall.Input = map[string]any{}
+			}
+			*seq++
+			stream.Push(core.StreamEvent{
+				Type:      core.EventToolCall,
+				ToolCall:  toolCall,
+				Seq:       *seq,
+				Schema:    "gai.events.v1",
+				Timestamp: time.Now(),
+				Provider:  "gemini",
+				Ext:       cloneAnyMap(metadata),
+			})
+		}
 	}
 }
 
@@ -317,6 +430,16 @@ func convertMessages(messages []core.Message) ([]geminiContent, error) {
 			continue
 		}
 
+		if raw, ok := message.Metadata[metadataKeyRawContent]; ok {
+			if content, ok := restoreGeminiContent(raw); ok {
+				if content.Role == "" {
+					content.Role = roleFromMessageRole(message.Role)
+				}
+				contents = append(contents, content)
+				continue
+			}
+		}
+
 		role := "user"
 		switch message.Role {
 		case core.User:
@@ -331,6 +454,9 @@ func convertMessages(messages []core.Message) ([]geminiContent, error) {
 		for _, part := range message.Parts {
 			switch p := part.(type) {
 			case core.Text:
+				if p.Text == "" {
+					continue
+				}
 				parts = append(parts, geminiPart{Text: p.Text})
 			case core.Image:
 				inline, err := inlineDataFromBlob(p.Source)
@@ -351,14 +477,30 @@ func convertMessages(messages []core.Message) ([]geminiContent, error) {
 				}
 				parts = append(parts, geminiPart{InlineData: inline})
 			case core.ToolCall:
-				args := p.Input
-				if args == nil {
-					args = map[string]any{}
+				args := cloneMap(p.Input)
+				fc := &geminiFunctionCall{Name: p.Name, Args: args}
+				if p.ID != "" {
+					fc.ID = p.ID
 				}
-				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: p.Name, Args: args}})
+				gemPart := geminiPart{FunctionCall: fc}
+				if sig, ok := extractMetadataString(p.Metadata, metadataKeyThoughtSignature); ok {
+					gemPart.ThoughtSignature = sig
+				} else if sig, ok := extractMetadataString(message.Metadata, metadataKeyThoughtSignature); ok {
+					gemPart.ThoughtSignature = sig
+				}
+				if thought, ok := p.Metadata[metadataKeyThought].(bool); ok && thought {
+					gemPart.Thought = true
+				} else if thought, ok := message.Metadata[metadataKeyThought].(bool); ok && thought {
+					gemPart.Thought = true
+				}
+				parts = append(parts, gemPart)
 			case core.ToolResult:
 				response := makeFunctionResponsePayload(p)
-				parts = append(parts, geminiPart{FunctionResponse: &geminiFunctionResponse{Name: p.Name, Response: response}})
+				funcResp := &geminiFunctionResponse{Name: p.Name, Response: response}
+				if p.ID != "" {
+					funcResp.ID = p.ID
+				}
+				parts = append(parts, geminiPart{FunctionResponse: funcResp})
 			default:
 				return nil, fmt.Errorf("unsupported gemini part type %T", part)
 			}
@@ -376,6 +518,17 @@ func convertMessages(messages []core.Message) ([]geminiContent, error) {
 	}
 
 	return contents, nil
+}
+
+func roleFromMessageRole(role core.Role) string {
+	switch role {
+	case core.Assistant:
+		return "model"
+	case core.User:
+		return "user"
+	default:
+		return "user"
+	}
 }
 
 func inlineDataFromBlob(blob core.BlobRef) (*geminiInlineData, error) {
@@ -511,6 +664,26 @@ func convertTools(handles []core.ToolHandle) ([]geminiTool, error) {
 	return []geminiTool{{FunctionDeclarations: decls}}, nil
 }
 
+func applyProviderOptions(request *geminiRequest, opts map[string]any) error {
+	if mime, ok := getString(opts, providerOptionResponseMIME); ok {
+		request.GenerationConfig.ResponseMimeType = mime
+	}
+	budget, ok := getInt(opts, providerOptionThinkingBudget)
+	if ok {
+		if request.GenerationConfig.ThinkingConfig == nil {
+			request.GenerationConfig.ThinkingConfig = &geminiThinkingConfig{}
+		}
+		request.GenerationConfig.ThinkingConfig.ThinkingBudget = budget
+	}
+	if include, ok := getBool(opts, providerOptionIncludeThought); ok {
+		if request.GenerationConfig.ThinkingConfig == nil {
+			request.GenerationConfig.ThinkingConfig = &geminiThinkingConfig{}
+		}
+		request.GenerationConfig.ThinkingConfig.IncludeThoughts = include
+	}
+	return nil
+}
+
 func schemaToMap(s *schema.Schema) (map[string]any, error) {
 	if s == nil {
 		return map[string]any{"type": "object"}, nil
@@ -549,16 +722,162 @@ func makeFunctionResponsePayload(result core.ToolResult) map[string]any {
 	case string:
 		response["text"] = v
 	default:
-		if data, err := json.Marshal(v); err == nil {
-			response["json"] = string(data)
-		} else {
-			response["value"] = fmt.Sprintf("%v", v)
-		}
+		response["output"] = v
 	}
 	if result.Error != "" {
 		response["error"] = result.Error
 	}
 	return response
+}
+
+func marshalGeminiContent(content geminiContent) string {
+	data, err := json.Marshal(content)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func cloneMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func restoreGeminiContent(raw any) (geminiContent, bool) {
+	switch v := raw.(type) {
+	case string:
+		var content geminiContent
+		if err := json.Unmarshal([]byte(v), &content); err == nil {
+			return content, true
+		}
+	case []byte:
+		var content geminiContent
+		if err := json.Unmarshal(v, &content); err == nil {
+			return content, true
+		}
+	case map[string]any:
+		if data, err := json.Marshal(v); err == nil {
+			var content geminiContent
+			if err := json.Unmarshal(data, &content); err == nil {
+				return content, true
+			}
+		}
+	case geminiContent:
+		return v, true
+	}
+	return geminiContent{}, false
+}
+
+func extractMetadataString(meta map[string]any, key string) (string, bool) {
+	if meta == nil {
+		return "", false
+	}
+	val, ok := meta[key]
+	if !ok {
+		return "", false
+	}
+	switch v := val.(type) {
+	case string:
+		return v, true
+	case []byte:
+		return string(v), true
+	}
+	return "", false
+}
+
+func getInt(opts map[string]any, key string) (int, bool) {
+	val, ok := opts[key]
+	if !ok {
+		return 0, false
+	}
+	switch v := val.(type) {
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case string:
+		i, err := strconv.Atoi(v)
+		if err == nil {
+			return i, true
+		}
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return int(i), true
+		}
+	}
+	return 0, false
+}
+
+func getBool(opts map[string]any, key string) (bool, bool) {
+	val, ok := opts[key]
+	if !ok {
+		return false, false
+	}
+	switch v := val.(type) {
+	case bool:
+		return v, true
+	case string:
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			return parsed, true
+		}
+	}
+	return false, false
+}
+
+func getString(opts map[string]any, key string) (string, bool) {
+	val, ok := opts[key]
+	if !ok {
+		return "", false
+	}
+	switch v := val.(type) {
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return "", false
+		}
+		return trimmed, true
+	case json.Number:
+		trimmed := strings.TrimSpace(v.String())
+		if trimmed == "" {
+			return "", false
+		}
+		return trimmed, true
+	case fmt.Stringer:
+		trimmed := strings.TrimSpace(v.String())
+		if trimmed == "" {
+			return "", false
+		}
+		return trimmed, true
+	default:
+		trimmed := strings.TrimSpace(fmt.Sprint(v))
+		if trimmed == "" {
+			return "", false
+		}
+		return trimmed, true
+	}
 }
 
 func chooseModel(request, fallback string) string {

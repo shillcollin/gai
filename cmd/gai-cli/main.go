@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -256,6 +257,8 @@ func (c *conversation) processTurn(ctx context.Context, userInput string) error 
 		fmt.Println()
 	}
 
+	toolCallRecords := buildToolCallRecords(toolRecords)
+
 	fmt.Printf("Assistant (%s / %s):\n%s\n\n", c.current.Label, c.currentModel, finalText)
 	fmt.Printf("Usage: input=%d output=%d total=%d (%.2fs)\n\n", meta.Usage.InputTokens, meta.Usage.OutputTokens, meta.Usage.TotalTokens, elapsed.Seconds())
 
@@ -267,7 +270,8 @@ func (c *conversation) processTurn(ctx context.Context, userInput string) error 
 		Output:       obs.MessageFromCore(core.AssistantMessage(finalText)),
 		Usage:        obs.UsageFromCore(meta.Usage),
 		LatencyMS:    elapsed.Milliseconds(),
-		Metadata:     map[string]any{"conversation_id": c.conversationID, "turn": strconv.Itoa(c.turn + 1)},
+		Metadata:     map[string]any{"conversation_id": c.conversationID, "turn": strconv.Itoa(c.turn + 1), "tool_call_count": len(toolCallRecords)},
+		ToolCalls:    toolCallRecords,
 		CreatedAtUTC: time.Now().UTC().UnixMilli(),
 	})
 
@@ -318,6 +322,68 @@ func printToolResult(result core.ToolResult) {
 	}
 	outputJSON := mustJSON(result.Result)
 	fmt.Printf("[Tool result] %s -> %s\n", result.Name, outputJSON)
+}
+
+func buildToolCallRecords(records []toolTranscript) []obs.ToolCallRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	byKey := make(map[string]*obs.ToolCallRecord)
+	order := make([]string, 0)
+	fallback := 0
+	ensure := func(id string, step int, name string) *obs.ToolCallRecord {
+		key := id
+		if key == "" {
+			key = fmt.Sprintf("step%d_%d_%s", step, fallback, name)
+			fallback++
+		}
+		rec, ok := byKey[key]
+		if !ok {
+			rec = &obs.ToolCallRecord{Step: step, ID: id, Name: name}
+			byKey[key] = rec
+			order = append(order, key)
+		} else {
+			if rec.Step == 0 && step != 0 {
+				rec.Step = step
+			}
+			if rec.Name == "" {
+				rec.Name = name
+			}
+		}
+		return rec
+	}
+
+	for _, entry := range records {
+		if entry.Call.Name != "" {
+			rec := ensure(entry.Call.ID, entry.StepID, entry.Call.Name)
+			rec.Input = obs.NormalizeMap(entry.Call.Input)
+		}
+		if entry.Result.Name != "" || entry.Result.Result != nil || entry.Result.Error != "" {
+			rec := ensure(entry.Result.ID, entry.StepID, entry.Result.Name)
+			if entry.Result.Result != nil {
+				rec.Result = obs.NormalizeValue(entry.Result.Result)
+			}
+			if entry.Result.Error != "" {
+				rec.Error = entry.Result.Error
+			}
+		}
+	}
+
+	out := make([]obs.ToolCallRecord, 0, len(order))
+	for _, key := range order {
+		rec := byKey[key]
+		if rec == nil {
+			continue
+		}
+		out = append(out, *rec)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Step == out[j].Step {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Step < out[j].Step
+	})
+	return out
 }
 
 func mustJSON(v any) string {

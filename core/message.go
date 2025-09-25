@@ -106,9 +106,10 @@ func (f File) Content() any   { return f.Source }
 
 // ToolCall records a model-initiated tool invocation.
 type ToolCall struct {
-	ID    string         `json:"id"`
-	Name  string         `json:"name"`
-	Input map[string]any `json:"input"`
+	ID       string         `json:"id"`
+	Name     string         `json:"name"`
+	Input    map[string]any `json:"input"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 func (t ToolCall) Type() PartType { return PartTypeToolCall }

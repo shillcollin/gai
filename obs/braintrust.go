@@ -1,27 +1,32 @@
 package obs
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	braintrust "github.com/braintrustdata/braintrust-go"
+	"github.com/braintrustdata/braintrust-go/option"
+	"github.com/braintrustdata/braintrust-go/packages/param"
+	"github.com/braintrustdata/braintrust-go/shared"
 )
 
 const defaultBraintrustBaseURL = "https://api.braintrust.dev"
 
 type braintrustSink struct {
-	cfg    BraintrustOptions
-	queue  chan Completion
-	client *http.Client
-	wg     sync.WaitGroup
-	cancel context.CancelFunc
+	cfg           BraintrustOptions
+	queue         chan Completion
+	projectLogSvc *braintrust.ProjectLogService
+	datasetSvc    *braintrust.DatasetService
+	projectID     string
+	datasetID     string
+	wg            sync.WaitGroup
+	cancel        context.CancelFunc
 }
 
 func newBraintrustSink(ctx context.Context, cfg BraintrustOptions) (*braintrustSink, error) {
@@ -40,16 +45,49 @@ func newBraintrustSink(ctx context.Context, cfg BraintrustOptions) (*braintrustS
 	if cfg.HTTPTimeout <= 0 {
 		cfg.HTTPTimeout = 10 * time.Second
 	}
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = defaultBraintrustBaseURL
+
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL = defaultBraintrustBaseURL
+	}
+
+	clientOpts := []option.RequestOption{
+		option.WithAPIKey(cfg.APIKey),
+		option.WithBaseURL(baseURL),
+		option.WithHTTPClient(&http.Client{Timeout: cfg.HTTPTimeout}),
+	}
+
+	projectSvc := braintrust.NewProjectService(clientOpts...)
+	datasetSvc := braintrust.NewDatasetService(clientOpts...)
+	projectLogSvc := braintrust.NewProjectLogService(clientOpts...)
+
+	projectID, err := resolveProjectID(ctx, &projectSvc, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	datasetName := strings.TrimSpace(cfg.Dataset)
+	if datasetName == "<auto>" {
+		datasetName = ""
+	}
+
+	var datasetID string
+	if datasetName != "" {
+		datasetID, err = ensureDataset(ctx, &datasetSvc, projectID, datasetName)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	sink := &braintrustSink{
-		cfg:    cfg,
-		queue:  make(chan Completion, cfg.BatchSize*4),
-		client: &http.Client{Timeout: cfg.HTTPTimeout},
-		cancel: cancel,
+		cfg:           cfg,
+		queue:         make(chan Completion, cfg.BatchSize*4),
+		projectLogSvc: &projectLogSvc,
+		datasetSvc:    &datasetSvc,
+		projectID:     projectID,
+		datasetID:     datasetID,
+		cancel:        cancel,
 	}
 
 	sink.wg.Add(1)
@@ -62,7 +100,6 @@ func (b *braintrustSink) LogCompletion(ctx context.Context, c Completion) error 
 	case b.queue <- c:
 		return nil
 	default:
-		// Drop if queue is full to avoid blocking hot path.
 		return errors.New("braintrust queue full")
 	}
 }
@@ -124,70 +161,233 @@ func (b *braintrustSink) run(ctx context.Context) {
 }
 
 func (b *braintrustSink) flushBatch(ctx context.Context, batch []Completion) error {
-	payload := make([]braintrustRecord, 0, len(batch))
-	for _, item := range batch {
-		payload = append(payload, toBraintrustRecord(item, b.cfg))
+	if b.datasetID != "" && b.datasetSvc != nil {
+		events := make([]shared.InsertDatasetEventParam, 0, len(batch))
+		for _, item := range batch {
+			events = append(events, completionToDatasetEvent(item))
+		}
+		_, err := b.datasetSvc.Insert(ctx, b.datasetID, braintrust.DatasetInsertParams{
+			Events: events,
+		})
+		return err
 	}
-	body, err := json.Marshal(braintrustEnvelope{
-		Project:   b.cfg.Project,
-		ProjectID: b.cfg.ProjectID,
-		Dataset:   b.cfg.Dataset,
-		Records:   payload,
+
+	if b.projectLogSvc == nil {
+		return errors.New("braintrust project log service not configured")
+	}
+	events := make([]shared.InsertProjectLogsEventParam, 0, len(batch))
+	for _, item := range batch {
+		events = append(events, completionToProjectLogEvent(item))
+	}
+	_, err := b.projectLogSvc.Insert(ctx, b.projectID, braintrust.ProjectLogInsertParams{
+		Events: events,
+	})
+	return err
+}
+
+func resolveProjectID(ctx context.Context, svc *braintrust.ProjectService, cfg BraintrustOptions) (string, error) {
+	if cfg.ProjectID != "" {
+		return cfg.ProjectID, nil
+	}
+	if cfg.Project == "" {
+		return "", errors.New("braintrust project name required when project id missing")
+	}
+
+	resp, err := svc.List(ctx, braintrust.ProjectListParams{
+		Limit:       param.NewOpt[int64](1),
+		ProjectName: param.NewOpt(cfg.Project),
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
+	if resp == nil || len(resp.Objects) == 0 {
+		return "", fmt.Errorf("braintrust project %q not found", cfg.Project)
+	}
+	return resp.Objects[0].ID, nil
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/v1/log", b.cfg.BaseURL), bytes.NewReader(body))
+func ensureDataset(ctx context.Context, svc *braintrust.DatasetService, projectID, datasetName string) (string, error) {
+	dataset, err := svc.New(ctx, braintrust.DatasetNewParams{
+		Name:      datasetName,
+		ProjectID: projectID,
+	})
 	if err != nil {
-		return err
+		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
-
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("braintrust status %s: %s", resp.Status, strings.TrimSpace(string(data)))
-	}
-	return nil
+	return dataset.ID, nil
 }
 
-type braintrustEnvelope struct {
-	Project   string             `json:"project,omitempty"`
-	ProjectID string             `json:"project_id,omitempty"`
-	Dataset   string             `json:"dataset,omitempty"`
-	Records   []braintrustRecord `json:"records"`
-}
-
-type braintrustRecord struct {
-	RequestID string         `json:"request_id,omitempty"`
-	Provider  string         `json:"provider,omitempty"`
-	Model     string         `json:"model,omitempty"`
-	Input     []Message      `json:"input,omitempty"`
-	Output    Message        `json:"output"`
-	Usage     UsageTokens    `json:"usage"`
-	LatencyMS int64          `json:"latency_ms,omitempty"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	Error     string         `json:"error,omitempty"`
-	Timestamp int64          `json:"timestamp_ms"`
-}
-
-func toBraintrustRecord(c Completion, cfg BraintrustOptions) braintrustRecord {
-	return braintrustRecord{
-		RequestID: c.RequestID,
-		Provider:  c.Provider,
-		Model:     c.Model,
-		Input:     c.Input,
-		Output:    c.Output,
-		Usage:     c.Usage,
-		LatencyMS: c.LatencyMS,
-		Metadata:  c.Metadata,
-		Error:     c.Error,
-		Timestamp: c.CreatedAtUTC,
+func completionToProjectLogEvent(c Completion) shared.InsertProjectLogsEventParam {
+	event := shared.InsertProjectLogsEventParam{}
+	if c.RequestID != "" {
+		event.ID = param.NewOpt(c.RequestID)
 	}
+	if c.CreatedAtUTC != 0 {
+		event.Created = param.NewOpt(time.UnixMilli(c.CreatedAtUTC).UTC())
+	}
+
+	event.Input = messagesToAny(c.Input)
+	event.Output = messageToAny(c.Output)
+	if c.Error != "" {
+		event.Error = c.Error
+	}
+
+	event.Metadata = buildProjectMetadata(c)
+	event.Metrics = buildProjectMetrics(c)
+	if len(c.ToolCalls) > 0 {
+		if event.Metadata.ExtraFields == nil {
+			event.Metadata.ExtraFields = make(map[string]any)
+		}
+		event.Metadata.ExtraFields["tool_calls"] = ToolCallsToAny(c.ToolCalls)
+	}
+
+	return event
+}
+
+func completionToDatasetEvent(c Completion) shared.InsertDatasetEventParam {
+	event := shared.InsertDatasetEventParam{}
+	if c.RequestID != "" {
+		event.ID = param.NewOpt(c.RequestID)
+	}
+	if c.CreatedAtUTC != 0 {
+		event.Created = param.NewOpt(time.UnixMilli(c.CreatedAtUTC).UTC())
+	}
+
+	event.Input = map[string]any{
+		"messages": messagesToAny(c.Input),
+	}
+	if c.Provider != "" {
+		event.Input.(map[string]any)["provider"] = c.Provider
+	}
+	if c.Model != "" {
+		event.Input.(map[string]any)["model"] = c.Model
+	}
+
+	event.Expected = messageToAny(c.Output)
+
+	event.Metadata = shared.InsertDatasetEventMetadataParam{
+		ExtraFields: copyMetadata(c.Metadata),
+	}
+	if c.Model != "" {
+		event.Metadata.Model = param.NewOpt(c.Model)
+	}
+	if c.Error != "" {
+		if event.Metadata.ExtraFields == nil {
+			event.Metadata.ExtraFields = make(map[string]any)
+		}
+		event.Metadata.ExtraFields["error"] = c.Error
+	}
+	if len(c.ToolCalls) > 0 {
+		if event.Metadata.ExtraFields == nil {
+			event.Metadata.ExtraFields = make(map[string]any)
+		}
+		event.Metadata.ExtraFields["tool_calls"] = ToolCallsToAny(c.ToolCalls)
+	}
+
+	return event
+}
+
+func buildProjectMetadata(c Completion) shared.InsertProjectLogsEventMetadataParam {
+	extras := copyMetadata(c.Metadata)
+	if extras == nil {
+		extras = make(map[string]any)
+	}
+	if c.Provider != "" {
+		extras["provider"] = c.Provider
+	}
+	if c.RequestID != "" {
+		extras["request_id"] = c.RequestID
+	}
+	if len(c.ToolCalls) > 0 {
+		extras["tool_calls"] = ToolCallsToAny(c.ToolCalls)
+	}
+
+	metadata := shared.InsertProjectLogsEventMetadataParam{
+		ExtraFields: extras,
+	}
+	if c.Model != "" {
+		metadata.Model = param.NewOpt(c.Model)
+	}
+	return metadata
+}
+
+func buildProjectMetrics(c Completion) shared.InsertProjectLogsEventMetricsParam {
+	metrics := shared.InsertProjectLogsEventMetricsParam{}
+	if c.Usage.InputTokens > 0 {
+		metrics.PromptTokens = param.NewOpt(int64(c.Usage.InputTokens))
+	}
+	if c.Usage.OutputTokens > 0 {
+		metrics.CompletionTokens = param.NewOpt(int64(c.Usage.OutputTokens))
+	}
+	if c.Usage.TotalTokens > 0 {
+		metrics.Tokens = param.NewOpt(int64(c.Usage.TotalTokens))
+	}
+
+	if c.LatencyMS > 0 || c.Usage.CostUSD > 0 || c.Usage.ReasoningTokens > 0 || c.Usage.AudioTokens > 0 || c.Usage.CachedTokens > 0 {
+		metrics.ExtraFields = make(map[string]float64)
+	}
+	if c.LatencyMS > 0 {
+		metrics.ExtraFields["latency_ms"] = float64(c.LatencyMS)
+	}
+	if c.Usage.CostUSD > 0 {
+		metrics.ExtraFields["cost_usd"] = c.Usage.CostUSD
+	}
+	if c.Usage.ReasoningTokens > 0 {
+		metrics.ExtraFields["reasoning_tokens"] = float64(c.Usage.ReasoningTokens)
+	}
+	if c.Usage.AudioTokens > 0 {
+		metrics.ExtraFields["audio_tokens"] = float64(c.Usage.AudioTokens)
+	}
+	if c.Usage.CachedTokens > 0 {
+		metrics.ExtraFields["cached_tokens"] = float64(c.Usage.CachedTokens)
+	}
+
+	return metrics
+}
+
+func messagesToAny(messages []Message) any {
+	if len(messages) == 0 {
+		return []any{}
+	}
+	out := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		entry := map[string]any{
+			"role": msg.Role,
+		}
+		if msg.Text != "" {
+			entry["text"] = msg.Text
+		}
+		if msg.Data != nil && len(msg.Data) > 0 {
+			entry["data"] = msg.Data
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func messageToAny(msg Message) any {
+	if msg.Role == "" && msg.Text == "" && len(msg.Data) == 0 {
+		return nil
+	}
+	entry := map[string]any{
+		"role": msg.Role,
+	}
+	if msg.Text != "" {
+		entry["text"] = msg.Text
+	}
+	if msg.Data != nil && len(msg.Data) > 0 {
+		entry["data"] = msg.Data
+	}
+	return entry
+}
+
+func copyMetadata(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }

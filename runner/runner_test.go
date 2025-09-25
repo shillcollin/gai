@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/shillcollin/gai/core"
@@ -139,5 +140,54 @@ func TestRunnerStreamRequest(t *testing.T) {
 	meta := stream.Meta()
 	if meta.Provider != "fake" {
 		t.Fatalf("unexpected stream meta provider: %s", meta.Provider)
+	}
+}
+
+func TestRunnerOnStopFinalizer(t *testing.T) {
+	provider := &fakeProvider{}
+	r := New(provider, WithMaxParallel(2))
+
+	type input struct {
+		Name string `json:"name"`
+	}
+
+	tool := tools.New[input, map[string]string](
+		"greet",
+		"Generate greeting",
+		func(ctx context.Context, in input, meta core.ToolMeta) (map[string]string, error) {
+			return map[string]string{"greeting": "Hello " + in.Name}, nil
+		},
+	)
+
+	finalCalled := false
+	res, err := r.ExecuteRequest(context.Background(), core.Request{
+		Messages: []core.Message{core.UserMessage(core.TextPart("Say hi"))},
+		Tools:    []core.ToolHandle{tools.NewCoreAdapter(tool)},
+		StopWhen: core.MaxSteps(1),
+		OnStop: func(ctx context.Context, state core.FinalState) (*core.TextResult, error) {
+			finalCalled = true
+			if len(state.Steps) != 1 {
+				return nil, fmt.Errorf("expected 1 step, got %d", len(state.Steps))
+			}
+			if state.StopReason.Type != core.StopReasonMaxSteps {
+				return nil, fmt.Errorf("unexpected stop reason %s", state.StopReason.Type)
+			}
+			return &core.TextResult{
+				Text:         "stopped",
+				FinishReason: state.StopReason,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteRequest error: %v", err)
+	}
+	if !finalCalled {
+		t.Fatalf("expected finalizer to run")
+	}
+	if res.Text != "stopped" {
+		t.Fatalf("unexpected final text: %s", res.Text)
+	}
+	if res.FinishReason.Type != core.StopReasonMaxSteps {
+		t.Fatalf("unexpected finish reason: %#v", res.FinishReason)
 	}
 }

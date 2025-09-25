@@ -1385,6 +1385,8 @@ req := core.Request{
     ProviderOptions: gemini.BuildProviderOptions(
         gemini.WithGrounding("web"),
         gemini.WithThoughtSignatures("require"),
+        gemini.WithThinkingBudget(2048),
+        gemini.WithIncludeThoughts(true),
     ),
 }
 
@@ -1422,6 +1424,14 @@ req := core.Request{
     Messages: msgs,
     ProviderOptions: opts,
 }
+
+// Gemini helpers expose similar builders for reasoning controls.
+req.ProviderOptions = gemini.BuildProviderOptions(
+    gemini.WithGrounding("web"),
+    gemini.WithThinkingBudget(2048),
+    gemini.WithIncludeThoughts(true),
+    gemini.WithThoughtSignatures("require"),
+)
 ``````
 
 ## Helper Functions

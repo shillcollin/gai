@@ -1,421 +1,693 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import clsx from "clsx"
+import Sidebar from "../components/Sidebar"
+import ChatMessage from "../components/ChatMessage"
+import Composer from "../components/Composer"
+import {
+  ApiMessage,
+  ChatMessage as ChatMessageType,
+  ChatRequestPayload,
+  MessagePart,
+  ProviderInfo,
+  ReasoningEvent,
+  StreamEventPayload,
+  ToolCallEvent,
+  Usage,
+  WarningDTO,
+} from "../lib/types"
 
 const API_BASE = process.env.NEXT_PUBLIC_GAI_API_BASE ?? "http://localhost:8080"
+const SYSTEM_PROMPT = "You are a helpful assistant powered by the GAI SDK."
 
-type ProviderInfo = {
-  id: string
-  label: string
-  default_model: string
-  models: string[]
-  capabilities: {
-    images: boolean
-    audio: boolean
-    video: boolean
-    reasoning: boolean
-  }
-  tools: string[]
-}
+type ThemeMode = "light" | "dark"
 
-type Part =
-  | { type: "text"; text: string }
-  | { type: "image"; dataUrl: string; mime: string }
+type ChatMode = "text" | "json"
 
-type ConversationMessage = {
-  id: string
-  role: "system" | "user" | "assistant"
-  parts: Part[]
-  steps?: StepDTO[]
-  warnings?: WarningDTO[]
-  usage?: UsageDTO
-}
-
-type StepDTO = {
-  number: number
+type StreamResult = {
   text: string
-  model: string
-  duration_ms: number
-  tool_calls: ToolCallDTO[]
-}
-
-type ToolCallDTO = {
-  id: string
-  name: string
-  input: Record<string, unknown>
-  result?: unknown
-  error?: string
-  duration_ms: number
-}
-
-type WarningDTO = {
-  code: string
-  field?: string
-  message: string
-}
-
-type UsageDTO = {
-  input_tokens: number
-  output_tokens: number
-  total_tokens: number
-  reasoning_tokens?: number
-}
-
-type ChatResponse = {
-  id: string
-  text: string
-  json?: unknown
-  model: string
-  usage: UsageDTO
-  finish_reason: { type: string; description?: string }
-  steps: StepDTO[]
-  warnings?: WarningDTO[]
-}
-
-type ApiMessage = {
-  role: string
-  parts: { type: string; text?: string; data?: string; mime?: string }[]
-}
-
-type ChatRequest = {
-  provider: string
+  usage?: Usage
+  finishReason?: string
+  provider?: string
   model?: string
-  mode?: string
-  messages: ApiMessage[]
-  temperature?: number
-  max_output_tokens?: number
-  tool_choice?: string
-  tools?: string[]
+  warnings: string[]
 }
 
-const SYSTEM_PROMPT = "You are a helpful assistant powered by the GAI SDK." as const
+const systemMessage = (): ApiMessage => ({
+  role: "system",
+  parts: [{ type: "text", text: SYSTEM_PROMPT }],
+})
 
 export default function Page() {
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [providerId, setProviderId] = useState<string>("")
   const [model, setModel] = useState<string>("")
-  const [messages, setMessages] = useState<ConversationMessage[]>([{
-    id: crypto.randomUUID(),
-    role: "system",
-    parts: [{ type: "text", text: SYSTEM_PROMPT }],
-  }])
-  const [input, setInput] = useState("")
-  const [mode, setMode] = useState<"text" | "json">("text")
-  const [temperature, setTemperature] = useState(0.7)
-  const [maxOutputTokens, setMaxOutputTokens] = useState(1024)
   const [selectedTools, setSelectedTools] = useState<Record<string, boolean>>({})
-  const [selectedImage, setSelectedImage] = useState<{ dataUrl: string; mime: string } | null>(null)
-  const [loading, setLoading] = useState(false)
+  const [conversation, setConversation] = useState<ApiMessage[]>(() => [systemMessage()])
+  const [messages, setMessages] = useState<ChatMessageType[]>([])
+  const [temperature, setTemperature] = useState<number>(0.7)
+  const [mode, setMode] = useState<ChatMode>("text")
+  const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
+  const [theme, setTheme] = useState<ThemeMode>("dark")
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false)
+  const threadRef = useRef<HTMLDivElement | null>(null)
+
+  const activeProvider = useMemo(
+    () => providers.find((provider) => provider.id === providerId) ?? null,
+    [providers, providerId],
+  )
+
+  const providerLabel = activeProvider?.label ?? providerId ?? ""
+
+  const enabledTools = useMemo(
+    () => Object.entries(selectedTools).filter(([, enabled]) => enabled).map(([name]) => name),
+    [selectedTools],
+  )
+
+  const allowImages = useMemo(() => {
+    if (!activeProvider) {
+      return false
+    }
+    const caps = activeProvider.capabilities
+    return Boolean((caps as any).Images ?? (caps as any).images)
+  }, [activeProvider])
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/providers`)
-      .then((res) => res.json())
-      .then((data: ProviderInfo[]) => {
-        setProviders(data)
-        if (data.length > 0) {
-          setProviderId((prev) => prev || data[0].id)
-          setModel(data[0].default_model)
+    async function loadProviders() {
+      try {
+        const response = await fetch(`${API_BASE}/api/providers`)
+        if (!response.ok) {
+          throw new Error(`Request failed with status ${response.status}`)
         }
-      })
-      .catch((err) => {
+        const payload: ProviderInfo[] = await response.json()
+        setProviders(payload)
+        if (payload.length > 0) {
+          const first = payload[0]
+          setProviderId(first.id)
+          setModel(first.default_model)
+          setSelectedTools(defaultToolSelection(first.tools))
+          resetSession(first)
+        }
+      } catch (err) {
         console.error("Failed to load providers", err)
         setError("Failed to load providers. Is the API server running?")
-      })
+      }
+    }
+    loadProviders()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    const provider = providers.find((p) => p.id === providerId)
-    if (provider) {
-      setModel(provider.default_model)
-      const defaults: Record<string, boolean> = {}
-      provider.tools.forEach((tool) => {
-        defaults[tool] = true
-      })
-      setSelectedTools(defaults)
-    }
-  }, [providerId, providers])
-
-  const availableTools = useMemo(() => {
-    const provider = providers.find((p) => p.id === providerId)
-    return provider?.tools ?? []
-  }, [providers, providerId])
-
-  const handleImageChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) {
-      setSelectedImage(null)
+    if (typeof window === "undefined") {
       return
     }
-    const dataUrl = await fileToDataUrl(file)
-    setSelectedImage({ dataUrl, mime: file.type || "image/png" })
+    const saved = window.localStorage.getItem("gai-demo-theme") as ThemeMode | null
+    if (saved) {
+      setTheme(saved)
+    } else {
+      const prefersLight = window.matchMedia("(prefers-color-scheme: light)").matches
+      setTheme(prefersLight ? "light" : "dark")
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof document !== "undefined") {
+      document.body.dataset.theme = theme
+      window.localStorage.setItem("gai-demo-theme", theme)
+    }
+  }, [theme])
+
+  useEffect(() => {
+    if (!threadRef.current) {
+      return
+    }
+    threadRef.current.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" })
+  }, [messages])
+
+  const handleProviderChange = (id: string) => {
+    const next = providers.find((provider) => provider.id === id)
+    if (!next) {
+      return
+    }
+    setProviderId(id)
+    setError(null)
+    setModel((current) => (next.models.includes(current) ? current : next.default_model))
+    setSelectedTools((prev) => {
+      if (next.tools.length === 0) {
+        return {}
+      }
+      const defaults = defaultToolSelection(next.tools)
+      const merged: Record<string, boolean> = { ...defaults }
+      for (const [name, enabled] of Object.entries(prev)) {
+        if (name in defaults) {
+          merged[name] = enabled
+        }
+      }
+      return merged
+    })
   }
 
-  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!input.trim() && !selectedImage) {
-      return
-    }
+  const handleToolToggle = (tool: string, enabled: boolean) => {
+    setSelectedTools((prev) => ({ ...prev, [tool]: enabled }))
+  }
 
-    setLoading(true)
+  const handleThemeToggle = () => {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"))
+  }
+
+  const resetSession = (provider?: ProviderInfo) => {
+    setConversation([systemMessage()])
+    setMessages([])
     setError(null)
-
-    const userMessage: ConversationMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      parts: [
-        ...(input.trim() ? [{ type: "text", text: input.trim() } as Part] : []),
-        ...(selectedImage ? [{ type: "image", dataUrl: selectedImage.dataUrl, mime: selectedImage.mime } as Part] : []),
-      ],
+    if (provider) {
+      setSelectedTools(defaultToolSelection(provider.tools))
     }
+  }
 
-    const nextMessages = [...messages, userMessage]
-    setMessages(nextMessages)
-    setInput("")
-    setSelectedImage(null)
+  const handleClearChat = () => {
+    resetSession(activeProvider ?? undefined)
+  }
 
-    const request: ChatRequest = {
-      provider: providerId,
-      model,
-      mode,
-      temperature,
-      max_output_tokens: maxOutputTokens,
-      messages: buildApiMessages(nextMessages),
-      tools: Object.entries(selectedTools).filter(([_, enabled]) => enabled).map(([name]) => name),
-      tool_choice: availableTools.length > 0 ? "auto" : "none",
-    }
-
-    try {
-      const res = await fetch(`${API_BASE}/api/chat`, {
+  const runBatchRequest = useCallback(
+    async (request: ChatRequestPayload, assistantId: string): Promise<StreamResult> => {
+      const response = await fetch(`${API_BASE}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request),
       })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}))
+        throw new Error((payload as any).error || `Request failed with status ${response.status}`)
+      }
+      const payload = await response.json()
+      const warnings = Array.isArray(payload.warnings)
+        ? (payload.warnings as WarningDTO[]).map((warning) => warning.message)
+        : []
+      const jsonText = payload.json ? JSON.stringify(payload.json, null, 2) : undefined
+      const messageText = payload.text ?? (jsonText ? `\`\`\`json\n${jsonText}\n\`\`\`` : "")
 
-      if (!res.ok) {
-        const payload = await res.json().catch(() => ({}))
-        throw new Error(payload.error || `Request failed with status ${res.status}`)
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === assistantId
+            ? {
+                ...msg,
+                content: messageText,
+                toolCalls: [],
+                reasoning: [],
+                warnings,
+                status: "complete",
+                provider: payload.provider ?? msg.provider,
+                model: payload.model ?? msg.model,
+                usage: payload.usage ?? msg.usage,
+              }
+            : msg,
+        ),
+      )
+
+      return {
+        text: messageText,
+        usage: payload.usage,
+        finishReason: payload.finish_reason?.type,
+        provider: payload.provider ?? providerLabel,
+        model: payload.model ?? model,
+        warnings,
+      }
+    },
+    [model, providerLabel],
+  )
+
+  const runStreamingRequest = useCallback(
+    async (request: ChatRequestPayload, assistantId: string): Promise<StreamResult> => {
+      const response = await fetch(`${API_BASE}/api/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}))
+        throw new Error((payload as any).error || `Request failed with status ${response.status}`)
+      }
+      if (!response.body) {
+        throw new Error("Streaming is not supported by this server")
       }
 
-      const data: ChatResponse = await res.json()
-      const parts: Part[] = []
-      if (typeof data.text === "string" && data.text.trim()) {
-        parts.push({ type: "text", text: data.text.trim() })
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
+      let assistantText = ""
+      let providerName: string | undefined = providerLabel
+      let modelName: string | undefined = model
+      let usage: Usage | undefined
+      let finishReason: string | undefined
+
+      const applyUpdate = (updater: (message: ChatMessageType) => ChatMessageType) => {
+        setMessages((prev) =>
+          prev.map((msg) => {
+            if (msg.id !== assistantId) {
+              return msg
+            }
+            return updater({ ...msg })
+          }),
+        )
       }
-      if (data.json !== undefined) {
-        const formatted = JSON.stringify(data.json, null, 2)
-        parts.push({ type: "text", text: formatted })
+
+      while (true) {
+        const { value, done } = await reader.read()
+        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done })
+
+        let newlineIndex = buffer.indexOf("\n")
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim()
+          buffer = buffer.slice(newlineIndex + 1)
+          if (line) {
+            const event = JSON.parse(line) as StreamEventPayload
+            ;({
+              assistantText,
+              providerName,
+              modelName,
+              usage,
+              finishReason,
+            } = handleStreamEvent({
+              event,
+              assistantId,
+              assistantText,
+              providerName,
+              modelName,
+              usage,
+              finishReason,
+              applyUpdate,
+            }))
+          }
+          newlineIndex = buffer.indexOf("\n")
+        }
+
+        if (done) {
+          const tail = buffer.trim()
+          if (tail) {
+            const event = JSON.parse(tail) as StreamEventPayload
+            ;({
+              assistantText,
+              providerName,
+              modelName,
+              usage,
+              finishReason,
+            } = handleStreamEvent({
+              event,
+              assistantId,
+              assistantText,
+              providerName,
+              modelName,
+              usage,
+              finishReason,
+              applyUpdate,
+            }))
+          }
+          break
+        }
       }
-      const assistantMessage: ConversationMessage = {
-        id: data.id,
+
+      applyUpdate((msg) => ({
+        ...msg,
+        content: assistantText,
+        status: "complete",
+        provider: providerName ?? msg.provider,
+        model: modelName ?? msg.model,
+        usage: usage ?? msg.usage,
+        finishReason: finishReason ?? msg.finishReason,
+      }))
+
+      return {
+        text: assistantText,
+        usage,
+        finishReason,
+        provider: providerName,
+        model: modelName,
+        warnings: [],
+      }
+    },
+    [model, providerLabel],
+  )
+
+  const handleSend = useCallback(
+    async ({ text, image }: { text: string; image?: { dataUrl: string; mime: string } }) => {
+      if (!providerId) {
+        setError("Select a provider to get started.")
+        return
+      }
+      if (loading) {
+        return
+      }
+      setLoading(true)
+      setError(null)
+
+      const timestamp = Date.now()
+      const assistantId = crypto.randomUUID()
+      const userParts = buildMessageParts(text, image)
+
+      const userMessage: ChatMessageType = {
+        id: crypto.randomUUID(),
+        role: "user",
+        createdAt: timestamp,
+        parts: userParts,
+        content: text,
+        reasoning: [],
+        toolCalls: [],
+        status: "complete",
+      }
+
+      const assistantMessage: ChatMessageType = {
+        id: assistantId,
         role: "assistant",
-        parts: parts.length > 0 ? parts : [{ type: "text", text: "(no response)" }],
-        steps: data.steps,
-        warnings: data.warnings,
-        usage: data.usage,
+        createdAt: timestamp,
+        parts: [],
+        content: "",
+        reasoning: [],
+        toolCalls: [],
+        provider: providerLabel,
+        model,
+        status: "streaming",
       }
-      setMessages((prev) => [...prev, assistantMessage])
-    } catch (err) {
-      console.error(err)
-      setError(err instanceof Error ? err.message : "unexpected error")
-    } finally {
-      setLoading(false)
-    }
-  }
+
+      setMessages((prev) => [...prev, userMessage, assistantMessage])
+
+      const apiUserMessage: ApiMessage = {
+        role: "user",
+        parts: buildApiParts(text, image),
+      }
+
+      const request: ChatRequestPayload = {
+        provider: providerId,
+        model,
+        mode,
+        messages: [...conversation, apiUserMessage],
+        temperature,
+        tool_choice: enabledTools.length > 0 ? "auto" : "none",
+        tools: enabledTools,
+      }
+
+      try {
+        let result: StreamResult
+        if (mode === "json") {
+          result = await runBatchRequest(request, assistantId)
+        } else {
+          result = await runStreamingRequest(request, assistantId)
+        }
+
+        const assistantApiMessage: ApiMessage = {
+          role: "assistant",
+          parts: result.text
+            ? [
+                {
+                  type: "text",
+                  text: result.text,
+                },
+              ]
+            : [],
+        }
+        setConversation((prev) => [...prev, apiUserMessage, assistantApiMessage])
+
+        setMessages((prev) =>
+          prev.map((msg) => {
+            if (msg.id !== assistantId) {
+              return msg
+            }
+            return {
+              ...msg,
+              status: "complete",
+              content: result.text,
+              usage: result.usage ?? msg.usage,
+              finishReason: result.finishReason ?? msg.finishReason,
+              provider: result.provider ?? msg.provider,
+              model: result.model ?? msg.model,
+              warnings: result.warnings.length > 0 ? result.warnings : msg.warnings,
+            }
+          }),
+        )
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unexpected error"
+        setError(message)
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantId
+              ? {
+                  ...msg,
+                  status: "complete",
+                  content: msg.content || `⚠️ ${message}`,
+                }
+              : msg,
+          ),
+        )
+      } finally {
+        setLoading(false)
+      }
+    },
+    [
+      providerId,
+      conversation,
+      enabledTools,
+      loading,
+      model,
+      mode,
+      providerLabel,
+      temperature,
+      runBatchRequest,
+      runStreamingRequest,
+    ],
+  )
 
   return (
-    <main>
-      <header>
-        <span className="badge">GAI SDK</span>
-        <h1>Build with OpenAI, Anthropic, and Gemini</h1>
-        <p>
-          This playground uses the Go-first GAI SDK to orchestrate multimodal prompts, tool calls, and structured output across providers.
-        </p>
-      </header>
-
-      {error && (
-        <div className="error-banner">{error}</div>
+    <div className={clsx("app-shell", { "sidebar-hidden": sidebarCollapsed })}>
+      {!sidebarCollapsed && (
+        <Sidebar
+          providers={providers}
+          providerId={providerId}
+          onProviderChange={handleProviderChange}
+          model={model}
+          onModelChange={setModel}
+          selectedTools={selectedTools}
+          onToggleTool={handleToolToggle}
+          temperature={temperature}
+          onTemperatureChange={setTemperature}
+          temperatureDisabled={loading || !providerId}
+          theme={theme}
+          onThemeToggle={handleThemeToggle}
+          onClearChat={messages.length > 0 ? handleClearChat : undefined}
+        />
       )}
 
-      <section className="card">
-        <form className="control-grid" onSubmit={handleSubmit}>
-          <label>
-            Provider
-            <select value={providerId} onChange={(e) => setProviderId(e.target.value)}>
-              {providers.map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label>
-            Model
-            <select value={model} onChange={(e) => setModel(e.target.value)}>
-              {providers
-                .find((p) => p.id === providerId)?.models.map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))}
-            </select>
-          </label>
-
-          <label>
-            Temperature
-            <input
-              type="number"
-              min={0}
-              max={2}
-              step={0.1}
-              value={temperature}
-              onChange={(e) => setTemperature(parseFloat(e.target.value))}
-            />
-          </label>
-
-          <label>
-            Max Output Tokens
-            <input
-              type="number"
-              min={32}
-              max={4096}
-              value={maxOutputTokens}
-              onChange={(e) => setMaxOutputTokens(parseInt(e.target.value))}
-            />
-          </label>
-
-          <label>
-            Response Mode
-            <select value={mode} onChange={(e) => setMode(e.target.value as "text" | "json")}> 
-              <option value="text">Conversational</option>
-              <option value="json">Structured JSON</option>
-            </select>
-          </label>
-
-          <label>
-            Attach Image
-            <input type="file" accept="image/*" onChange={handleImageChange} />
-          </label>
-
-          {availableTools.length > 0 && (
-            <div className="toggle-row" style={{ gridColumn: "1 / -1" }}>
-              {availableTools.map((tool) => (
-                <label key={tool}>
-                  <input
-                    type="checkbox"
-                    checked={Boolean(selectedTools[tool])}
-                    onChange={(e) =>
-                      setSelectedTools((prev) => ({ ...prev, [tool]: e.target.checked }))
-                    }
-                  />
-                  {tool}
-                </label>
-              ))}
-            </div>
-          )}
-
-          <label style={{ gridColumn: "1 / -1" }}>
-            Message
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask anything, or request structured JSON."
-            />
-          </label>
-
-          {selectedImage && (
-            <div className="selected-image" style={{ gridColumn: "1 / -1" }}>
-              <img src={selectedImage.dataUrl} alt="attachment preview" className="preview" style={{ maxWidth: "180px", borderRadius: "12px" }} />
-            </div>
-          )}
-
-          <button className="primary" type="submit" disabled={loading}>
-            {loading ? "Generating…" : "Send"}
+      <main className="main">
+        <div className="main-toolbar">
+          <button
+            type="button"
+            className="sidebar-toggle"
+            onClick={() => setSidebarCollapsed((prev) => !prev)}
+            aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          >
+            {sidebarCollapsed ? (
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3.5" y="4" width="16.5" height="16" rx="2.2" />
+                <path d="M15.5 4v16" />
+                <polyline points="11 8 15.5 12 11 16" />
+              </svg>
+            ) : (
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3.5" y="4" width="16.5" height="16" rx="2.2" />
+                <path d="M8.5 4v16" />
+                <polyline points="13 8 8.5 12 13 16" />
+              </svg>
+            )}
           </button>
-        </form>
-      </section>
-
-      <section className="card">
-        <div className="chat-thread">
-          {messages.filter((msg) => msg.role !== "system" || msg.parts.some(part => part.type === "text" && part.text !== SYSTEM_PROMPT)).map((message) => (
-            <article key={message.id} className="message">
-              <h3>{message.role === "assistant" ? "Assistant" : "You"}</h3>
-              {message.parts.map((part, index) => {
-                if (part.type === "text") {
-                  return <p key={index} style={{ whiteSpace: "pre-wrap" }}>{part.text}</p>
-                }
-                return <img key={index} className="preview" src={part.dataUrl} alt="user upload" />
-              })}
-
-              {message.steps && message.steps.length > 0 && (
-                <div>
-                  {message.steps.map((step) => (
-                    <div key={step.number} className="tool-call">
-                      <strong>Step {step.number}</strong>{" "}
-                      <span className="badge">{step.model}</span>
-                      {step.tool_calls.map((call) => (
-                        <details key={call.id} style={{ marginTop: "0.5rem" }}>
-                          <summary>{call.name}</summary>
-                          <pre>{JSON.stringify({ input: call.input, result: call.result, error: call.error }, null, 2)}</pre>
-                        </details>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {message.warnings && message.warnings.length > 0 && (
-                <ul className="warning-list">
-                  {message.warnings.map((warning, idx) => (
-                    <li key={idx}>{warning.message}</li>
-                  ))}
-                </ul>
-              )}
-
-              {message.usage && (
-                <div className="usage">
-                  tokens: in {message.usage.input_tokens} / out {message.usage.output_tokens} / total {message.usage.total_tokens}
-                </div>
-              )}
-            </article>
-          ))}
         </div>
-      </section>
-    </main>
+
+        {error && (
+          <div className="alert" role="status">
+            <span>{error}</span>
+            <button type="button" onClick={() => setError(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        <div className="chat-thread" ref={threadRef}>
+          {messages.length === 0 ? (
+            <div className="empty-state">
+              <h2>Start a conversation</h2>
+              <p>
+                Choose a provider on the left, then ask a question, request structured JSON, or try a tool-enabled task.
+                Image input is available when supported.
+              </p>
+            </div>
+          ) : (
+            messages.map((message) => <ChatMessage key={message.id} message={message} />)
+          )}
+        </div>
+
+        <Composer
+          disabled={loading || !providerId}
+          allowImage={allowImages}
+          mode={mode}
+          onModeChange={setMode}
+          onSubmit={handleSend}
+        />
+      </main>
+    </div>
   )
 }
 
-function buildApiMessages(messages: ConversationMessage[]): ApiMessage[] {
-  return messages.map((msg) => ({
-    role: msg.role,
-    parts: msg.parts.map((part) => {
-      if (part.type === "text") {
-        return { type: "text", text: part.text }
-      }
-      const [header, base64] = part.dataUrl.split(",", 2)
-      const mime = part.mime || header.replace("data:", "").replace(";base64", "")
-      const data = base64 || part.dataUrl
-      return { type: "image_base64", data, mime }
-    }),
-  }))
+function defaultToolSelection(tools: string[]) {
+  return tools.reduce<Record<string, boolean>>((acc, tool) => {
+    acc[tool] = true
+    return acc
+  }, {})
 }
 
-function hasTool(set: Record<string, boolean>, name: string) {
-  return !!set[name]
+function buildMessageParts(text: string, image?: { dataUrl: string; mime: string }): MessagePart[] {
+  const parts: MessagePart[] = []
+  if (text.trim()) {
+    parts.push({ type: "text", text: text.trim() })
+  }
+  if (image) {
+    parts.push({ type: "image", dataUrl: image.dataUrl, mime: image.mime })
+  }
+  return parts
 }
 
-function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      if (typeof reader.result === "string") {
-        resolve(reader.result)
-      } else {
-        reject(new Error("failed to read file"))
+function buildApiParts(text: string, image?: { dataUrl: string; mime: string }) {
+  const parts: ApiMessage["parts"] = []
+  if (text.trim()) {
+    parts.push({ type: "text", text: text.trim() })
+  }
+  if (image) {
+    const [, base64] = image.dataUrl.split(",", 2)
+    parts.push({ type: "image_base64", data: base64 ?? image.dataUrl, mime: image.mime })
+  }
+  return parts
+}
+
+function handleStreamEvent({
+  event,
+  assistantId,
+  assistantText,
+  providerName,
+  modelName,
+  usage,
+  finishReason,
+  applyUpdate,
+}: {
+  event: StreamEventPayload
+  assistantId: string
+  assistantText: string
+  providerName?: string
+  modelName?: string
+  usage?: Usage
+  finishReason?: string
+  applyUpdate: (updater: (message: ChatMessageType) => ChatMessageType) => void
+}) {
+  let nextText = assistantText
+  let nextProvider = providerName
+  let nextModel = modelName
+  let nextUsage = usage
+  let nextFinish = finishReason
+
+  if (event.provider) {
+    nextProvider = event.provider
+  }
+  if (event.model) {
+    nextModel = event.model
+  }
+
+  switch (event.type) {
+    case "text.delta":
+      if (event.text_delta) {
+        nextText += event.text_delta
+        applyUpdate((msg) => ({ ...msg, content: nextText }))
       }
-    }
-    reader.onerror = () => reject(reader.error || new Error("failed to read file"))
-    reader.readAsDataURL(file)
-  })
+      break
+    case "reasoning.delta":
+      if (event.reasoning_delta) {
+        const reasoning: ReasoningEvent = {
+          id: crypto.randomUUID(),
+          text: event.reasoning_delta,
+          kind: "thinking",
+          step: event.step,
+          timestamp: Date.now(),
+        }
+        applyUpdate((msg) => ({ ...msg, reasoning: [...msg.reasoning, reasoning] }))
+      }
+      break
+    case "reasoning.summary":
+      if (event.reasoning_summary) {
+        const summary: ReasoningEvent = {
+          id: crypto.randomUUID(),
+          text: event.reasoning_summary,
+          kind: "summary",
+          step: event.step,
+          timestamp: Date.now(),
+        }
+        applyUpdate((msg) => ({ ...msg, reasoning: [...msg.reasoning, summary] }))
+      }
+      break
+    case "tool.call":
+      if (event.tool_call) {
+        const tool: ToolCallEvent = {
+          id: event.tool_call.id,
+          name: event.tool_call.name,
+          status: "running",
+          input: event.tool_call.input ?? undefined,
+          metadata: event.tool_call.metadata ?? undefined,
+          timestamp: Date.now(),
+          step: event.step,
+        }
+        applyUpdate((msg) => ({ ...msg, toolCalls: mergeToolCall(msg.toolCalls, tool) }))
+      }
+      break
+    case "tool.result":
+      if (event.tool_result) {
+        const tool: ToolCallEvent = {
+          id: event.tool_result.id,
+          name: event.tool_result.name,
+          status: "completed",
+          input: undefined,
+          result: event.tool_result.result,
+          error: event.tool_result.error ?? undefined,
+          duration_ms: event.tool_result.duration_ms ?? undefined,
+          retries: event.tool_result.retries ?? undefined,
+          metadata: event.tool_result.metadata ?? undefined,
+          timestamp: Date.now(),
+          step: event.step,
+        }
+        applyUpdate((msg) => ({ ...msg, toolCalls: mergeToolCall(msg.toolCalls, tool) }))
+      }
+      break
+    case "finish":
+      nextUsage = event.usage ?? nextUsage
+      nextFinish = event.finish_reason?.type ?? nextFinish
+      break
+    default:
+      break
+  }
+
+  return {
+    assistantText: nextText,
+    providerName: nextProvider,
+    modelName: nextModel,
+    usage: nextUsage,
+    finishReason: nextFinish,
+  }
+}
+
+function mergeToolCall(existing: ToolCallEvent[], incoming: ToolCallEvent) {
+  const index = existing.findIndex((tool) => tool.id === incoming.id)
+  if (index === -1) {
+    return [...existing, incoming]
+  }
+  const updated = [...existing]
+  updated[index] = {
+    ...updated[index],
+    ...incoming,
+    input: incoming.input ?? updated[index].input,
+  }
+  return updated
 }

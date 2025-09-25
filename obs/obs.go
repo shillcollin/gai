@@ -240,6 +240,19 @@ type Completion struct {
 	Metadata     map[string]any
 	Error        string
 	CreatedAtUTC int64
+	ToolCalls    []ToolCallRecord
+}
+
+// ToolCallRecord captures a summarized tool invocation for observability sinks.
+type ToolCallRecord struct {
+	Step       int            `json:"step"`
+	ID         string         `json:"id,omitempty"`
+	Name       string         `json:"name,omitempty"`
+	Input      map[string]any `json:"input,omitempty"`
+	Result     any            `json:"result,omitempty"`
+	Error      string         `json:"error,omitempty"`
+	DurationMS int64          `json:"duration_ms,omitempty"`
+	Retries    int            `json:"retries,omitempty"`
 }
 
 // Message keeps observability copies of chat messages without leaking internal structs.

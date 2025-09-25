@@ -128,7 +128,32 @@ func (p *streamPublisher) emitToolResult(step int, exec core.ToolExecution) {
 	if exec.Error != nil {
 		result.Error = exec.Error.Error()
 	}
-	p.push(core.StreamEvent{Type: core.EventToolResult, ToolResult: result}, step)
+	event := core.StreamEvent{Type: core.EventToolResult, ToolResult: result}
+	ext := map[string]any{}
+	if exec.DurationMS > 0 {
+		ext["duration_ms"] = exec.DurationMS
+	}
+	if exec.Retries > 0 {
+		ext["retries"] = exec.Retries
+	}
+	if len(exec.Call.Metadata) > 0 {
+		ext["metadata"] = cloneGenericMap(exec.Call.Metadata)
+	}
+	if len(ext) > 0 {
+		event.Ext = ext
+	}
+	p.push(event, step)
+}
+
+func cloneGenericMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 func (p *streamPublisher) addWarnings(warnings ...core.Warning) {
@@ -703,8 +728,25 @@ func buildToolResultMessages(executions []core.ToolExecution) []core.Message {
 		if exec.Call.Name == "" {
 			continue
 		}
-		callPart := core.ToolCall{ID: exec.Call.ID, Name: exec.Call.Name, Input: exec.Call.Input}
-		messages = append(messages, core.Message{Role: core.Assistant, Parts: []core.Part{callPart}})
+		callInput := map[string]any{}
+		for k, v := range exec.Call.Input {
+			callInput[k] = v
+		}
+		callMetadata := map[string]any{}
+		for k, v := range exec.Call.Metadata {
+			callMetadata[k] = v
+		}
+		callPart := core.ToolCall{
+			ID:       exec.Call.ID,
+			Name:     exec.Call.Name,
+			Input:    callInput,
+			Metadata: callMetadata,
+		}
+		callMessage := core.Message{Role: core.Assistant, Parts: []core.Part{callPart}}
+		if len(callMetadata) > 0 {
+			callMessage.Metadata = copyAnyMap(callMetadata)
+		}
+		messages = append(messages, callMessage)
 		if exec.Error != nil {
 			messages = append(messages, core.Message{Role: core.User, Parts: []core.Part{core.ToolResult{ID: exec.Call.ID, Name: exec.Call.Name, Error: exec.Error.Error()}}})
 			continue
@@ -712,6 +754,17 @@ func buildToolResultMessages(executions []core.ToolExecution) []core.Message {
 		messages = append(messages, core.Message{Role: core.User, Parts: []core.Part{core.ToolResult{ID: exec.Call.ID, Name: exec.Call.Name, Result: exec.Result}}})
 	}
 	return messages
+}
+
+func copyAnyMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 func addUsage(total, step core.Usage) core.Usage {

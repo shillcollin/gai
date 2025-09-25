@@ -1,6 +1,10 @@
 package gemini
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/shillcollin/gai/core"
+)
 
 type geminiRequest struct {
 	Model            string                 `json:"model"`
@@ -12,9 +16,11 @@ type geminiRequest struct {
 }
 
 type geminiGenerationConfig struct {
-	Temperature     float32 `json:"temperature,omitempty"`
-	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
-	TopP            float32 `json:"topP,omitempty"`
+	Temperature      float32               `json:"temperature,omitempty"`
+	MaxOutputTokens  int                   `json:"maxOutputTokens,omitempty"`
+	TopP             float32               `json:"topP,omitempty"`
+	ThinkingConfig   *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
+	ResponseMimeType string                `json:"responseMimeType,omitempty"`
 }
 
 type geminiSafetySetting struct {
@@ -33,6 +39,8 @@ type geminiPart struct {
 	FileData         *geminiFileData         `json:"fileData,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
+	Thought          bool                    `json:"thought,omitempty"`
 }
 
 type geminiInlineData struct {
@@ -48,11 +56,13 @@ type geminiFileData struct {
 type geminiFunctionCall struct {
 	Name string         `json:"name"`
 	Args map[string]any `json:"args,omitempty"`
+	ID   string         `json:"id,omitempty"`
 }
 
 type geminiFunctionResponse struct {
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response,omitempty"`
+	ID       string         `json:"id,omitempty"`
 }
 
 type geminiTool struct {
@@ -75,7 +85,8 @@ type geminiFunctionCallingConfig struct {
 }
 
 type geminiResponse struct {
-	Candidates []geminiCandidate `json:"candidates"`
+	Candidates    []geminiCandidate   `json:"candidates"`
+	UsageMetadata geminiUsageMetadata `json:"usageMetadata,omitempty"`
 }
 
 type geminiCandidate struct {
@@ -84,7 +95,20 @@ type geminiCandidate struct {
 }
 
 type geminiStreamResponse struct {
-	Candidates []geminiCandidate `json:"candidates"`
+	Candidates    []geminiCandidate   `json:"candidates"`
+	UsageMetadata geminiUsageMetadata `json:"usageMetadata,omitempty"`
+}
+
+type geminiUsageMetadata struct {
+	PromptTokenCount     int `json:"promptTokenCount,omitempty"`
+	CandidatesTokenCount int `json:"candidatesTokenCount,omitempty"`
+	TotalTokenCount      int `json:"totalTokenCount,omitempty"`
+	ThoughtsTokenCount   int `json:"thoughtsTokenCount,omitempty"`
+}
+
+type geminiThinkingConfig struct {
+	IncludeThoughts bool `json:"includeThoughts,omitempty"`
+	ThinkingBudget  int  `json:"thinkingBudget,omitempty"`
 }
 
 func (r geminiResponse) JoinText() string {
@@ -107,4 +131,13 @@ func (c geminiContent) JoinText() string {
 		b.WriteString(part.Text)
 	}
 	return b.String()
+}
+
+func (u geminiUsageMetadata) toCore() core.Usage {
+	return core.Usage{
+		InputTokens:     u.PromptTokenCount,
+		OutputTokens:    u.CandidatesTokenCount,
+		ReasoningTokens: u.ThoughtsTokenCount,
+		TotalTokens:     u.TotalTokenCount,
+	}
 }

@@ -54,6 +54,7 @@ func main() {
 	})
 	mux.HandleFunc("/api/providers", api.handleProviders)
 	mux.HandleFunc("/api/chat", api.handleChat)
+	mux.HandleFunc("/api/chat/stream", api.handleChatStream)
 
 	addr := strings.TrimSpace(os.Getenv("GAI_WEB_DEMO_ADDR"))
 	if addr == "" {

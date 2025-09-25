@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/shillcollin/gai/core"
@@ -155,6 +157,61 @@ func TestAnnotationsToCitations(t *testing.T) {
 	}
 	if c.Start != 5 || c.End != 12 || c.Score < 0.8 {
 		t.Fatalf("unexpected citation indices: %#v", c)
+	}
+}
+
+func TestConsumeSSEStreamEmitsToolCall(t *testing.T) {
+	client := New()
+	events := strings.Join([]string{
+		"event: response.created",
+		"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5-codex\"}}",
+		"",
+		"event: response.output_item.added",
+		"data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"make_sheet\",\"call_id\":\"call_1\"}}",
+		"",
+		"event: response.function_call_arguments.delta",
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"item_1\",\"delta\":\"{\\\"sheet\\\":\\\"P&L\\\"}\"}",
+		"",
+		"event: response.function_call_arguments.done",
+		"data: {\"type\":\"response.function_call_arguments.done\",\"sequence_number\":3,\"item_id\":\"item_1\",\"arguments\":\"{\\\"sheet\\\":\\\"P&L\\\"}\"}",
+		"",
+		"event: response.completed",
+		"data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5-codex\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}",
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	ctx := context.Background()
+	stream := core.NewStream(ctx, 16)
+	go client.consumeSSEStream(ctx, io.NopCloser(strings.NewReader(events)), stream, "gpt-5-codex")
+
+	var toolCalls []core.ToolCall
+	var finish *core.StreamEvent
+	for event := range stream.Events() {
+		switch event.Type {
+		case core.EventToolCall:
+			toolCalls = append(toolCalls, event.ToolCall)
+		case core.EventFinish:
+			copy := event
+			finish = &copy
+		}
+	}
+	if err := stream.Err(); err != nil && !errors.Is(err, core.ErrStreamClosed) {
+		t.Fatalf("stream err: %v", err)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected single tool call, got %d", len(toolCalls))
+	}
+	call := toolCalls[0]
+	if call.Name != "make_sheet" {
+		t.Fatalf("unexpected tool name: %s", call.Name)
+	}
+	if call.Input["sheet"] != "P&L" {
+		t.Fatalf("unexpected tool input: %#v", call.Input)
+	}
+	if finish == nil || finish.Usage.TotalTokens != 15 {
+		t.Fatalf("expected finish event with usage, got %#v", finish)
 	}
 }
 

@@ -452,6 +452,7 @@ result, err := geminiProvider.GenerateText(ctx, core.Request{
         gemini.WithGrounding("web"),
         gemini.WithThoughtSignatures("require"),
         gemini.WithThinkingBudget(2048),
+        gemini.WithIncludeThoughts(true),
     ),
 })
 
@@ -505,6 +506,12 @@ func streamExample(ctx context.Context, p core.Provider) error {
             // Print text as it arrives
             fmt.Print(event.TextDelta)
 
+        case core.EventToolCall:
+            fmt.Printf("\n[Tool call] %s -> %v\n", event.ToolCall.Name, event.ToolCall.Input)
+            if sig, ok := event.ToolCall.Metadata["gemini.thought_signature"]; ok {
+                fmt.Println("(Gemini thought signature captured)")
+            }
+
         case core.EventFinish:
             // Stream completed successfully
             fmt.Printf("\n\nCompleted. Tokens used: %d\n",
@@ -519,6 +526,12 @@ func streamExample(ctx context.Context, p core.Provider) error {
     return nil
 }
 ```
+
+When a Gemini model produces a tool call, the stream event's `ToolCall.Metadata`
+contains the opaque `gemini.thought_signature` value and the raw content blob the
+provider expects on the next request. Always return the prior model message
+unchanged (including that signature) when you send the tool result back so the
+model can resume the same reasoning thread.
 
 ### Advanced Stream Processing
 
@@ -1430,10 +1443,13 @@ func logCompletion(ctx context.Context, res *core.TextResult, history []core.Mes
         Output:       obs.MessageFromCore(core.AssistantMessage(res.Text)),
         Usage:        obs.UsageFromCore(res.Usage),
         LatencyMS:    res.LatencyMS,
+        ToolCalls:    obs.ToolCallsFromSteps(res.Steps),
         CreatedAtUTC: time.Now().UTC().UnixMilli(),
     })
 }
 ```
+
+`ToolCalls` captures each tool run, including provider metadata such as Gemini thought signatures that must be echoed on the next turn.
 
 Braintrust is the default evaluation sink. Provide `BRAINTRUST_API_KEY`, `BRAINTRUST_PROJECT_NAME` (or `BRAINTRUST_PROJECT_ID`), and optional `BRAINTRUST_DATASET` to stream normalized completions automatically. The `obs` package also exposes an `ArizeOptions` struct so future releases can wire Arize exports without touching call sites; set `ARIZE_ENABLED=true` to opt-in once support lands.
 
