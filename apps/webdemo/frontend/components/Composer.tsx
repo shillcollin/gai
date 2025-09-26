@@ -7,16 +7,12 @@ import clsx from "clsx"
 interface ComposerProps {
   disabled: boolean
   allowImage: boolean
-  mode: "text" | "json"
-  onModeChange: (mode: "text" | "json") => void
   onSubmit: (input: { text: string; image?: { dataUrl: string; mime: string } }) => void
 }
 
 const Composer: React.FC<ComposerProps> = ({
   disabled,
   allowImage,
-  mode,
-  onModeChange,
   onSubmit,
 }) => {
   const [text, setText] = useState("")
@@ -56,31 +52,6 @@ const Composer: React.FC<ComposerProps> = ({
 
   return (
     <form className="composer" onSubmit={handleSubmit}>
-      <div className="composer-controls">
-        <div className="mode-toggle" role="radiogroup">
-          <button
-            type="button"
-            role="radio"
-            aria-checked={mode === "text"}
-            className={clsx("pill", { active: mode === "text" })}
-            onClick={() => onModeChange("text")}
-            disabled={disabled}
-          >
-            Conversational
-          </button>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={mode === "json"}
-            className={clsx("pill", { active: mode === "json" })}
-            onClick={() => onModeChange("json")}
-            disabled={disabled}
-          >
-            Structured JSON
-          </button>
-        </div>
-      </div>
-
       <textarea
         className="composer-input"
         placeholder="Ask anything, attach an image, or request structured JSON output."
@@ -96,9 +67,13 @@ const Composer: React.FC<ComposerProps> = ({
 
       <div className="composer-footer">
         <div className="composer-actions">
-          <label className={clsx("ghost", { disabled: disabled || !allowImage })}>
+          <label className={clsx("ghost", "icon-button", { disabled: disabled || !allowImage })}>
             <input type="file" accept="image/*" disabled={disabled || !allowImage} onChange={handleFileChange} hidden />
-            Attach image
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+              <circle cx="8.5" cy="8.5" r="1.5"/>
+              <polyline points="21 15 16 10 5 21"/>
+            </svg>
           </label>
           {image && (
             <div className="composer-attachment">

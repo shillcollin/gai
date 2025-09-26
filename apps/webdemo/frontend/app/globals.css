@@ -56,13 +56,16 @@ a {
 
 .app-shell {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
   width: 100%;
   background: transparent;
+  overflow: hidden;
 }
 
 .sidebar {
   width: 320px;
+  min-width: 320px;
+  flex-shrink: 0;
   background: var(--surface);
   border-right: 1px solid var(--border);
   padding: 2.5rem 2rem;
@@ -306,6 +309,9 @@ a {
   display: flex;
   flex-direction: column;
   background: transparent;
+  min-width: 0;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .main-toolbar {
@@ -355,11 +361,14 @@ a {
 .chat-thread {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 2.2rem 2.4rem;
   display: flex;
   flex-direction: column;
   gap: 1.6rem;
   background: transparent;
+  max-width: 100%;
+  min-height: 0;
 }
 
 .chat-thread::-webkit-scrollbar {
@@ -413,6 +422,7 @@ a {
 .chat-message.assistant {
   margin-right: auto;
   max-width: min(760px, 95%);
+  overflow: visible;
 }
 
 .chat-message-header {
@@ -496,33 +506,54 @@ a {
 }
 
 .tool-card {
-  border: 1px solid var(--border);
+  border: none;
   border-radius: 12px;
-  padding: 0.9rem 1rem;
   background: var(--surface-alt);
-  display: flex;
-  flex-direction: column;
-  gap: 0.65rem;
+  overflow: visible;
+  max-width: 100%;
 }
 
-.tool-card.running {
-  border-color: var(--accent);
-}
-
-.tool-card.completed {
-  border-color: var(--primary);
-}
-
-.tool-card header {
+.tool-card summary {
+  padding: 0.9rem 1rem;
   display: flex;
   justify-content: space-between;
   align-items: center;
+  cursor: pointer;
+  list-style: none;
   font-weight: 600;
+  user-select: none;
+}
+
+.tool-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-card summary::before {
+  content: "▶";
+  display: inline-block;
+  margin-right: 0.5rem;
+  transition: transform 0.2s ease;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.tool-card[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.tool-card-content {
+  padding: 0 1rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  border-top: 1px solid var(--border);
+  margin-top: 0.25rem;
 }
 
 .tool-status {
   font-size: 0.85rem;
   color: var(--text-secondary);
+  font-weight: 400;
 }
 
 .tool-section {
@@ -546,6 +577,9 @@ a {
   color: #e8e6e6;
   font-size: 0.8rem;
   overflow-x: auto;
+  max-width: 100%;
+  word-wrap: break-word;
+  white-space: pre-wrap;
 }
 
 .tool-error {
@@ -598,6 +632,7 @@ a {
   border-radius: 12px;
   overflow-x: auto;
   font-size: 0.85rem;
+  max-width: 100%;
 }
 
 .md-table-wrapper {
@@ -634,8 +669,7 @@ a {
   display: flex;
   flex-direction: column;
   gap: 1.1rem;
-  position: sticky;
-  bottom: 0;
+  flex-shrink: 0;
 }
 
 .composer-controls {
@@ -741,17 +775,26 @@ button.ghost.disabled {
   pointer-events: none;
 }
 
-button.icon-button {
+button.icon-button,
+label.icon-button {
   padding: 0.5rem;
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   transition: transform 0.2s ease, background 0.2s ease;
+  cursor: pointer;
+  border-radius: 8px;
 }
 
-button.icon-button:hover {
+button.icon-button:hover,
+label.icon-button:hover:not(.disabled) {
   background: var(--surface-alt);
   transform: scale(1.05);
+}
+
+label.icon-button.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 @media (max-width: 1024px) {

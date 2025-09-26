@@ -390,6 +390,81 @@ func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream 
 		}
 	}
 
+	if runErr == nil && req.OnStop != nil {
+		prevUsage := state.Usage
+		prevSteps := len(state.Steps)
+		res, err := r.runFinalizer(ctx, req.OnStop, state)
+		if err != nil {
+			runErr = err
+		} else if res != nil {
+			newSteps := append([]core.Step(nil), res.Steps...)
+			if len(newSteps) < prevSteps {
+				prevSteps = len(newSteps)
+			}
+			appended := []core.Step{}
+			if len(newSteps) > prevSteps {
+				appended = append(appended, newSteps[prevSteps:]...)
+			}
+			finalText := strings.TrimSpace(res.Text)
+			stepUsage := subtractUsage(res.Usage, prevUsage)
+			if len(appended) == 0 && finalText != "" {
+				now := time.Now()
+				modelForSynthetic := res.Model
+				if modelForSynthetic == "" {
+					if len(state.Steps) > 0 && state.Steps[len(state.Steps)-1].Model != "" {
+						modelForSynthetic = state.Steps[len(state.Steps)-1].Model
+					} else if req.Model != "" {
+						modelForSynthetic = req.Model
+					} else {
+						modelForSynthetic = providerName
+					}
+				}
+				synthetic := core.Step{
+					Number:      prevSteps + 1,
+					Text:        finalText,
+					Usage:       stepUsage,
+					DurationMS:  0,
+					StartedAt:   now.UnixMilli(),
+					CompletedAt: now.UnixMilli(),
+					Model:       modelForSynthetic,
+				}
+				newSteps = append(newSteps, synthetic)
+				appended = []core.Step{synthetic}
+			}
+			if publisher != nil && len(appended) > 0 {
+				for _, step := range appended {
+					publisher.emitStepStart(step.Number)
+					if text := strings.TrimSpace(step.Text); text != "" {
+						publisher.push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text}, step.Number)
+					}
+					publisher.emitStepFinish(step)
+				}
+			}
+			state.Steps = append([]core.Step(nil), newSteps...)
+			if len(state.Steps) > 0 {
+				state.LastStep = &state.Steps[len(state.Steps)-1]
+			} else {
+				state.LastStep = nil
+			}
+			state.Usage = res.Usage
+			state.StopReason = res.FinishReason
+			if finalText != "" {
+				state.Messages = append(state.Messages, core.AssistantMessage(finalText))
+			}
+			if res.Model != "" {
+				lastModel = res.Model
+			} else if state.LastStep != nil && state.LastStep.Model != "" {
+				lastModel = state.LastStep.Model
+			}
+			if res.Provider != "" {
+				providerName = res.Provider
+				if publisher != nil {
+					publisher.provider = providerName
+				}
+			}
+		}
+	}
+
 	if runErr == nil {
 		if state.StopReason.Type == "" {
 			state.StopReason = core.StopReason{Type: core.StopReasonComplete}
@@ -776,6 +851,40 @@ func addUsage(total, step core.Usage) core.Usage {
 	total.AudioTokens += step.AudioTokens
 	total.CostUSD += step.CostUSD
 	return total
+}
+
+func subtractUsage(total, prior core.Usage) core.Usage {
+	diff := core.Usage{
+		InputTokens:       total.InputTokens - prior.InputTokens,
+		OutputTokens:      total.OutputTokens - prior.OutputTokens,
+		ReasoningTokens:   total.ReasoningTokens - prior.ReasoningTokens,
+		TotalTokens:       total.TotalTokens - prior.TotalTokens,
+		CachedInputTokens: total.CachedInputTokens - prior.CachedInputTokens,
+		AudioTokens:       total.AudioTokens - prior.AudioTokens,
+		CostUSD:           total.CostUSD - prior.CostUSD,
+	}
+	if diff.InputTokens < 0 {
+		diff.InputTokens = 0
+	}
+	if diff.OutputTokens < 0 {
+		diff.OutputTokens = 0
+	}
+	if diff.ReasoningTokens < 0 {
+		diff.ReasoningTokens = 0
+	}
+	if diff.TotalTokens < 0 {
+		diff.TotalTokens = 0
+	}
+	if diff.CachedInputTokens < 0 {
+		diff.CachedInputTokens = 0
+	}
+	if diff.AudioTokens < 0 {
+		diff.AudioTokens = 0
+	}
+	if diff.CostUSD < 0 {
+		diff.CostUSD = 0
+	}
+	return diff
 }
 
 func toolInputHash(input map[string]any) string {

@@ -17,7 +17,6 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message }) => {
       {message.role === "assistant" && (
         <header className="chat-message-header">
           <div className="chat-message-meta">
-            <span className="chat-author">GAI</span>
             {message.provider && message.model && (
               <span className="chat-model">{message.provider} • {message.model}</span>
             )}
@@ -96,31 +95,33 @@ function renderTools(tools: ToolCallEvent[]) {
   return (
     <div className="chat-tools">
       {tools.map((tool) => (
-        <div key={tool.id} className={clsx("tool-card", tool.status)}>
-          <header>
+        <details key={tool.id} className={clsx("tool-card", tool.status)}>
+          <summary>
             <strong>{tool.name}</strong>
             <span className="tool-status">{labelForToolStatus(tool.status)}</span>
-          </header>
-          {tool.input && (
-            <div className="tool-section">
-              <span className="tool-section-label">Input</span>
-              <pre>{JSON.stringify(tool.input, null, 2)}</pre>
-            </div>
-          )}
-          {tool.result !== undefined && tool.result !== null && (
-            <div className="tool-section">
-              <span className="tool-section-label">Result</span>
-              <pre>{JSON.stringify(tool.result, null, 2)}</pre>
-            </div>
-          )}
-          {tool.error && <div className="tool-error">{tool.error}</div>}
-          {(tool.duration_ms || tool.retries) && (
-            <footer className="tool-footer">
-              {tool.duration_ms ? `${tool.duration_ms} ms` : null}
-              {tool.retries ? ` • ${tool.retries} retries` : null}
-            </footer>
-          )}
-        </div>
+          </summary>
+          <div className="tool-card-content">
+            {tool.input && (
+              <div className="tool-section">
+                <span className="tool-section-label">Input</span>
+                <pre>{JSON.stringify(tool.input, null, 2)}</pre>
+              </div>
+            )}
+            {tool.result !== undefined && tool.result !== null && (
+              <div className="tool-section">
+                <span className="tool-section-label">Result</span>
+                <pre>{JSON.stringify(tool.result, null, 2)}</pre>
+              </div>
+            )}
+            {tool.error && <div className="tool-error">{tool.error}</div>}
+            {(tool.duration_ms || tool.retries) && (
+              <footer className="tool-footer">
+                {tool.duration_ms ? `${tool.duration_ms} ms` : null}
+                {tool.retries ? ` • ${tool.retries} retries` : null}
+              </footer>
+            )}
+          </div>
+        </details>
       ))}
     </div>
   )

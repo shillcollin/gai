@@ -471,6 +471,8 @@ export default function Page() {
           temperature={temperature}
           onTemperatureChange={setTemperature}
           temperatureDisabled={loading || !providerId}
+          mode={mode}
+          onModeChange={setMode}
           theme={theme}
           onThemeToggle={handleThemeToggle}
           onClearChat={messages.length > 0 ? handleClearChat : undefined}
@@ -527,8 +529,6 @@ export default function Page() {
         <Composer
           disabled={loading || !providerId}
           allowImage={allowImages}
-          mode={mode}
-          onModeChange={setMode}
           onSubmit={handleSend}
         />
       </main>

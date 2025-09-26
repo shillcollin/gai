@@ -15,6 +15,8 @@ interface SidebarProps {
   temperature: number
   onTemperatureChange: (value: number) => void
   temperatureDisabled?: boolean
+  mode: "text" | "json"
+  onModeChange: (mode: "text" | "json") => void
   theme: "light" | "dark"
   onThemeToggle: () => void
   onClearChat?: () => void
@@ -31,6 +33,8 @@ const Sidebar: React.FC<SidebarProps> = ({
   temperature,
   onTemperatureChange,
   temperatureDisabled = false,
+  mode,
+  onModeChange,
   theme,
   onThemeToggle,
   onClearChat,
@@ -79,19 +83,99 @@ const Sidebar: React.FC<SidebarProps> = ({
         <section className="sidebar-section">
           <h3>Tools</h3>
           <div className="sidebar-pill-group">
-            {tools.map((tool) => (
+            {/* Consolidate web_search and url_extract into one Search button */}
+            {tools.includes("web_search") && tools.includes("url_extract") ? (
               <button
-                key={tool}
                 type="button"
-                className={clsx("pill", { active: selectedTools[tool] })}
-                onClick={() => onToggleTool(tool, !selectedTools[tool])}
+                className={clsx("pill", {
+                  active: selectedTools["web_search"] && selectedTools["url_extract"]
+                })}
+                onClick={() => {
+                  const newState = !(selectedTools["web_search"] && selectedTools["url_extract"])
+                  onToggleTool("web_search", newState)
+                  onToggleTool("url_extract", newState)
+                }}
               >
-                {tool}
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  style={{ marginRight: "0.4rem", verticalAlign: "middle" }}
+                >
+                  <circle cx="11" cy="11" r="8"/>
+                  <path d="m21 21-4.35-4.35"/>
+                </svg>
+                Search
               </button>
-            ))}
+            ) : (
+              <>
+                {/* Show individual tool buttons for non-web search tools */}
+                {tools.map((tool) => {
+                  if (tool === "web_search" || tool === "url_extract") return null
+                  return (
+                    <button
+                      key={tool}
+                      type="button"
+                      className={clsx("pill", { active: selectedTools[tool] })}
+                      onClick={() => onToggleTool(tool, !selectedTools[tool])}
+                    >
+                      {tool}
+                    </button>
+                  )
+                })}
+                {/* If only one of the web tools is present, show it individually */}
+                {tools.includes("web_search") && !tools.includes("url_extract") && (
+                  <button
+                    type="button"
+                    className={clsx("pill", { active: selectedTools["web_search"] })}
+                    onClick={() => onToggleTool("web_search", !selectedTools["web_search"])}
+                  >
+                    web_search
+                  </button>
+                )}
+                {!tools.includes("web_search") && tools.includes("url_extract") && (
+                  <button
+                    type="button"
+                    className={clsx("pill", { active: selectedTools["url_extract"] })}
+                    onClick={() => onToggleTool("url_extract", !selectedTools["url_extract"])}
+                  >
+                    url_extract
+                  </button>
+                )}
+              </>
+            )}
           </div>
         </section>
       )}
+
+      <section className="sidebar-section">
+        <h3>Mode</h3>
+        <div className="sidebar-pill-group" role="radiogroup">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={mode === "text"}
+            className={clsx("pill", { active: mode === "text" })}
+            onClick={() => onModeChange("text")}
+          >
+            Conversational
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={mode === "json"}
+            className={clsx("pill", { active: mode === "json" })}
+            onClick={() => onModeChange("json")}
+          >
+            Structured JSON
+          </button>
+        </div>
+      </section>
 
       <section className="sidebar-section">
         <h3>Parameters</h3>

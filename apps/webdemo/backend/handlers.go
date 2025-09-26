@@ -494,11 +494,23 @@ func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit
 		result, err := entry.Client.GenerateText(ctx, finalReq)
 		if err != nil {
 			fallback := strings.TrimSpace(baseResult.Text)
+			var message string
 			if fallback == "" {
-				baseResult.Text = fmt.Sprintf("I reached the limit of %d consecutive tool calls and could not complete the request. Please retry or adjust the instructions.", limit)
+				message = fmt.Sprintf("I reached the limit of %d consecutive tool calls and could not complete the request. Please retry or adjust the instructions.", limit)
 			} else {
-				baseResult.Text = fmt.Sprintf("I reached the limit of %d consecutive tool calls before finishing. Here's the partial answer I produced:\n\n%s", limit, fallback)
+				message = fmt.Sprintf("I reached the limit of %d consecutive tool calls before finishing. Here's the partial answer I produced:\n\n%s", limit, fallback)
 			}
+			baseResult.Text = message
+			now := time.Now()
+			baseResult.Steps = append(baseResult.Steps, core.Step{
+				Number:      len(baseResult.Steps) + 1,
+				Text:        message,
+				Usage:       core.Usage{},
+				DurationMS:  0,
+				StartedAt:   now.UnixMilli(),
+				CompletedAt: now.UnixMilli(),
+				Model:       firstNonEmpty(baseModel, lastModelFromSteps(baseResult.Steps, baseModel), providerName),
+			})
 			return baseResult, nil
 		}
 
@@ -519,6 +531,20 @@ func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit
 		steps := append([]core.Step(nil), state.Steps...)
 		if len(result.Steps) > 0 {
 			steps = append(steps, result.Steps...)
+		} else if finalText != "" {
+			duplicate := len(steps) > 0 && strings.TrimSpace(steps[len(steps)-1].Text) == finalText
+			if !duplicate {
+				now := time.Now()
+				steps = append(steps, core.Step{
+					Number:      len(steps) + 1,
+					Text:        finalText,
+					Usage:       result.Usage,
+					DurationMS:  0,
+					StartedAt:   now.UnixMilli(),
+					CompletedAt: now.UnixMilli(),
+					Model:       firstNonEmpty(result.Model, lastModelFromSteps(steps, baseModel), baseModel),
+				})
+			}
 		}
 
 		warnings := append([]core.Warning(nil), baseResult.Warnings...)

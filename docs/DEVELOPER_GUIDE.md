@@ -1211,6 +1211,8 @@ result, err := runner.ExecuteRequest(ctx, core.Request{
 })
 ```
 
+When you run the streaming API (`runner.StreamRequest`) the finalizer now executes before the stream closes. Any additional steps returned by the finalizer (for example, a synthetic answer when a stop condition fires before the model can respond) are converted into streamed events so the client still receives a final assistant message.
+
 ## Prompt Management
 
 ### Versioned Prompts with Templates
