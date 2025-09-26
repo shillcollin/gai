@@ -19,8 +19,10 @@ import (
 
 type chatHandler struct {
 	providers map[string]providerEntry
-	firecrawl *firecrawlClient
+	tavily    *tavilyClient
 }
+
+const maxConsecutiveToolSteps = 4
 
 type apiMessage struct {
 	Role     string         `json:"role"`
@@ -94,7 +96,7 @@ func (h *chatHandler) handleProviders(w http.ResponseWriter, r *http.Request) {
 	for id, entry := range h.providers {
 		caps := entry.Client.Capabilities()
 		tools := []string{}
-		if h.firecrawl != nil && h.firecrawl.enabled() {
+		if h.tavily != nil && h.tavily.enabled() {
 			tools = append(tools, "web_search", "url_extract")
 		}
 		list = append(list, providerListResponse{
@@ -254,14 +256,14 @@ func (h *chatHandler) prepareCoreRequest(req chatRequest, reqID string) (core.Re
 	}
 
 	toolHandles := make([]core.ToolHandle, 0, 4)
-	if h.firecrawl != nil && h.firecrawl.enabled() {
+	if h.tavily != nil && h.tavily.enabled() {
 		if len(selected) == 0 || hasTool(selected, "web_search") {
-			if handle := h.firecrawl.searchTool(); handle != nil {
+			if handle := h.tavily.searchTool(); handle != nil {
 				toolHandles = append(toolHandles, handle)
 			}
 		}
 		if len(selected) == 0 || hasTool(selected, "url_extract") {
-			if handle := h.firecrawl.extractTool(); handle != nil {
+			if handle := h.tavily.extractTool(); handle != nil {
 				toolHandles = append(toolHandles, handle)
 			}
 		}
@@ -284,6 +286,12 @@ func (h *chatHandler) prepareCoreRequest(req chatRequest, reqID string) (core.Re
 		ProviderOptions: providerOptions,
 		Metadata:        metadata,
 	}
+
+	request.StopWhen = core.Any(
+		stopWhenMaxConsecutiveToolSteps(maxConsecutiveToolSteps),
+		core.NoMoreTools(),
+	)
+	request.OnStop = buildConsecutiveToolFinalizer(entry, request, maxConsecutiveToolSteps)
 
 	return request, entry, nil
 }
@@ -403,6 +411,192 @@ func parseToolChoice(choice string) core.ToolChoice {
 func hasTool(set map[string]struct{}, name string) bool {
 	_, ok := set[name]
 	return ok
+}
+
+func stopWhenMaxConsecutiveToolSteps(limit int) core.StopCondition {
+	if limit <= 0 {
+		limit = 1
+	}
+	return func(state *core.RunnerState) (bool, core.StopReason) {
+		if state == nil {
+			return false, core.StopReason{}
+		}
+		consecutive := 0
+		for i := len(state.Steps) - 1; i >= 0; i-- {
+			if len(state.Steps[i].ToolCalls) == 0 {
+				break
+			}
+			consecutive++
+		}
+		if consecutive >= limit {
+			return true, core.StopReason{
+				Type:        core.StopReasonMaxSteps,
+				Description: fmt.Sprintf("reached %d consecutive tool-call steps", limit),
+				Details: map[string]any{
+					"limit":       limit,
+					"consecutive": consecutive,
+				},
+			}
+		}
+		return false, core.StopReason{}
+	}
+}
+
+func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit int) core.Finalizer {
+	if entry.Client == nil {
+		return nil
+	}
+	providerName := entry.Client.Capabilities().Provider
+	baseMetadata := cloneAnyMap(base.Metadata)
+	baseProviderOptions := cloneAnyMap(base.ProviderOptions)
+	baseModel := base.Model
+
+	return func(ctx context.Context, state core.FinalState) (*core.TextResult, error) {
+		baseResult := stateToResult(providerName, baseModel, state)
+		if state.StopReason.Type != core.StopReasonMaxSteps {
+			return baseResult, nil
+		}
+
+		messages := append([]core.Message(nil), state.Messages...)
+		instruction := fmt.Sprintf(
+			"The tool runner stopped after %d consecutive tool-call steps. Using only the information already gathered, craft a final reply that explains the limit, summarizes findings, and suggests concrete next steps. Do not call any tools.",
+			limit,
+		)
+		messages = append(messages,
+			core.SystemMessage(instruction),
+			core.UserMessage(core.TextPart("Respond to the user now with a complete answer.")),
+		)
+
+		metadata := cloneAnyMap(baseMetadata)
+		if metadata == nil {
+			metadata = map[string]any{}
+		}
+		metadata["finalizer"] = map[string]any{
+			"type":  "consecutive_tool_limit",
+			"limit": limit,
+		}
+
+		providerOptions := cloneAnyMap(baseProviderOptions)
+
+		finalReq := core.Request{
+			Model:           firstNonEmpty(baseModel, lastModelFromSteps(state.Steps, baseModel)),
+			Messages:        messages,
+			Temperature:     base.Temperature,
+			MaxTokens:       base.MaxTokens,
+			TopP:            base.TopP,
+			TopK:            base.TopK,
+			ToolChoice:      core.ToolChoiceNone,
+			Tools:           nil,
+			Metadata:        metadata,
+			ProviderOptions: providerOptions,
+		}
+
+		result, err := entry.Client.GenerateText(ctx, finalReq)
+		if err != nil {
+			fallback := strings.TrimSpace(baseResult.Text)
+			if fallback == "" {
+				baseResult.Text = fmt.Sprintf("I reached the limit of %d consecutive tool calls and could not complete the request. Please retry or adjust the instructions.", limit)
+			} else {
+				baseResult.Text = fmt.Sprintf("I reached the limit of %d consecutive tool calls before finishing. Here's the partial answer I produced:\n\n%s", limit, fallback)
+			}
+			return baseResult, nil
+		}
+
+		finishReason := cloneStopReason(state.StopReason)
+		if finishReason.Details == nil {
+			finishReason.Details = map[string]any{}
+		}
+		finishReason.Details["finalizer"] = "consecutive_tool_limit"
+		finishReason.Details["limit"] = limit
+
+		combinedUsage := combineUsage(state.Usage, result.Usage)
+
+		finalText := strings.TrimSpace(result.Text)
+		if finalText == "" {
+			finalText = baseResult.Text
+		}
+
+		steps := append([]core.Step(nil), state.Steps...)
+		if len(result.Steps) > 0 {
+			steps = append(steps, result.Steps...)
+		}
+
+		warnings := append([]core.Warning(nil), baseResult.Warnings...)
+		if len(result.Warnings) > 0 {
+			warnings = append(warnings, result.Warnings...)
+		}
+
+		finalModel := firstNonEmpty(result.Model, lastModelFromSteps(steps, baseModel), baseModel)
+		finalProvider := firstNonEmpty(result.Provider, providerName)
+
+		return &core.TextResult{
+			Text:         finalText,
+			Steps:        steps,
+			Usage:        combinedUsage,
+			FinishReason: finishReason,
+			Provider:     finalProvider,
+			Model:        finalModel,
+			Warnings:     warnings,
+		}, nil
+	}
+}
+
+func stateToResult(providerName, fallbackModel string, state core.FinalState) *core.TextResult {
+	text := ""
+	if state.LastText != nil {
+		text = strings.TrimSpace(state.LastText())
+	}
+	steps := append([]core.Step(nil), state.Steps...)
+	model := lastModelFromSteps(steps, fallbackModel)
+	return &core.TextResult{
+		Text:         text,
+		Steps:        steps,
+		Usage:        state.Usage,
+		FinishReason: state.StopReason,
+		Provider:     providerName,
+		Model:        model,
+	}
+}
+
+func combineUsage(a, b core.Usage) core.Usage {
+	return core.Usage{
+		InputTokens:       a.InputTokens + b.InputTokens,
+		OutputTokens:      a.OutputTokens + b.OutputTokens,
+		ReasoningTokens:   a.ReasoningTokens + b.ReasoningTokens,
+		TotalTokens:       a.TotalTokens + b.TotalTokens,
+		CostUSD:           a.CostUSD + b.CostUSD,
+		CachedInputTokens: a.CachedInputTokens + b.CachedInputTokens,
+		AudioTokens:       a.AudioTokens + b.AudioTokens,
+	}
+}
+
+func cloneStopReason(reason core.StopReason) core.StopReason {
+	cloned := reason
+	if len(reason.Details) > 0 {
+		cloned.Details = make(map[string]any, len(reason.Details))
+		for k, v := range reason.Details {
+			cloned.Details[k] = v
+		}
+	}
+	return cloned
+}
+
+func lastModelFromSteps(steps []core.Step, fallback string) string {
+	for i := len(steps) - 1; i >= 0; i-- {
+		if model := strings.TrimSpace(steps[i].Model); model != "" {
+			return model
+		}
+	}
+	return fallback
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func normalizeAny(v any) any {

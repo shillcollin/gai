@@ -44,9 +44,9 @@ func main() {
 		log.Fatal("no providers available; set API keys before starting the server")
 	}
 
-	firecrawl := newFirecrawlClient(http.DefaultClient, os.Getenv("FIRECRAWL_API_KEY"))
+	tavily := newTavilyClient(http.DefaultClient, os.Getenv("TAVILY_API_KEY"))
 
-	api := &chatHandler{providers: providers, firecrawl: firecrawl}
+	api := &chatHandler{providers: providers, tavily: tavily}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

@@ -636,6 +636,15 @@ type Example struct {
 }
 ```
 
+### Demo Web Tools
+
+The web demo exposes Tavily-backed tools whenever `TAVILY_API_KEY` is configured. These tools are registered with both OpenAI Responses and other providers so the model can orchestrate linked search-and-read flows:
+
+- `web_search` &mdash; *"Search the public web with Tavily; follow up with url_extract via Tavily Extract when you need the full document."* Key inputs include `query` (required), optional selectors such as `topic` (`general`, `news`, or `finance`), `search_depth` (`basic` or `advanced`), `max_results`, and booleans like `include_answer`, `include_raw_content`, `include_images`, and `include_favicon`. The tool returns Tavily's structured response with `answer`, ranked `results` (title, URL, content snippet, score, raw content), any returned `images`, and metadata such as `auto_parameters`, `response_time`, and `request_id`.
+- `url_extract` &mdash; *"Fetch full page content with Tavily Extract; use this after web_search finds promising sources."* Inputs accept one or more `urls` plus optional toggles for `include_images`, `include_favicon`, `extract_depth` (`basic` or `advanced`), `format` (`markdown` or `text`), and `timeout`. Results echo Tavily's extractor payload, including the normalized `raw_content`, any inline images, failed URL metadata, `response_time`, and `request_id`.
+
+Both tool descriptions reference the counterpart so the LLM understands they work together: search surfaces candidates, extract hydrates the long-form content. Tool schemas are generated from the typed Go structs in `apps/webdemo/backend/tavily.go`, ensuring the UI and providers see accurate parameter contracts.
+
 ## Runner Package
 
 The `runner` package orchestrates multi-step tool execution with sophisticated control flow.
@@ -970,6 +979,8 @@ func ValidationFinalizer(validator func(string) error) OnStop {
     }
 }
 ```
+
+The web demo uses an `OnStop` finalizer to detect when the runner hits a ceiling of consecutive tool-call steps. When `StopReason.Type == core.StopReasonMaxSteps` for that condition, the finalizer appends two messages (a system reminder plus a short user nudge) and makes one more `GenerateText` call with `ToolChoiceNone`. The follow-up prompt instructs the model to explain that the Tavily workflow reached its tool limit, summarize any gathered evidence, and hand the user next steps—all without invoking additional tools. This ensures the UI still receives a coherent assistant reply even when exploration exhausts the configured tool budget.
 
 ## Prompts Package
 
