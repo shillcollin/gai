@@ -26,6 +26,8 @@ export interface ProviderInfo {
   models: string[]
   capabilities: ProviderCapabilities
   tools: string[]
+  system_prompt?: string
+  prompt_metadata?: Record<string, string>
 }
 
 export type Role = "system" | "user" | "assistant"

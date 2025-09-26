@@ -19,8 +19,6 @@ import {
 } from "../lib/types"
 
 const API_BASE = process.env.NEXT_PUBLIC_GAI_API_BASE ?? "http://localhost:8080"
-const SYSTEM_PROMPT = "You are a helpful assistant powered by the GAI SDK."
-
 type ThemeMode = "light" | "dark"
 
 type ChatMode = "text" | "json"
@@ -34,17 +32,13 @@ type StreamResult = {
   warnings: string[]
 }
 
-const systemMessage = (): ApiMessage => ({
-  role: "system",
-  parts: [{ type: "text", text: SYSTEM_PROMPT }],
-})
-
 export default function Page() {
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [providerId, setProviderId] = useState<string>("")
   const [model, setModel] = useState<string>("")
   const [selectedTools, setSelectedTools] = useState<Record<string, boolean>>({})
-  const [conversation, setConversation] = useState<ApiMessage[]>(() => [systemMessage()])
+  const [systemPrompt, setSystemPrompt] = useState<string>("")
+  const [conversation, setConversation] = useState<ApiMessage[]>([])
   const [messages, setMessages] = useState<ChatMessageType[]>([])
   const [temperature, setTemperature] = useState<number>(0.7)
   const [mode, setMode] = useState<ChatMode>("text")
@@ -53,6 +47,14 @@ export default function Page() {
   const [theme, setTheme] = useState<ThemeMode>("dark")
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false)
   const threadRef = useRef<HTMLDivElement | null>(null)
+
+  const makeSystemMessage = useCallback(
+    (prompt: string): ApiMessage => ({
+      role: "system",
+      parts: [{ type: "text", text: prompt }],
+    }),
+    [],
+  )
 
   const activeProvider = useMemo(
     () => providers.find((provider) => provider.id === providerId) ?? null,
@@ -85,10 +87,11 @@ export default function Page() {
         setProviders(payload)
         if (payload.length > 0) {
           const first = payload[0]
+          const promptText = first.system_prompt ?? ""
+          setSystemPrompt(promptText)
           setProviderId(first.id)
           setModel(first.default_model)
-          setSelectedTools(defaultToolSelection(first.tools))
-          resetSession(first)
+          resetSession(first, promptText)
         }
       } catch (err) {
         console.error("Failed to load providers", err)
@@ -133,6 +136,23 @@ export default function Page() {
     }
     setProviderId(id)
     setError(null)
+    const nextPrompt = next.system_prompt ?? ""
+    setSystemPrompt(nextPrompt)
+    setConversation((prev) => {
+      if (prev.length === 0) {
+        return nextPrompt ? [makeSystemMessage(nextPrompt)] : prev
+      }
+      const [first, ...rest] = prev
+      if (first.role !== "system") {
+        return nextPrompt ? [makeSystemMessage(nextPrompt), ...prev] : prev
+      }
+      const firstPart = first.parts[0]
+      const firstText = typeof firstPart?.text === "string" ? firstPart.text : ""
+      if (firstText.trim() === nextPrompt.trim()) {
+        return prev
+      }
+      return nextPrompt ? [makeSystemMessage(nextPrompt), ...rest] : rest
+    })
     setModel((current) => (next.models.includes(current) ? current : next.default_model))
     setSelectedTools((prev) => {
       if (next.tools.length === 0) {
@@ -157,14 +177,18 @@ export default function Page() {
     setTheme((prev) => (prev === "dark" ? "light" : "dark"))
   }
 
-  const resetSession = (provider?: ProviderInfo) => {
-    setConversation([systemMessage()])
-    setMessages([])
-    setError(null)
-    if (provider) {
-      setSelectedTools(defaultToolSelection(provider.tools))
-    }
-  }
+  const resetSession = useCallback(
+    (provider?: ProviderInfo, promptOverride?: string) => {
+      const promptText = (promptOverride ?? systemPrompt).trim()
+      setConversation(promptText ? [makeSystemMessage(promptText)] : [])
+      setMessages([])
+      setError(null)
+      if (provider) {
+        setSelectedTools(defaultToolSelection(provider.tools))
+      }
+    },
+    [makeSystemMessage, systemPrompt],
+  )
 
   const handleClearChat = () => {
     resetSession(activeProvider ?? undefined)

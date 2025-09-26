@@ -14,12 +14,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/obs"
+	"github.com/shillcollin/gai/prompts"
 	"github.com/shillcollin/gai/runner"
 )
 
 type chatHandler struct {
 	providers map[string]providerEntry
 	tavily    *tavilyClient
+	prompt    promptInfo
+	prompts   *prompts.Registry
+	toolLimit promptTemplate
 }
 
 const maxConsecutiveToolSteps = 4
@@ -89,6 +93,8 @@ type providerListResponse struct {
 	Models       []string          `json:"models"`
 	Capabilities core.Capabilities `json:"capabilities"`
 	Tools        []string          `json:"tools"`
+	SystemPrompt string            `json:"system_prompt"`
+	PromptMeta   map[string]string `json:"prompt_metadata,omitempty"`
 }
 
 func (h *chatHandler) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +105,7 @@ func (h *chatHandler) handleProviders(w http.ResponseWriter, r *http.Request) {
 		if h.tavily != nil && h.tavily.enabled() {
 			tools = append(tools, "web_search", "url_extract")
 		}
+		promptMeta := h.promptMetadataStrings()
 		list = append(list, providerListResponse{
 			ID:           id,
 			Label:        entry.Label,
@@ -106,6 +113,8 @@ func (h *chatHandler) handleProviders(w http.ResponseWriter, r *http.Request) {
 			Models:       entry.Models,
 			Capabilities: caps,
 			Tools:        tools,
+			SystemPrompt: h.prompt.Text,
+			PromptMeta:   promptMeta,
 		})
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -246,6 +255,7 @@ func (h *chatHandler) prepareCoreRequest(req chatRequest, reqID string) (core.Re
 	if err != nil {
 		return core.Request{}, providerEntry{}, err
 	}
+	messages = h.ensureSystemMessage(messages)
 
 	selected := make(map[string]struct{}, len(req.Tools))
 	for _, name := range req.Tools {
@@ -275,6 +285,11 @@ func (h *chatHandler) prepareCoreRequest(req chatRequest, reqID string) (core.Re
 	}
 
 	metadata := map[string]any{"request_id": reqID}
+	if promptMeta := h.promptMetadataStrings(); len(promptMeta) > 0 {
+		for k, v := range promptMeta {
+			metadata[k] = v
+		}
+	}
 
 	request := core.Request{
 		Model:           chooseModel(req.Model, entry.DefaultModel),
@@ -291,7 +306,7 @@ func (h *chatHandler) prepareCoreRequest(req chatRequest, reqID string) (core.Re
 		stopWhenMaxConsecutiveToolSteps(maxConsecutiveToolSteps),
 		core.NoMoreTools(),
 	)
-	request.OnStop = buildConsecutiveToolFinalizer(entry, request, maxConsecutiveToolSteps)
+	request.OnStop = h.buildConsecutiveToolFinalizer(entry, request, maxConsecutiveToolSteps)
 
 	return request, entry, nil
 }
@@ -413,6 +428,74 @@ func hasTool(set map[string]struct{}, name string) bool {
 	return ok
 }
 
+func (h *chatHandler) promptMetadataStrings() map[string]string {
+	if strings.TrimSpace(h.prompt.Text) == "" {
+		return nil
+	}
+	meta := map[string]string{}
+	if h.prompt.Name != "" {
+		meta["prompt_name"] = h.prompt.Name
+	}
+	if h.prompt.Version != "" {
+		meta["prompt_version"] = h.prompt.Version
+	}
+	if h.prompt.Fingerprint != "" {
+		meta["prompt_fingerprint"] = h.prompt.Fingerprint
+	}
+	return meta
+}
+
+func (h *chatHandler) ensureSystemMessage(msgs []core.Message) []core.Message {
+	promptText := strings.TrimSpace(h.prompt.Text)
+	if promptText == "" {
+		return msgs
+	}
+	metaStrings := h.promptMetadataStrings()
+	systemMsg := core.SystemMessage(promptText)
+	if len(metaStrings) > 0 {
+		systemMsg.Metadata = make(map[string]any, len(metaStrings))
+		for k, v := range metaStrings {
+			systemMsg.Metadata[k] = v
+		}
+	}
+	if len(msgs) == 0 {
+		return append([]core.Message{systemMsg}, msgs...)
+	}
+	first := msgs[0]
+	if first.Role != core.System {
+		return append([]core.Message{systemMsg}, msgs...)
+	}
+	if len(first.Parts) == 1 {
+		if textPart, ok := first.Parts[0].(core.Text); ok && strings.TrimSpace(textPart.Text) == promptText {
+			if len(metaStrings) > 0 {
+				if first.Metadata == nil {
+					first.Metadata = make(map[string]any, len(metaStrings))
+				}
+				for k, v := range metaStrings {
+					first.Metadata[k] = v
+				}
+			}
+			msgs[0] = first
+			return msgs
+		}
+	}
+	msgs[0] = systemMsg
+	return msgs
+}
+
+func (h *chatHandler) renderToolLimitInstruction(ctx context.Context, limit int) (string, promptTemplate, error) {
+	if h.prompts == nil || h.toolLimit.Name == "" {
+		return "", promptTemplate{}, errors.New("tool limit prompt unavailable")
+	}
+	data := map[string]any{"Limit": limit}
+	text, id, err := h.prompts.Render(ctx, h.toolLimit.Name, h.toolLimit.Version, data)
+	if err != nil {
+		return "", promptTemplate{}, err
+	}
+	info := promptTemplate{Name: id.Name, Version: id.Version, Fingerprint: id.Fingerprint}
+	return text, info, nil
+}
+
 func stopWhenMaxConsecutiveToolSteps(limit int) core.StopCondition {
 	if limit <= 0 {
 		limit = 1
@@ -442,7 +525,7 @@ func stopWhenMaxConsecutiveToolSteps(limit int) core.StopCondition {
 	}
 }
 
-func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit int) core.Finalizer {
+func (h *chatHandler) buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit int) core.Finalizer {
 	if entry.Client == nil {
 		return nil
 	}
@@ -458,12 +541,33 @@ func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit
 		}
 
 		messages := append([]core.Message(nil), state.Messages...)
-		instruction := fmt.Sprintf(
-			"The tool runner stopped after %d consecutive tool-call steps. Using only the information already gathered, craft a final reply that explains the limit, summarizes findings, and suggests concrete next steps. Do not call any tools. You should see the content results from the past 4 tool calls, make sure to summarize what those results were, if you don't see it, please inform the user. Format the start of your message to the user with TOOL LIMIT HIT. ",
-			limit,
-		)
+		instructionText, instructionPrompt, promptErr := h.renderToolLimitInstruction(ctx, limit)
+		if promptErr != nil || strings.TrimSpace(instructionText) == "" {
+			if promptErr != nil {
+				log.Printf("tool limit prompt render error: %v", promptErr)
+			}
+			instructionText = fmt.Sprintf(
+				"The tool runner stopped after %d consecutive tool-call steps. Using only the information already gathered, craft a final reply that explains the limit, summarizes findings, and suggests concrete next steps. Do not call any tools. You should see the content results from the past %d tool calls; summarize them and note any missing data. Lead with TOOL LIMIT HIT.",
+				limit, limit,
+			)
+			instructionPrompt = promptTemplate{}
+		}
+		systemInstruction := core.SystemMessage(instructionText)
+		if instructionPrompt.Name != "" || instructionPrompt.Version != "" || instructionPrompt.Fingerprint != "" {
+			meta := map[string]any{}
+			if instructionPrompt.Name != "" {
+				meta["prompt_name"] = instructionPrompt.Name
+			}
+			if instructionPrompt.Version != "" {
+				meta["prompt_version"] = instructionPrompt.Version
+			}
+			if instructionPrompt.Fingerprint != "" {
+				meta["prompt_fingerprint"] = instructionPrompt.Fingerprint
+			}
+			systemInstruction.Metadata = meta
+		}
 		messages = append(messages,
-			core.SystemMessage(instruction),
+			systemInstruction,
 			core.UserMessage(core.TextPart("Respond to the user now with a complete answer.")),
 		)
 
@@ -473,6 +577,15 @@ func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit
 		}
 		metadata["finalizer"] = "consecutive_tool_limit"
 		metadata["finalizer_limit"] = fmt.Sprintf("%d", limit)
+		if instructionPrompt.Name != "" {
+			metadata["finalizer_prompt_name"] = instructionPrompt.Name
+		}
+		if instructionPrompt.Version != "" {
+			metadata["finalizer_prompt_version"] = instructionPrompt.Version
+		}
+		if instructionPrompt.Fingerprint != "" {
+			metadata["finalizer_prompt_fingerprint"] = instructionPrompt.Fingerprint
+		}
 
 		providerOptions := cloneAnyMap(baseProviderOptions)
 
