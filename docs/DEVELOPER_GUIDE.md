@@ -1302,8 +1302,9 @@ Provide your review in the following format:
 ```
 
 ### Using Prompts in Code
-
+```
 ```go
+
 func usePrompts(ctx context.Context, reg *prompts.Registry, p core.Provider) error {
     // Render prompt with variables
     text, promptID, err := reg.Render(ctx, "summarize", "1.0.0", map[string]any{

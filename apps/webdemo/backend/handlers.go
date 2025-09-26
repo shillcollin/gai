@@ -459,7 +459,7 @@ func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit
 
 		messages := append([]core.Message(nil), state.Messages...)
 		instruction := fmt.Sprintf(
-			"The tool runner stopped after %d consecutive tool-call steps. Using only the information already gathered, craft a final reply that explains the limit, summarizes findings, and suggests concrete next steps. Do not call any tools.",
+			"The tool runner stopped after %d consecutive tool-call steps. Using only the information already gathered, craft a final reply that explains the limit, summarizes findings, and suggests concrete next steps. Do not call any tools. You should see the content results from the past 4 tool calls, make sure to summarize what those results were, if you don't see it, please inform the user. Format the start of your message to the user with TOOL LIMIT HIT. ",
 			limit,
 		)
 		messages = append(messages,
@@ -471,10 +471,8 @@ func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit
 		if metadata == nil {
 			metadata = map[string]any{}
 		}
-		metadata["finalizer"] = map[string]any{
-			"type":  "consecutive_tool_limit",
-			"limit": limit,
-		}
+		metadata["finalizer"] = "consecutive_tool_limit"
+		metadata["finalizer_limit"] = fmt.Sprintf("%d", limit)
 
 		providerOptions := cloneAnyMap(baseProviderOptions)
 
@@ -500,6 +498,7 @@ func buildConsecutiveToolFinalizer(entry providerEntry, base core.Request, limit
 			} else {
 				message = fmt.Sprintf("I reached the limit of %d consecutive tool calls before finishing. Here's the partial answer I produced:\n\n%s", limit, fallback)
 			}
+			log.Printf("OnStop finalizer GenerateText error: %v", err)
 			baseResult.Text = message
 			now := time.Now()
 			baseResult.Steps = append(baseResult.Steps, core.Step{
