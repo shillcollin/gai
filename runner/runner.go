@@ -393,6 +393,10 @@ func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream 
 	if runErr == nil && req.OnStop != nil {
 		prevUsage := state.Usage
 		prevSteps := len(state.Steps)
+		prevLastText := ""
+		if prevSteps > 0 {
+			prevLastText = strings.TrimSpace(state.Steps[prevSteps-1].Text)
+		}
 		res, err := r.runFinalizer(ctx, req.OnStop, state)
 		if err != nil {
 			runErr = err
@@ -407,7 +411,7 @@ func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream 
 			}
 			finalText := strings.TrimSpace(res.Text)
 			stepUsage := subtractUsage(res.Usage, prevUsage)
-			if len(appended) == 0 && finalText != "" {
+			if len(appended) == 0 && finalText != "" && finalText != prevLastText {
 				now := time.Now()
 				modelForSynthetic := res.Model
 				if modelForSynthetic == "" {
@@ -449,7 +453,13 @@ func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream 
 			state.Usage = res.Usage
 			state.StopReason = res.FinishReason
 			if finalText != "" {
-				state.Messages = append(state.Messages, core.AssistantMessage(finalText))
+				latestText := strings.TrimSpace(state.LastText())
+				if latestText == "" {
+					latestText = finalText
+				}
+				if latestText != prevLastText {
+					state.Messages = append(state.Messages, core.AssistantMessage(latestText))
+				}
 			}
 			if res.Model != "" {
 				lastModel = res.Model
