@@ -14,15 +14,17 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message }) => {
 
   return (
     <article className={clsx("chat-message", message.role)}>
-      <header className="chat-message-header">
-        <div className="chat-message-meta">
-          <span className="chat-author">{message.role === "assistant" ? "GAI" : "You"}</span>
-          {message.provider && message.model && (
-            <span className="chat-model">{message.provider} • {message.model}</span>
-          )}
-        </div>
-        {message.status === "streaming" && <span className="chat-status">Streaming…</span>}
-      </header>
+      {message.role === "assistant" && (
+        <header className="chat-message-header">
+          <div className="chat-message-meta">
+            <span className="chat-author">GAI</span>
+            {message.provider && message.model && (
+              <span className="chat-model">{message.provider} • {message.model}</span>
+            )}
+          </div>
+          {message.status === "streaming" && <span className="chat-status">Streaming…</span>}
+        </header>
+      )}
 
       {renderParts(message.parts)}
 

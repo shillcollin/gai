@@ -38,24 +38,11 @@ func (tc *tavilyClient) searchTool() core.ToolHandle {
 	}
 
 	type searchInput struct {
-		Query                    string   `json:"query"`
-		Topic                    string   `json:"topic,omitempty"`
-		SearchDepth              string   `json:"search_depth,omitempty"`
-		AutoParameters           bool     `json:"auto_parameters,omitempty"`
-		ChunksPerSource          int      `json:"chunks_per_source,omitempty"`
-		MaxResults               int      `json:"max_results,omitempty"`
-		TimeRange                string   `json:"time_range,omitempty"`
-		Days                     int      `json:"days,omitempty"`
-		StartDate                string   `json:"start_date,omitempty"`
-		EndDate                  string   `json:"end_date,omitempty"`
-		IncludeAnswer            bool     `json:"include_answer,omitempty"`
-		IncludeRawContent        bool     `json:"include_raw_content,omitempty"`
-		IncludeImages            bool     `json:"include_images,omitempty"`
-		IncludeImageDescriptions bool     `json:"include_image_descriptions,omitempty"`
-		IncludeFavicon           bool     `json:"include_favicon,omitempty"`
-		IncludeDomains           []string `json:"include_domains,omitempty"`
-		ExcludeDomains           []string `json:"exclude_domains,omitempty"`
-		Country                  string   `json:"country,omitempty"`
+		Query             string `json:"query"`
+		SearchDepth       string `json:"search_depth,omitempty"`
+		MaxResults        int    `json:"max_results,omitempty"`
+		IncludeRawContent bool   `json:"include_raw_content,omitempty"`
+		IncludeAnswer     bool   `json:"include_answer,omitempty"`
 	}
 
 	type searchImage struct {
@@ -84,7 +71,7 @@ func (tc *tavilyClient) searchTool() core.ToolHandle {
 
 	tool := tools.New[searchInput, searchOutput](
 		"web_search",
-		"Search the public web with Tavily; follow up with url_extract via Tavily Extract when you need the full document.",
+		"Search the public web with Tavily; follow up with url_extract via Tavily Extract when you need the full document. Optional fields: search_depth ('basic' or 'advanced', default 'advanced'), max_results (1-10, default 5), include_raw_content (bool), include_answer (bool).",
 		func(ctx context.Context, in searchInput, meta core.ToolMeta) (searchOutput, error) {
 			if strings.TrimSpace(in.Query) == "" {
 				return searchOutput{}, errors.New("query is required")
@@ -93,56 +80,29 @@ func (tc *tavilyClient) searchTool() core.ToolHandle {
 			body := map[string]any{
 				"query": strings.TrimSpace(in.Query),
 			}
-			if topic := strings.TrimSpace(in.Topic); topic != "" {
-				body["topic"] = strings.ToLower(topic)
+			depth := strings.ToLower(strings.TrimSpace(in.SearchDepth))
+			if depth == "" {
+				depth = "advanced"
 			}
-			if depth := strings.TrimSpace(in.SearchDepth); depth != "" {
-				body["search_depth"] = strings.ToLower(depth)
+			if depth != "basic" && depth != "advanced" {
+				return searchOutput{}, fmt.Errorf("invalid search_depth %q", in.SearchDepth)
 			}
-			if in.AutoParameters {
-				body["auto_parameters"] = true
+			body["search_depth"] = depth
+
+			maxResults := in.MaxResults
+			if maxResults <= 0 {
+				maxResults = 5
 			}
-			if in.ChunksPerSource > 0 {
-				body["chunks_per_source"] = in.ChunksPerSource
+			if maxResults > 10 {
+				maxResults = 10
 			}
-			if in.MaxResults > 0 {
-				body["max_results"] = in.MaxResults
-			}
-			if tr := strings.TrimSpace(in.TimeRange); tr != "" {
-				body["time_range"] = strings.ToLower(tr)
-			}
-			if in.Days > 0 {
-				body["days"] = in.Days
-			}
-			if start := strings.TrimSpace(in.StartDate); start != "" {
-				body["start_date"] = start
-			}
-			if end := strings.TrimSpace(in.EndDate); end != "" {
-				body["end_date"] = end
-			}
+			body["max_results"] = maxResults
+
 			if in.IncludeAnswer {
 				body["include_answer"] = true
 			}
 			if in.IncludeRawContent {
 				body["include_raw_content"] = true
-			}
-			if in.IncludeImages {
-				body["include_images"] = true
-			}
-			if in.IncludeImageDescriptions {
-				body["include_image_descriptions"] = true
-			}
-			if in.IncludeFavicon {
-				body["include_favicon"] = true
-			}
-			if len(in.IncludeDomains) > 0 {
-				body["include_domains"] = in.IncludeDomains
-			}
-			if len(in.ExcludeDomains) > 0 {
-				body["exclude_domains"] = in.ExcludeDomains
-			}
-			if country := strings.TrimSpace(in.Country); country != "" {
-				body["country"] = strings.ToLower(country)
 			}
 
 			var resp struct {
@@ -207,12 +167,7 @@ func (tc *tavilyClient) extractTool() core.ToolHandle {
 	}
 
 	type extractInput struct {
-		URLs           []string `json:"urls"`
-		IncludeImages  bool     `json:"include_images,omitempty"`
-		IncludeFavicon bool     `json:"include_favicon,omitempty"`
-		ExtractDepth   string   `json:"extract_depth,omitempty"`
-		Format         string   `json:"format,omitempty"`
-		TimeoutSeconds int      `json:"timeout,omitempty"`
+		URL string `json:"url"`
 	}
 
 	type extractResult struct {
@@ -236,41 +191,12 @@ func (tc *tavilyClient) extractTool() core.ToolHandle {
 		"url_extract",
 		"Fetch full page content with Tavily Extract; use this after web_search finds promising sources.",
 		func(ctx context.Context, in extractInput, meta core.ToolMeta) (extractOutput, error) {
-			if len(in.URLs) == 0 {
-				return extractOutput{}, errors.New("at least one url is required")
+			url := strings.TrimSpace(in.URL)
+			if url == "" {
+				return extractOutput{}, errors.New("url is required")
 			}
 
-			payload := map[string]any{}
-			if len(in.URLs) == 1 {
-				payload["urls"] = strings.TrimSpace(in.URLs[0])
-			} else {
-				urls := make([]string, 0, len(in.URLs))
-				for _, u := range in.URLs {
-					if trimmed := strings.TrimSpace(u); trimmed != "" {
-						urls = append(urls, trimmed)
-					}
-				}
-				if len(urls) == 0 {
-					return extractOutput{}, errors.New("at least one url is required")
-				}
-				payload["urls"] = urls
-			}
-
-			if in.IncludeImages {
-				payload["include_images"] = true
-			}
-			if in.IncludeFavicon {
-				payload["include_favicon"] = true
-			}
-			if depth := strings.TrimSpace(in.ExtractDepth); depth != "" {
-				payload["extract_depth"] = strings.ToLower(depth)
-			}
-			if format := strings.TrimSpace(in.Format); format != "" {
-				payload["format"] = strings.ToLower(format)
-			}
-			if in.TimeoutSeconds > 0 {
-				payload["timeout"] = in.TimeoutSeconds
-			}
+			payload := map[string]any{"urls": url}
 
 			var resp struct {
 				Results      []extractResult  `json:"results"`
