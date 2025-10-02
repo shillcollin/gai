@@ -21,6 +21,7 @@ import (
 	"github.com/shillcollin/gai/obs"
 	"github.com/shillcollin/gai/providers/anthropic"
 	"github.com/shillcollin/gai/providers/gemini"
+	"github.com/shillcollin/gai/providers/groq"
 	"github.com/shillcollin/gai/providers/openai"
 	openairesponses "github.com/shillcollin/gai/providers/openai-responses"
 	"github.com/shillcollin/gai/runner"
@@ -736,6 +737,20 @@ func buildProviders() ([]*providerEntry, error) {
 			Label:   "Gemini",
 			Models:  []string{"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"},
 			Default: "gemini-2.5-pro",
+			Client:  client,
+		})
+	}
+
+	if key := strings.TrimSpace(os.Getenv("GROQ_API_KEY")); key != "" {
+		client := groq.New(
+			groq.WithAPIKey(key),
+			groq.WithModel("llama3-8b-8192"),
+		)
+		providers = append(providers, &providerEntry{
+			Name:    "groq",
+			Label:   "Groq",
+			Models:  []string{"llama3-8b-8192", "llama3-70b-8192", "mixtral-8x7b-32768", "gemma-7b-it"},
+			Default: "llama3-8b-8192",
 			Client:  client,
 		})
 	}
