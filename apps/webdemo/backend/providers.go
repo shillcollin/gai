@@ -11,6 +11,7 @@ import (
 	"github.com/shillcollin/gai/providers/groq"
 	openai "github.com/shillcollin/gai/providers/openai"
 	openairesponses "github.com/shillcollin/gai/providers/openai-responses"
+	"github.com/shillcollin/gai/providers/xai"
 )
 
 type providerEntry struct {
@@ -82,6 +83,19 @@ func buildProviders() (map[string]providerEntry, error) {
 			Label:        "Groq",
 			DefaultModel: "llama3-8b-8192",
 			Models:       []string{"llama3-8b-8192", "llama3-70b-8192", "mixtral-8x7b-32768", "gemma-7b-it"},
+			Client:       client,
+		}
+	}
+
+	if key := strings.TrimSpace(os.Getenv("XAI_API_KEY")); key != "" {
+		client := xai.New(
+			xai.WithAPIKey(key),
+			xai.WithModel("grok-4"),
+		)
+		providers["xai"] = providerEntry{
+			Label:        "XAI",
+			DefaultModel: "grok-4",
+			Models:       []string{"grok-4", "grok-4-fast-reasoning", "grok-4-fast-non-reasoning", "grok-code-fast-1", "grok-3", "grok-3-mini"},
 			Client:       client,
 		}
 	}

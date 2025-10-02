@@ -1,4 +1,4 @@
-package groq
+package xai
 
 import (
 	"github.com/shillcollin/gai/core"
@@ -6,12 +6,12 @@ import (
 	"github.com/shillcollin/gai/providers/compat"
 )
 
-// Client for the Groq API.
+// Client for the XAI API.
 type Client struct {
 	core.Provider
 }
 
-// New constructs a new Groq client.
+// New constructs a new XAI client.
 func New(opts ...Option) *Client {
 	o := defaultOptions()
 	for _, opt := range opts {
