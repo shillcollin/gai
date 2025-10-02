@@ -77,12 +77,12 @@ func buildProviders() (map[string]providerEntry, error) {
 	if key := strings.TrimSpace(os.Getenv("GROQ_API_KEY")); key != "" {
 		client := groq.New(
 			groq.WithAPIKey(key),
-			groq.WithModel("llama3-8b-8192"),
+			groq.WithModel("llama-3.1-8b-instant"),
 		)
 		providers["groq"] = providerEntry{
 			Label:        "Groq",
-			DefaultModel: "llama3-8b-8192",
-			Models:       []string{"llama3-8b-8192", "llama3-70b-8192", "mixtral-8x7b-32768", "gemma-7b-it"},
+			DefaultModel: "llama-3.1-8b-instant",
+			Models:       []string{"moonshotai/kimi-k2-instruct-0905", "meta-llama/llama-4-maverick-17b-128e-instruct", "groq/compound", "openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"},
 			Client:       client,
 		}
 	}
