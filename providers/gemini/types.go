@@ -92,6 +92,7 @@ type geminiResponse struct {
 type geminiCandidate struct {
 	Content      geminiContent `json:"content"`
 	FinishReason string        `json:"finishReason"`
+	Index        int           `json:"index,omitempty"`
 }
 
 type geminiStreamResponse struct {

@@ -299,11 +299,7 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
 	seq := 0
-	var buffer strings.Builder
-
-	flushBuffer := func() {
-		buffer.Reset()
-	}
+	var usage geminiUsageMetadata
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -315,38 +311,31 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 		}
 		if line == "[DONE]" {
 			seq++
-			stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-			flushBuffer()
+			stream.Push(core.StreamEvent{Type: core.EventFinish, Usage: usage.toCore(), Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
 			break
 		}
-		if buffer.Len() > 0 {
-			buffer.WriteByte('\n')
-		}
-		buffer.WriteString(line)
 
 		var resp geminiStreamResponse
-		if err := json.Unmarshal([]byte(buffer.String()), &resp); err != nil {
-			if strings.Contains(err.Error(), "unexpected end of JSON input") {
-				continue
-			}
-			if strings.Contains(err.Error(), "cannot unmarshal array") {
-				var respArr []geminiStreamResponse
-				if errArr := json.Unmarshal([]byte(buffer.String()), &respArr); errArr == nil {
-					for _, item := range respArr {
-						emitStreamEvents(stream, item, &seq)
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			var respArr []geminiStreamResponse
+			if errArr := json.Unmarshal([]byte(line), &respArr); errArr == nil {
+				for _, item := range respArr {
+					if item.UsageMetadata.TotalTokenCount > 0 {
+						usage = item.UsageMetadata
 					}
-					flushBuffer()
-					continue
+					emitStreamEvents(stream, item, &seq)
 				}
+				continue
 			}
 			seq++
 			stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-			flushBuffer()
 			continue
 		}
 
+		if resp.UsageMetadata.TotalTokenCount > 0 {
+			usage = resp.UsageMetadata
+		}
 		emitStreamEvents(stream, resp, &seq)
-		flushBuffer()
 	}
 	if err := scanner.Err(); err != nil {
 		stream.Fail(err)
@@ -395,6 +384,7 @@ func emitStreamEvents(stream *core.Stream, resp geminiStreamResponse, seq *int) 
 			stream.Push(core.StreamEvent{
 				Type:      core.EventToolCall,
 				ToolCall:  toolCall,
+				StepID:    cand.Index,
 				Seq:       *seq,
 				Schema:    "gai.events.v1",
 				Timestamp: time.Now(),
