@@ -178,20 +178,25 @@ func newStreamAccumulator(start time.Time) *streamAccumulator {
 }
 
 func (a *streamAccumulator) consume(event core.StreamEvent) {
-	switch event.Type {
-	case core.EventTextDelta:
-		a.textBuilder.WriteString(event.TextDelta)
-	case core.EventToolCall:
-		id := event.ToolCall.ID
-		if id == "" {
-			id = fmt.Sprintf("step%d-call%d", event.StepID, len(a.order)+1)
-		}
-		record := &obs.ToolCallRecord{
-			Step:  event.StepID,
-			ID:    event.ToolCall.ID,
-			Name:  event.ToolCall.Name,
-			Input: obs.NormalizeMap(event.ToolCall.Input),
-		}
+    switch event.Type {
+    case core.EventTextDelta:
+        a.textBuilder.WriteString(event.TextDelta)
+    case core.EventToolCall:
+        // Use a composite key of step + id to avoid collisions
+        // when providers reuse simple IDs like "call_1" across steps.
+        id := event.ToolCall.ID
+        key := id
+        if key == "" {
+            key = fmt.Sprintf("step%d-call%d", event.StepID, len(a.order)+1)
+        } else {
+            key = fmt.Sprintf("%d:%s", event.StepID, key)
+        }
+        record := &obs.ToolCallRecord{
+            Step:  event.StepID,
+            ID:    event.ToolCall.ID,
+            Name:  event.ToolCall.Name,
+            Input: obs.NormalizeMap(event.ToolCall.Input),
+        }
 		if len(event.ToolCall.Metadata) > 0 {
 			meta := obs.NormalizeMap(event.ToolCall.Metadata)
 			if len(meta) > 0 {
@@ -201,24 +206,27 @@ func (a *streamAccumulator) consume(event core.StreamEvent) {
 				record.Input["metadata"] = meta
 			}
 		}
-		a.toolRecords[id] = record
-		a.order = append(a.order, id)
-	case core.EventToolResult:
-		id := event.ToolResult.ID
-		if id == "" {
-			id = fmt.Sprintf("step%d-result%d", event.StepID, len(a.order)+1)
-		}
-		record, ok := a.toolRecords[id]
-		if !ok {
-			record = &obs.ToolCallRecord{Step: event.StepID, ID: event.ToolResult.ID, Name: event.ToolResult.Name}
-			a.toolRecords[id] = record
-			a.order = append(a.order, id)
-		}
-		record.Result = normalizeAny(event.ToolResult.Result)
-		record.Error = event.ToolResult.Error
-		if dur := extractInt64(event.Ext, "duration_ms"); dur > 0 {
-			record.DurationMS = dur
-		}
+        a.toolRecords[key] = record
+        a.order = append(a.order, key)
+    case core.EventToolResult:
+        id := event.ToolResult.ID
+        key := id
+        if key == "" {
+            key = fmt.Sprintf("step%d-result%d", event.StepID, len(a.order)+1)
+        } else {
+            key = fmt.Sprintf("%d:%s", event.StepID, key)
+        }
+        record, ok := a.toolRecords[key]
+        if !ok {
+            record = &obs.ToolCallRecord{Step: event.StepID, ID: event.ToolResult.ID, Name: event.ToolResult.Name}
+            a.toolRecords[key] = record
+            a.order = append(a.order, key)
+        }
+        record.Result = normalizeAny(event.ToolResult.Result)
+        record.Error = event.ToolResult.Error
+        if dur := extractInt64(event.Ext, "duration_ms"); dur > 0 {
+            record.DurationMS = dur
+        }
 		if retries := extractInt(event.Ext, "retries"); retries > 0 {
 			record.Retries = retries
 		}
@@ -294,21 +302,36 @@ func makeStreamPayload(event core.StreamEvent, provider string) streamEventPaylo
 		payload.ReasoningDelta = event.ReasoningDelta
 	case core.EventReasoningSummary:
 		payload.ReasoningSummary = event.ReasoningSummary
-	case core.EventToolCall:
-		payload.ToolCall = &toolExecutionDTO{
-			ID:       event.ToolCall.ID,
-			Name:     event.ToolCall.Name,
-			Input:    obs.NormalizeMap(event.ToolCall.Input),
-			Metadata: obs.NormalizeMap(event.ToolCall.Metadata),
-		}
-	case core.EventToolResult:
-		dto := &toolExecutionDTO{
-			ID:       event.ToolResult.ID,
-			Name:     event.ToolResult.Name,
-			Result:   normalizeAny(event.ToolResult.Result),
-			Error:    event.ToolResult.Error,
-			Metadata: extractMetadata(event.Ext),
-		}
+    case core.EventToolCall:
+        // Publish a step-scoped ID to avoid UI merges across steps.
+        // Keep original provider ID in metadata when present.
+        composedID := event.ToolCall.ID
+        if composedID != "" {
+            composedID = fmt.Sprintf("%d:%s", event.StepID, composedID)
+        } else {
+            composedID = fmt.Sprintf("%d:%d", event.StepID, event.Seq)
+        }
+        payload.ToolCall = &toolExecutionDTO{
+            ID:       composedID,
+            Name:     event.ToolCall.Name,
+            Input:    obs.NormalizeMap(event.ToolCall.Input),
+            Metadata: obs.NormalizeMap(event.ToolCall.Metadata),
+        }
+    case core.EventToolResult:
+        // Mirror the step-scoped ID for pairing with the tool.call event.
+        composedID := event.ToolResult.ID
+        if composedID != "" {
+            composedID = fmt.Sprintf("%d:%s", event.StepID, composedID)
+        } else {
+            composedID = fmt.Sprintf("%d:%d", event.StepID, event.Seq)
+        }
+        dto := &toolExecutionDTO{
+            ID:       composedID,
+            Name:     event.ToolResult.Name,
+            Result:   normalizeAny(event.ToolResult.Result),
+            Error:    event.ToolResult.Error,
+            Metadata: extractMetadata(event.Ext),
+        }
 		if dur := extractInt64(event.Ext, "duration_ms"); dur > 0 {
 			dto.Duration = dur
 		}

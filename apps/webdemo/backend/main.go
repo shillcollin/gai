@@ -85,11 +85,15 @@ func main() {
 }
 
 func withJSONHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
-	})
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Default to JSON for API responses, but avoid forcing a content type on
+        // streaming endpoints which set NDJSON to enable incremental rendering.
+        if r.URL.Path != "/api/chat/stream" {
+            w.Header().Set("Content-Type", "application/json")
+        }
+        w.Header().Set("Cache-Control", "no-store")
+        next.ServeHTTP(w, r)
+    })
 }
 
 func withCORS(next http.Handler) http.Handler {

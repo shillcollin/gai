@@ -100,18 +100,18 @@ func (c *Client) StreamText(ctx context.Context, req core.Request) (*core.Stream
 		return nil, err
 	}
 	recorder.AddAttributes(attribute.String("ai.model", payload.Model))
-	body, err := c.doRequest(ctx, payload, true)
-	if err != nil {
-		recorder.End(err, obs.UsageTokens{})
-		return nil, err
-	}
-	stream := core.NewStream(ctx, 64)
-	go func() {
-		consumeStream(body, stream)
-		meta := stream.Meta()
-		recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
-	}()
-	return stream, nil
+    body, err := c.doRequest(ctx, payload, true)
+    if err != nil {
+        recorder.End(err, obs.UsageTokens{})
+        return nil, err
+    }
+    stream := core.NewStream(ctx, 64)
+    go func() {
+        consumeStream(body, stream)
+        meta := stream.Meta()
+        recorder.End(stream.Err(), obs.UsageFromCore(meta.Usage))
+    }()
+    return stream, nil
 }
 
 func (c *Client) GenerateObject(ctx context.Context, req core.Request) (_ *core.ObjectResultRaw, err error) {
@@ -293,13 +293,19 @@ func buildRequest(req core.Request, model string) (*geminiRequest, error) {
 }
 
 func consumeStream(body io.ReadCloser, stream *core.Stream) {
-	defer body.Close()
-	defer stream.Close()
+    defer body.Close()
+    defer stream.Close()
 
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
-	seq := 0
-	var buffer strings.Builder
+    scanner := bufio.NewScanner(body)
+    scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+    seq := 0
+    var buffer strings.Builder
+    // Track the latest usage reported in streamed chunks
+    var lastUsage core.Usage
+    // Generate a per-stream nonce to ensure tool call IDs are unique across steps
+    // even if providers reuse simple counters like "call_1".
+    streamNonce := fmt.Sprintf("s%x", time.Now().UnixNano())
+    pushedFinish := false
 
 	flushBuffer := func() {
 		buffer.Reset()
@@ -313,66 +319,86 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 		if strings.HasPrefix(line, "data:") {
 			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
-		if line == "[DONE]" {
-			seq++
-			stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-			flushBuffer()
-			break
-		}
+        if line == "[DONE]" {
+            seq++
+            // Include the last observed usage in the finish event so token
+            // accounting is available to runners and UIs.
+            stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
+            pushedFinish = true
+            flushBuffer()
+            break
+        }
 		if buffer.Len() > 0 {
 			buffer.WriteByte('\n')
 		}
 		buffer.WriteString(line)
 
-		var resp geminiStreamResponse
-		if err := json.Unmarshal([]byte(buffer.String()), &resp); err != nil {
-			if strings.Contains(err.Error(), "unexpected end of JSON input") {
-				continue
-			}
-			if strings.Contains(err.Error(), "cannot unmarshal array") {
-				var respArr []geminiStreamResponse
-				if errArr := json.Unmarshal([]byte(buffer.String()), &respArr); errArr == nil {
-					for _, item := range respArr {
-						emitStreamEvents(stream, item, &seq)
-					}
-					flushBuffer()
-					continue
-				}
-			}
-			seq++
-			stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-			flushBuffer()
-			continue
-		}
+        var resp geminiStreamResponse
+        if err := json.Unmarshal([]byte(buffer.String()), &resp); err != nil {
+            if strings.Contains(err.Error(), "unexpected end of JSON input") {
+                continue
+            }
+            if strings.Contains(err.Error(), "cannot unmarshal array") {
+                var respArr []geminiStreamResponse
+                if errArr := json.Unmarshal([]byte(buffer.String()), &respArr); errArr == nil {
+                    for _, item := range respArr {
+                        emitStreamEvents(stream, item, &seq, streamNonce, &lastUsage)
+                    }
+                    flushBuffer()
+                    continue
+                }
+            }
+            seq++
+            stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+            flushBuffer()
+            continue
+        }
 
-		emitStreamEvents(stream, resp, &seq)
-		flushBuffer()
-	}
-	if err := scanner.Err(); err != nil {
-		stream.Fail(err)
-	}
+        emitStreamEvents(stream, resp, &seq, streamNonce, &lastUsage)
+        flushBuffer()
+    }
+    if err := scanner.Err(); err != nil {
+        stream.Fail(err)
+    }
+    // Some providers (including Gemini) may close the stream without a [DONE] sentinel.
+    // Emit a final finish event if none was pushed so downstream components can
+    // finalize properly and propagate usage.
+    if !pushedFinish {
+        seq++
+        stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
+    }
 }
 
-func emitStreamEvents(stream *core.Stream, resp geminiStreamResponse, seq *int) {
-	if text := resp.JoinText(); text != "" {
-		*seq++
-		stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: *seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-	}
-	for _, cand := range resp.Candidates {
-		rawContent := marshalGeminiContent(cand.Content)
-		for _, part := range cand.Content.Parts {
-			if part.FunctionCall == nil {
-				continue
-			}
-			callID := strings.TrimSpace(part.FunctionCall.ID)
-			if callID == "" {
-				callID = fmt.Sprintf("call_%d", *seq+1)
-			}
-			args := cloneMap(part.FunctionCall.Args)
-			metadata := map[string]any{}
-			if rawContent != "" {
-				metadata[metadataKeyRawContent] = rawContent
-			}
+func emitStreamEvents(stream *core.Stream, resp geminiStreamResponse, seq *int, streamNonce string, lastUsage *core.Usage) {
+    if text := resp.JoinText(); text != "" {
+        *seq++
+        stream.Push(core.StreamEvent{Type: core.EventTextDelta, TextDelta: text, Seq: *seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+    }
+    // Capture usage if present in this chunk so we can publish it on finish.
+    if (resp.UsageMetadata != geminiUsageMetadata{}) {
+        if lastUsage != nil {
+            *lastUsage = resp.UsageMetadata.toCore()
+        }
+    }
+    for _, cand := range resp.Candidates {
+        rawContent := marshalGeminiContent(cand.Content)
+        for _, part := range cand.Content.Parts {
+            if part.FunctionCall == nil {
+                continue
+            }
+            callID := strings.TrimSpace(part.FunctionCall.ID)
+            if callID == "" {
+                callID = fmt.Sprintf("call_%d", *seq+1)
+            }
+            // Prefix IDs with a per-stream nonce to avoid collisions across steps.
+            // This ensures tool call IDs remain unique for the UI and logs while
+            // preserving pairing with tool results (runner uses the same ID).
+            callID = fmt.Sprintf("%s:%s", streamNonce, callID)
+            args := cloneMap(part.FunctionCall.Args)
+            metadata := map[string]any{}
+            if rawContent != "" {
+                metadata[metadataKeyRawContent] = rawContent
+            }
 			if sig := strings.TrimSpace(part.ThoughtSignature); sig != "" {
 				metadata[metadataKeyThoughtSignature] = sig
 			}

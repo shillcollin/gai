@@ -1372,6 +1372,11 @@ func selectPromptVersion(reg *prompts.Registry, name string, env string) (string
 }
 ```
 
+### Provider Notes (IDs & Usage)
+
+- Tool call IDs must be unique across steps. Some providers reuse simple IDs like `call_1` for every step. The SDK’s streaming JSON now scopes tool IDs by step to prevent UI deduping, and the Gemini adapter prefixes IDs with a per-stream nonce to avoid cross-step collisions. If you write your own provider, ensure non-empty, stable IDs for tool calls and return the same ID on the corresponding tool result.
+- Streaming providers should include token usage in the final `finish` event so runners and UIs can report accurate totals. The Gemini provider now propagates usage from streamed chunks into the `finish` event.
+
 ## Observability & Monitoring
 
 ### OpenTelemetry Integration
