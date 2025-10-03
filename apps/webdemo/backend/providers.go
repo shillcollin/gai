@@ -56,7 +56,7 @@ func buildProviders() (map[string]providerEntry, error) {
 		providers["anthropic"] = providerEntry{
 			Label:        "Anthropic",
 			DefaultModel: "claude-3-7-sonnet-20250219",
-			Models:       []string{"claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"},
+			Models:       []string{"claude-sonnet-4-20250514", "claude-3-5-haiku-20241022"},
 			Client:       client,
 		}
 	}
