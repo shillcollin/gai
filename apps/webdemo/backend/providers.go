@@ -64,12 +64,12 @@ func buildProviders() (map[string]providerEntry, error) {
 	if key := strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")); key != "" {
 		client := gemini.New(
 			gemini.WithAPIKey(key),
-			gemini.WithModel("gemini-2.5-pro"),
+			gemini.WithModel("gemini-2.5-flash"),
 		)
 		providers["gemini"] = providerEntry{
 			Label:        "Gemini",
-			DefaultModel: "gemini-2.5-pro",
-			Models:       []string{"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"},
+			DefaultModel: "gemini-2.5-flash",
+			Models:       []string{"gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"},
 			Client:       client,
 		}
 	}

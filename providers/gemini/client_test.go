@@ -45,14 +45,17 @@ func TestGenerateText(t *testing.T) {
 }
 
 func TestStreamText(t *testing.T) {
-	events := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"A\"}]}}]}\n\n" +
-		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"B\"}]}}]}\n\n" +
-		"data: [DONE]\n\n"
+	respA := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{Text: "A"}}}}}}
+	respB := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{Text: "B"}}}}}}
+	jsonA, _ := json.Marshal(respA)
+	jsonB, _ := json.Marshal(respB)
+	events := string(jsonA) + "\n" + string(jsonB) + "\n"
+
 	transport := roundTrip(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: 200,
 			Body:       io.NopCloser(bytes.NewBufferString(events)),
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 		}, nil
 	})
 
@@ -164,14 +167,15 @@ func TestBuildRequestWithTools(t *testing.T) {
 }
 
 func TestStreamTextFunctionCall(t *testing.T) {
-	events := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"lookup_weather\",\"args\":{\"city\":\"Berlin\"}}}]}}]}\n\n" +
-		"data: [DONE]\n\n"
+	resp := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{FunctionCall: &geminiFunctionCall{Name: "lookup_weather", Args: map[string]any{"city": "Berlin"}}}}}}}}
+	jsonResp, _ := json.Marshal(resp)
+	events := string(jsonResp) + "\n"
 
 	transport := roundTrip(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: 200,
 			Body:       io.NopCloser(bytes.NewBufferString(events)),
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 		}, nil
 	})
 
@@ -203,16 +207,20 @@ func TestStreamTextFunctionCall(t *testing.T) {
 }
 
 func TestStreamTextWithArrayResponse(t *testing.T) {
-	events := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"A\"}]}}]}\n\n" +
-		"data: [{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"B\"}]}}]}, {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"C\"}]}}]}]\n\n" +
-		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"D\"}]}}]}\n\n" +
-		"data: [DONE]\n\n"
+	respA := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{Text: "A"}}}}}}
+	respB := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{Text: "B"}}}}}}
+	respC := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{Text: "C"}}}}}}
+	respD := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{Text: "D"}}}}}}
+	jsonA, _ := json.Marshal(respA)
+	jsonArr, _ := json.Marshal([]geminiStreamResponse{respB, respC})
+	jsonD, _ := json.Marshal(respD)
+	events := string(jsonA) + "\n" + string(jsonArr) + "\n" + string(jsonD) + "\n"
 
 	transport := roundTrip(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: 200,
 			Body:       io.NopCloser(bytes.NewBufferString(events)),
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 		}, nil
 	})
 
@@ -283,8 +291,9 @@ func TestGenerateObjectUsesJSONMimeType(t *testing.T) {
 
 func TestStreamObjectUsesJSONMimeType(t *testing.T) {
 	var captured geminiRequest
-	events := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{\\\"done\\\":true}\"}]}}]}\n\n" +
-		"data: [DONE]\n\n"
+	resp := geminiStreamResponse{Candidates: []geminiCandidate{{Content: geminiContent{Parts: []geminiPart{{Text: "{\"done\":true}"}}}}}}
+	jsonResp, _ := json.Marshal(resp)
+	events := string(jsonResp) + "\n"
 
 	transport := roundTrip(func(req *http.Request) (*http.Response, error) {
 		if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
@@ -293,7 +302,7 @@ func TestStreamObjectUsesJSONMimeType(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Body:       io.NopCloser(bytes.NewBufferString(events)),
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
 		}, nil
 	})
 

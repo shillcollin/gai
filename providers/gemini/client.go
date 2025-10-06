@@ -1,7 +1,6 @@
 package gemini
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -296,58 +295,45 @@ func consumeStream(body io.ReadCloser, stream *core.Stream) {
 	defer body.Close()
 	defer stream.Close()
 
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+	decoder := json.NewDecoder(body)
 	seq := 0
 	var lastUsage core.Usage
 	streamNonce := fmt.Sprintf("s%x", time.Now().UnixNano())
-	pushedFinish := false
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" {
-			continue
-		}
-
-		if data == "[DONE]" {
-			seq++
-			stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
-			pushedFinish = true
+	for {
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			if err == io.EOF {
+				break
+			}
+			stream.Fail(fmt.Errorf("gemini stream decode error: %w", err))
 			break
 		}
 
+		// Try to unmarshal as a single response object first.
 		var resp geminiStreamResponse
-		err := json.Unmarshal([]byte(data), &resp)
-		if err != nil {
-			if strings.Contains(err.Error(), "cannot unmarshal array") {
-				var respArr []geminiStreamResponse
-				if errArr := json.Unmarshal([]byte(data), &respArr); errArr == nil {
-					for _, item := range respArr {
-						emitStreamEvents(stream, item, &seq, streamNonce, &lastUsage)
-					}
-					continue
-				}
-			}
-			seq++
-			stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+		if err := json.Unmarshal(raw, &resp); err == nil {
+			emitStreamEvents(stream, resp, &seq, streamNonce, &lastUsage)
 			continue
 		}
 
-		emitStreamEvents(stream, resp, &seq, streamNonce, &lastUsage)
+		// If that fails, try to unmarshal as an array of responses.
+		var respArr []geminiStreamResponse
+		if errArr := json.Unmarshal(raw, &respArr); errArr == nil {
+			for _, item := range respArr {
+				emitStreamEvents(stream, item, &seq, streamNonce, &lastUsage)
+			}
+			continue
+		}
+
+		// If both fail, push an error.
+		seq++
+		stream.Push(core.StreamEvent{Type: core.EventError, Error: fmt.Errorf("gemini stream unmarshal error on payload: %s", string(raw)), Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
 	}
 
-	if err := scanner.Err(); err != nil {
-		stream.Fail(err)
-	}
-	if !pushedFinish {
-		seq++
-		stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
-	}
+	// Always push a finish event to ensure the stream terminates correctly.
+	seq++
+	stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
 }
 
 func emitStreamEvents(stream *core.Stream, resp geminiStreamResponse, seq *int, streamNonce string, lastUsage *core.Usage) {
