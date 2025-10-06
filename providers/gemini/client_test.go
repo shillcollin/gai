@@ -202,6 +202,50 @@ func TestStreamTextFunctionCall(t *testing.T) {
 	}
 }
 
+func TestStreamTextWithArrayResponse(t *testing.T) {
+	events := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"A\"}]}}]}\n\n" +
+		"data: [{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"B\"}]}}]}, {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"C\"}]}}]}]\n\n" +
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"D\"}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	transport := roundTrip(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(events)),
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		}, nil
+	})
+
+	client := New(
+		WithAPIKey("key"),
+		WithModel("gemini-1.5-flash"),
+		WithBaseURL("https://generativelanguage.googleapis.com/v1beta"),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+
+	stream, err := client.StreamText(context.Background(), core.Request{Messages: []core.Message{core.UserMessage(core.TextPart("hello"))}})
+	if err != nil {
+		t.Fatalf("StreamText error: %v", err)
+	}
+	defer stream.Close()
+
+	var text strings.Builder
+	var deltas []string
+	for ev := range stream.Events() {
+		if ev.Type == core.EventTextDelta {
+			text.WriteString(ev.TextDelta)
+			deltas = append(deltas, ev.TextDelta)
+		}
+	}
+
+	if text.String() != "ABCD" {
+		t.Fatalf("unexpected concatenated text: %s", text.String())
+	}
+	if len(deltas) != 4 {
+		t.Fatalf("expected 4 text deltas, got %d", len(deltas))
+	}
+}
+
 func TestGenerateObjectUsesJSONMimeType(t *testing.T) {
 	var captured geminiRequest
 	transport := roundTrip(func(req *http.Request) (*http.Response, error) {

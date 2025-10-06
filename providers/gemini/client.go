@@ -293,80 +293,61 @@ func buildRequest(req core.Request, model string) (*geminiRequest, error) {
 }
 
 func consumeStream(body io.ReadCloser, stream *core.Stream) {
-    defer body.Close()
-    defer stream.Close()
+	defer body.Close()
+	defer stream.Close()
 
-    scanner := bufio.NewScanner(body)
-    scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
-    seq := 0
-    var buffer strings.Builder
-    // Track the latest usage reported in streamed chunks
-    var lastUsage core.Usage
-    // Generate a per-stream nonce to ensure tool call IDs are unique across steps
-    // even if providers reuse simple counters like "call_1".
-    streamNonce := fmt.Sprintf("s%x", time.Now().UnixNano())
-    pushedFinish := false
-
-	flushBuffer := func() {
-		buffer.Reset()
-	}
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+	seq := 0
+	var lastUsage core.Usage
+	streamNonce := fmt.Sprintf("s%x", time.Now().UnixNano())
+	pushedFinish := false
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		}
-        if line == "[DONE]" {
-            seq++
-            // Include the last observed usage in the finish event so token
-            // accounting is available to runners and UIs.
-            stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
-            pushedFinish = true
-            flushBuffer()
-            break
-        }
-		if buffer.Len() > 0 {
-			buffer.WriteByte('\n')
-		}
-		buffer.WriteString(line)
 
-        var resp geminiStreamResponse
-        if err := json.Unmarshal([]byte(buffer.String()), &resp); err != nil {
-            if strings.Contains(err.Error(), "unexpected end of JSON input") {
-                continue
-            }
-            if strings.Contains(err.Error(), "cannot unmarshal array") {
-                var respArr []geminiStreamResponse
-                if errArr := json.Unmarshal([]byte(buffer.String()), &respArr); errArr == nil {
-                    for _, item := range respArr {
-                        emitStreamEvents(stream, item, &seq, streamNonce, &lastUsage)
-                    }
-                    flushBuffer()
-                    continue
-                }
-            }
-            seq++
-            stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
-            flushBuffer()
-            continue
-        }
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
 
-        emitStreamEvents(stream, resp, &seq, streamNonce, &lastUsage)
-        flushBuffer()
-    }
-    if err := scanner.Err(); err != nil {
-        stream.Fail(err)
-    }
-    // Some providers (including Gemini) may close the stream without a [DONE] sentinel.
-    // Emit a final finish event if none was pushed so downstream components can
-    // finalize properly and propagate usage.
-    if !pushedFinish {
-        seq++
-        stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
-    }
+		if data == "[DONE]" {
+			seq++
+			stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
+			pushedFinish = true
+			break
+		}
+
+		var resp geminiStreamResponse
+		err := json.Unmarshal([]byte(data), &resp)
+		if err != nil {
+			if strings.Contains(err.Error(), "cannot unmarshal array") {
+				var respArr []geminiStreamResponse
+				if errArr := json.Unmarshal([]byte(data), &respArr); errArr == nil {
+					for _, item := range respArr {
+						emitStreamEvents(stream, item, &seq, streamNonce, &lastUsage)
+					}
+					continue
+				}
+			}
+			seq++
+			stream.Push(core.StreamEvent{Type: core.EventError, Error: err, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini"})
+			continue
+		}
+
+		emitStreamEvents(stream, resp, &seq, streamNonce, &lastUsage)
+	}
+
+	if err := scanner.Err(); err != nil {
+		stream.Fail(err)
+	}
+	if !pushedFinish {
+		seq++
+		stream.Push(core.StreamEvent{Type: core.EventFinish, Seq: seq, Schema: "gai.events.v1", Timestamp: time.Now(), Provider: "gemini", Usage: lastUsage})
+	}
 }
 
 func emitStreamEvents(stream *core.Stream, resp geminiStreamResponse, seq *int, streamNonce string, lastUsage *core.Usage) {
