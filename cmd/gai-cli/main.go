@@ -64,6 +64,22 @@ type conversation struct {
 }
 
 func main() {
+    if handled, err := handleAgentCommands(context.Background(), os.Args[1:]); handled {
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "%v\n", err)
+            os.Exit(1)
+        }
+        return
+    }
+
+	if handled, err := handleSkillCommands(context.Background(), os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := loadDotEnv(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintf(os.Stderr, "failed to load .env: %v\n", err)
 		os.Exit(1)

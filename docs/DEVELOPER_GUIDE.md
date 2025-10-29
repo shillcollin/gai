@@ -1213,6 +1213,44 @@ result, err := runner.ExecuteRequest(ctx, core.Request{
 
 When you run the streaming API (`runner.StreamRequest`) the finalizer now executes before the stream closes. Any additional steps returned by the finalizer (for example, a synthetic answer when a stop condition fires before the model can respond) are converted into streamed events so the client still receives a final assistant message.
 
+## Skills & Sandboxed Execution
+
+Skills bundle instructions, tool availability, and sandbox configuration into a versioned manifest that can be surfaced to Anthropic's SKILLS API or consumed directly by the `runner`. Each manifest (see `docs/SKILLS.md`) specifies:
+
+- Provider instructions (`instructions`)
+- Tool bindings (names must match registered `core.ToolHandle`s)
+- Sandbox runtime (`sandbox.SessionSpec`) including base image, filesystem templates, mounts, and resource limits
+- Optional prewarm commands executed before the first tool call when `warm: true`
+- Optional evaluations that run inside the sandbox for regression coverage
+
+To execute commands safely inside the sandbox, register `tools.NewSandboxCommand` and enable the skill on the runner:
+
+```go
+bundle, _ := agent.LoadBundle("agents/python-sandbox")
+cfg, _ := bundle.SkillConfig("python")
+
+manager, _ := sandbox.NewManager(ctx, sandbox.ManagerOptions{})
+assets := sandbox.SessionAssets{Workspace: cfg.Workspace, Mounts: cfg.Mounts}
+runner := runner.New(provider, runner.WithSkillAssets(cfg.Skill, manager, assets))
+
+execTool := tools.NewSandboxCommand("sandbox_exec", "Execute shell commands", []string{"/bin/sh", "-lc", ""})
+
+req := core.Request{
+    Messages: []core.Message{core.UserMessage(core.TextPart("Create hello.py with python3 -c and show its output"))},
+    Tools:    []core.ToolHandle{execTool},
+    StopWhen: core.MaxSteps(bundle.Manifest.MaxSteps),
+}
+
+stream, _ := runner.StreamRequest(ctx, req)
+// Stream events now include sandbox command invocations
+```
+
+During tool execution the runner injects the `*sandbox.Session` into the tool metadata (`meta.Metadata["sandbox.session"]`). The sandbox command tool retrieves the session and executes the requested command, returning stdout/stderr/exit metadata.
+
+Run `gai-cli skills list` to inspect available manifests and `gai-cli skills export <path>` to emit an Anthropic descriptor.
+
+For a richer developer experience, group skills into an [agent bundle](AGENT_BUNDLES.md) that ships workspace templates, mounts, and hooks alongside the manifest. The demo bundle under `agents/python-sandbox/` shows the expected layout.
+
 ## Prompt Management
 
 ### Versioned Prompts with Templates

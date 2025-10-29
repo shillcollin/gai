@@ -25,12 +25,14 @@ Every document in this repository serves a specific purpose: enabling developers
 - **[API_REFERENCE.md](API_REFERENCE.md)** — Complete API surface, types, and interfaces
 - **[PROVIDERS.md](PROVIDERS.md)** — All provider adapters, setup, and best practices
 - **[PROVIDER_MATRIX.md](PROVIDER_MATRIX.md)** — Quick feature comparison across providers
+- **[AGENT_BUNDLES.md](AGENT_BUNDLES.md)** — Bundle layout, workspace staging, and skill composition
 
 ### Core Features
 - **[STREAMING.md](STREAMING.md)** — Normalized event streaming (SSE/NDJSON) and `gai.events.v1` specification
 - **[TOOLS_AND_RUNNER.md](TOOLS_AND_RUNNER.md)** — Typed tools, multi-step execution, and stop conditions
 - **[STRUCTURED_OUTPUTS.md](STRUCTURED_OUTPUTS.md)** — Type-safe JSON generation with validation and repair
 - **[PROMPTS.md](PROMPTS.md)** — Versioned prompt management with templates and overrides
+- **[SKILLS.md](SKILLS.md)** — Skill manifests, sandbox runtime, and Anthropic exports
 
 ### Production Features
 - **[OBSERVABILITY.md](OBSERVABILITY.md)** — OpenTelemetry integration, metrics, and evaluation framework

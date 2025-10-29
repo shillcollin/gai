@@ -15,6 +15,8 @@ import (
 
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/obs"
+	"github.com/shillcollin/gai/sandbox"
+	"github.com/shillcollin/gai/skills"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -34,6 +36,7 @@ type Runner struct {
 	retry        ToolRetry
 	memo         ToolMemo
 	interceptors []Interceptor
+	skillRuntime *skillRuntime
 }
 
 // ToolMemo provides caching for tool results.
@@ -65,6 +68,12 @@ type streamPublisher struct {
 	stream   *core.Stream
 	provider string
 	seq      int
+}
+
+type skillRuntime struct {
+	skill   *skills.Skill
+	manager *sandbox.Manager
+	assets  sandbox.SessionAssets
 }
 
 func (p *streamPublisher) push(event core.StreamEvent, step int) {
@@ -224,6 +233,20 @@ func WithInterceptor(i Interceptor) RunnerOption {
 	}
 }
 
+// WithSkill binds a skill and sandbox manager to the runner.
+func WithSkill(skill *skills.Skill, manager *sandbox.Manager) RunnerOption {
+	return WithSkillAssets(skill, manager, sandbox.SessionAssets{})
+}
+
+// WithSkillAssets binds a skill, sandbox manager, and additional session assets to the runner.
+func WithSkillAssets(skill *skills.Skill, manager *sandbox.Manager, assets sandbox.SessionAssets) RunnerOption {
+	return func(r *Runner) {
+		if skill != nil && manager != nil {
+			r.skillRuntime = &skillRuntime{skill: skill, manager: manager, assets: assets}
+		}
+	}
+}
+
 // New creates a new runner.
 func New(provider core.Provider, opts ...RunnerOption) *Runner {
 	r := &Runner{
@@ -243,6 +266,26 @@ func New(provider core.Provider, opts ...RunnerOption) *Runner {
 		r.interceptors = []Interceptor{noopInterceptor{}}
 	}
 	return r
+}
+
+func (r *Runner) prepareSkillSession(ctx context.Context) (*sandbox.Session, func(), error) {
+	if r.skillRuntime == nil {
+		return nil, func() {}, nil
+	}
+	session, err := r.skillRuntime.manager.CreateSessionWithAssets(ctx, r.skillRuntime.skill.SessionSpec(), r.skillRuntime.assets)
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		r.skillRuntime.manager.Destroy(session.ID)
+	}
+	if r.skillRuntime.skill.Manifest.Sandbox.Warm {
+		if err := r.skillRuntime.skill.Prewarm(ctx, session); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+	}
+	return session, cleanup, nil
 }
 
 // ExecuteRequest runs the request to completion, handling tool calls until stop conditions are met.
@@ -275,6 +318,12 @@ func (r *Runner) ExecuteRequest(ctx context.Context, req core.Request) (resp *co
 		Usage:    core.Usage{},
 	}
 
+	skillSession, cleanup, err := r.prepareSkillSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
 	for {
 		if ctx.Err() != nil {
 			err = ctx.Err()
@@ -289,7 +338,7 @@ func (r *Runner) ExecuteRequest(ctx context.Context, req core.Request) (resp *co
 			break
 		}
 
-		step, stepErr := r.executeStep(ctx, req, state, nil)
+		step, stepErr := r.executeStep(ctx, req, state, nil, skillSession)
 		if stepErr != nil {
 			err = stepErr
 			return nil, err
@@ -354,6 +403,14 @@ func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream 
 	publisher := &streamPublisher{stream: stream, provider: providerName}
 	publisher.emitRunnerStart()
 
+	skillSession, cleanup, err := r.prepareSkillSession(ctx)
+	if err != nil {
+		recorder.End(err, obs.UsageTokens{})
+		stream.Fail(err)
+		return
+	}
+	defer cleanup()
+
 	var (
 		lastModel string
 		runErr    error
@@ -372,7 +429,7 @@ func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream 
 			break
 		}
 
-		step, err := r.executeStep(ctx, req, state, publisher)
+		step, err := r.executeStep(ctx, req, state, publisher, skillSession)
 		if err != nil {
 			runErr = err
 			break
@@ -495,7 +552,7 @@ func (r *Runner) runStreamRequest(ctx context.Context, req core.Request, stream 
 	_ = stream.Close()
 }
 
-func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.RunnerState, publisher *streamPublisher) (core.Step, error) {
+func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.RunnerState, publisher *streamPublisher, session *sandbox.Session) (core.Step, error) {
 	stepNum := len(state.Steps) + 1
 	stepCtx := ctx
 	for _, ic := range r.interceptors {
@@ -575,7 +632,7 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 
 	executions := make([]core.ToolExecution, 0, len(toolCalls))
 	if len(toolCalls) > 0 {
-		execs, err := r.invokeTools(stepCtx, toolCalls, req.Tools, stepNum)
+		execs, err := r.invokeTools(stepCtx, toolCalls, req.Tools, stepNum, session)
 		if err != nil && r.errorMode == ToolErrorPropagate {
 			return core.Step{}, err
 		}
@@ -621,7 +678,7 @@ func (r *Runner) executeStep(ctx context.Context, req core.Request, state *core.
 	return step, nil
 }
 
-func (r *Runner) invokeTools(ctx context.Context, calls []core.ToolCall, tools []core.ToolHandle, stepID int) ([]core.ToolExecution, error) {
+func (r *Runner) invokeTools(ctx context.Context, calls []core.ToolCall, tools []core.ToolHandle, stepID int, session *sandbox.Session) ([]core.ToolExecution, error) {
 	index := make(map[string]core.ToolHandle, len(tools))
 	for _, tool := range tools {
 		if tool == nil {
@@ -661,6 +718,9 @@ func (r *Runner) invokeTools(ctx context.Context, calls []core.ToolCall, tools [
 			defer func() { <-sem }()
 
 			meta := &core.ToolMeta{CallID: c.ID, StepID: stepID, Metadata: map[string]any{}}
+			if session != nil {
+				meta.Metadata["sandbox.session"] = session
+			}
 			execCtx := ctx
 			for _, ic := range r.interceptors {
 				execCtx = ic.BeforeTool(execCtx, c, meta)
