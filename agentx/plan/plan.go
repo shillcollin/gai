@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -87,4 +88,43 @@ func (p PlanV1) AllowsTool(name string) bool {
 		}
 	}
 	return false
+}
+
+// ParseJSON parses a plan from JSON bytes.
+func ParseJSON(data []byte) (*PlanV1, error) {
+	var p PlanV1
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("plan: unmarshal: %w", err)
+	}
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// LoadFromFile reads and parses a plan from a file.
+func LoadFromFile(path string) (*PlanV1, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("plan: read file: %w", err)
+	}
+	return ParseJSON(data)
+}
+
+// SaveToFile writes a plan to a file with pretty formatting.
+func SaveToFile(path string, p *PlanV1) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return fmt.Errorf("plan: marshal: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("plan: write file: %w", err)
+	}
+
+	return nil
 }

@@ -32,14 +32,17 @@ type Usage struct {
 
 // Record is the persisted state blob stored at progress/state.json.
 type Record struct {
-	Version    string  `json:"version"`
-	Phase      string  `json:"phase"`
-	PlanSig    string  `json:"plan_sig,omitempty"`
-	LastStepID string  `json:"last_step_id,omitempty"`
-	Budgets    Budgets `json:"budgets"`
-	Usage      Usage   `json:"usage"`
-	StartedAt  int64   `json:"started_at"`
-	UpdatedAt  int64   `json:"updated_at"`
+	Version         string   `json:"version"`
+	LoopName        string   `json:"loop_name,omitempty"`
+	LoopVersion     string   `json:"loop_version,omitempty"`
+	Phase           string   `json:"phase"`
+	CompletedPhases []string `json:"completed_phases,omitempty"`
+	PlanSig         string   `json:"plan_sig,omitempty"`
+	LastStepID      string   `json:"last_step_id,omitempty"`
+	Budgets         Budgets  `json:"budgets"`
+	Usage           Usage    `json:"usage"`
+	StartedAt       int64    `json:"started_at"`
+	UpdatedAt       int64    `json:"updated_at"`
 }
 
 // Validate returns an error if mandatory fields are missing.

@@ -29,11 +29,21 @@ type ApprovalPolicy struct {
 
 // AgentOptions configure an Agent instance.
 type AgentOptions struct {
-	ID            string
-	Persona       string
-	Provider      core.Provider
-	Tools         []core.ToolHandle
-	Skills        []SkillBinding
+	ID       string
+	Persona  string
+	Provider core.Provider
+	Tools    []core.ToolHandle
+	Skills   []SkillBinding
+
+	// Loop defines the execution pattern. Defaults to DefaultLoop if nil.
+	Loop *Loop
+
+	// Emitters receive events in addition to the file emitter.
+	Emitters []Emitter
+
+	// ApprovalBroker is the approval implementation. Defaults to HybridBroker if nil.
+	ApprovalBroker approvals.Broker
+
 	Memory        MemoryManager
 	Approvals     ApprovalPolicy
 	Observability obs.Options
@@ -42,9 +52,11 @@ type AgentOptions struct {
 	DefaultResultView ResultView
 	DefaultBudgets    Budgets
 
-	RunnerOptions         []runner.RunnerOption
-	SandboxManager        *sandbox.Manager
-	SandboxAssets         sandbox.SessionAssets
+	RunnerOptions []runner.RunnerOption
+	SandboxManager *sandbox.Manager
+	SandboxAssets sandbox.SessionAssets
+
+	// Deprecated: Use ApprovalBroker instead
 	ApprovalBrokerFactory ApprovalBrokerFactory
 }
 

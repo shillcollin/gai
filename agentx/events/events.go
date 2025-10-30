@@ -20,6 +20,7 @@ type Type string
 const (
 	TypePhaseStart        Type = "phase.start"
 	TypePhaseFinish       Type = "phase.finish"
+	TypePhaseSkipped      Type = "phase.skipped"
 	TypeApprovalRequested Type = "approval.requested"
 	TypeApprovalDecided   Type = "approval.decided"
 	TypeToolCall          Type = "tool.call"
@@ -41,6 +42,24 @@ type AgentEventV1 struct {
 	Message  string         `json:"message,omitempty"`
 	Data     map[string]any `json:"data,omitempty"`
 	Error    string         `json:"error,omitempty"`
+	Progress *ProgressInfo  `json:"progress,omitempty"`
+}
+
+// ProgressInfo contains progress metadata for UI display.
+type ProgressInfo struct {
+	LoopName        string   `json:"loop_name"`
+	LoopVersion     string   `json:"loop_version"`
+	CurrentPhase    string   `json:"current_phase"`
+	CompletedPhases []string `json:"completed_phases"`
+
+	// Rich progress metadata (only present if loop declared phases)
+	TotalPhases              int     `json:"total_phases,omitempty"`
+	CurrentPhaseIndex        int     `json:"current_phase_index,omitempty"`
+	CurrentPhaseDescription  string  `json:"current_phase_description,omitempty"`
+	PercentComplete          float64 `json:"percent_complete,omitempty"`
+
+	// Budget tracking
+	BudgetsRemaining map[string]any `json:"budgets_remaining,omitempty"`
 }
 
 // MarshalJSON ensures the version is always present even if omitted by callers.
