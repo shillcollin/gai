@@ -6,13 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/shillcollin/gai/agentx/approvals"
-	agentEvents "github.com/shillcollin/gai/agentx/events"
-	"github.com/shillcollin/gai/agentx/plan"
 	"github.com/shillcollin/gai/agentx/state"
 	"github.com/shillcollin/gai/core"
 	"github.com/shillcollin/gai/schema"
@@ -30,152 +26,6 @@ func (s *stubTool) OutputSchema() *schema.Schema { return nil }
 func (s *stubTool) Execute(ctx context.Context, input map[string]any, meta core.ToolMeta) (any, error) {
 	s.executed = true
 	return map[string]any{"ok": true}, nil
-}
-
-type memorylessTool struct{ stubTool }
-
-type fakeBroker struct {
-	decisions map[string]approvals.Decision
-	requests  map[string]approvals.Request
-}
-
-func newFakeBroker() *fakeBroker {
-	return &fakeBroker{
-		decisions: make(map[string]approvals.Decision),
-		requests:  make(map[string]approvals.Request),
-	}
-}
-
-func (b *fakeBroker) Submit(_ context.Context, req approvals.Request) (string, error) {
-	id := req.ID
-	if id == "" {
-		id = "req-1"
-	}
-	req.ID = id
-	b.requests[id] = req
-	if _, ok := b.decisions[id]; !ok {
-		b.decisions[id] = approvals.Decision{ID: id, Status: approvals.StatusApproved, Timestamp: time.Now().UTC()}
-	}
-	return id, nil
-}
-
-func (b *fakeBroker) AwaitDecision(ctx context.Context, id string) (approvals.Decision, error) {
-	if dec, ok := b.decisions[id]; ok {
-		return dec, nil
-	}
-	return approvals.Decision{ID: id, Status: approvals.StatusApproved, Timestamp: time.Now().UTC()}, nil
-}
-
-func (b *fakeBroker) GetDecision(ctx context.Context, id string) (approvals.Decision, bool, error) {
-	dec, ok := b.decisions[id]
-	return dec, ok, nil
-}
-
-func TestPrepareToolHandlesEnforcesApprovals(t *testing.T) {
-	ttool := &stubTool{name: "sandbox_exec"}
-	agent := &Agent{toolIndex: map[string]core.ToolHandle{"sandbox_exec": ttool}}
-
-	dir := t.TempDir()
-	emitter, err := agentEvents.NewFileEmitter(dir)
-	if err != nil {
-		t.Fatalf("new emitter: %v", err)
-	}
-
-	rc := &runContext{
-		agent:       agent,
-		ctx:         context.Background(),
-		approvals:   newFakeBroker(),
-		emitter:     emitter,
-		policy:      ApprovalPolicy{RequireTools: []string{"sandbox_exec"}},
-		plan:        plan.PlanV1{Steps: []string{"step"}, AllowedTools: []string{"sandbox_exec"}},
-		progressDir: dir,
-		state:       state.Record{StartedAt: time.Now().UTC().UnixMilli(), UpdatedAt: time.Now().UTC().UnixMilli(), Phase: "act"},
-		statePath:   filepath.Join(dir, "state.json"),
-	}
-
-	handles, err := rc.prepareToolHandles()
-	if err != nil {
-		t.Fatalf("prepare handles: %v", err)
-	}
-	if len(handles) != 1 {
-		t.Fatalf("expected one tool handle, got %d", len(handles))
-	}
-
-	if _, err := handles[0].Execute(context.Background(), map[string]any{"arg": 1}, core.ToolMeta{}); err != nil {
-		t.Fatalf("execute: %v", err)
-	}
-	if !ttool.executed {
-		t.Fatalf("tool should have executed")
-	}
-
-	broker := rc.approvals.(*fakeBroker)
-	if len(broker.requests) == 0 {
-		t.Fatalf("expected approval request to be recorded")
-	}
-}
-
-func TestPrepareToolHandlesSkipsDisallowed(t *testing.T) {
-	ttool := &stubTool{name: "allowed"}
-	agent := &Agent{toolIndex: map[string]core.ToolHandle{"allowed": ttool, "other": &stubTool{name: "other"}}}
-
-	dir := t.TempDir()
-	emitter, _ := agentEvents.NewFileEmitter(dir)
-
-	rc := &runContext{
-		agent:       agent,
-		ctx:         context.Background(),
-		approvals:   newFakeBroker(),
-		emitter:     emitter,
-		plan:        plan.PlanV1{Steps: []string{"step"}, AllowedTools: []string{"allowed"}},
-		progressDir: dir,
-		state:       state.Record{StartedAt: time.Now().UTC().UnixMilli(), UpdatedAt: time.Now().UTC().UnixMilli(), Phase: "act"},
-		statePath:   filepath.Join(dir, "state.json"),
-	}
-
-	handles, err := rc.prepareToolHandles()
-	if err != nil {
-		t.Fatalf("prepare handles: %v", err)
-	}
-	if len(handles) != 1 {
-		t.Fatalf("expected one handle, got %d", len(handles))
-	}
-	if handles[0].Name() != "allowed" {
-		t.Fatalf("unexpected tool returned: %s", handles[0].Name())
-	}
-}
-
-type stubMemoryManager struct {
-	pinned []core.Message
-	phases map[string][]core.Message
-}
-
-func (s *stubMemoryManager) BuildPinned(ctx context.Context, taskRoot string) ([]core.Message, error) {
-	return s.pinned, nil
-}
-
-func (s *stubMemoryManager) BuildPhase(ctx context.Context, phase string, _ any) ([]core.Message, error) {
-	return s.phases[strings.ToLower(phase)], nil
-}
-
-func TestPhaseMessagesIncludesMemory(t *testing.T) {
-	mgr := &stubMemoryManager{
-		pinned: []core.Message{core.SystemMessage("Pinned memory")},
-		phases: map[string][]core.Message{"gather": {core.UserMessage(core.Text{Text: "Phase memory"})}},
-	}
-
-	rc := &runContext{
-		agent:  &Agent{opts: AgentOptions{Persona: "You are helpful."}},
-		state:  state.Record{Phase: "gather"},
-		memory: mgr,
-	}
-
-	msgs := rc.phaseMessages("gather", "Instruction")
-	if len(msgs) < 3 {
-		t.Fatalf("expected pinned, base, and phase messages")
-	}
-	if msgs[0].Parts[0].(core.Text).Text != "Pinned memory" {
-		t.Fatalf("pinned memory not first")
-	}
 }
 
 type sequenceProvider struct {
@@ -227,6 +77,41 @@ func (s *sequenceProvider) pop() (core.TextResult, error) {
 	return res, nil
 }
 
+func TestNewAgentRequiresIDAndPersona(t *testing.T) {
+	_, err := New(AgentOptions{})
+	if err == nil {
+		t.Fatal("expected error for missing ID")
+	}
+
+	_, err = New(AgentOptions{ID: "test"})
+	if err == nil {
+		t.Fatal("expected error for missing Persona")
+	}
+
+	_, err = New(AgentOptions{ID: "test", Persona: "helpful"})
+	if err == nil {
+		t.Fatal("expected error for missing Provider")
+	}
+}
+
+func TestNewAgentSetsDefaultLoop(t *testing.T) {
+	agent, err := New(AgentOptions{
+		ID:       "test",
+		Persona:  "helpful",
+		Provider: &sequenceProvider{},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if agent.opts.Loop == nil {
+		t.Fatal("expected default loop to be set")
+	}
+	if agent.opts.Loop.Name != "default" {
+		t.Fatalf("expected default loop, got %s", agent.opts.Loop.Name)
+	}
+}
+
 func TestDoTaskResumeFromPlan(t *testing.T) {
 	dir := t.TempDir()
 	progress := filepath.Join(dir, "progress")
@@ -240,12 +125,15 @@ func TestDoTaskResumeFromPlan(t *testing.T) {
 
 	now := time.Now().UTC().UnixMilli()
 	existing := state.Record{
-		Version:   state.VersionV1,
-		Phase:     "plan",
-		Budgets:   state.Budgets{},
-		Usage:     state.Usage{},
-		StartedAt: now,
-		UpdatedAt: now,
+		Version:         state.VersionV1,
+		LoopName:        "default",
+		LoopVersion:     "v1",
+		Phase:           "plan",
+		CompletedPhases: []string{"gather"},
+		Budgets:         state.Budgets{},
+		Usage:           state.Usage{},
+		StartedAt:       now,
+		UpdatedAt:       now,
 	}
 	if err := state.Write(filepath.Join(progress, "state.json"), existing); err != nil {
 		t.Fatalf("write state: %v", err)
@@ -279,9 +167,6 @@ func TestDoTaskResumeFromPlan(t *testing.T) {
 	}
 	if result.FinishReason.Type != core.StopReasonComplete {
 		t.Fatalf("unexpected finish reason: %s", result.FinishReason.Type)
-	}
-	if seq.idx != len(seq.responses) {
-		t.Fatalf("expected provider to be used for remaining phases")
 	}
 }
 

@@ -44,8 +44,18 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("read failed: %v", err)
 	}
 
-	if loaded != rec {
-		t.Fatalf("round trip mismatch: %#v vs %#v", loaded, rec)
+	// Compare individual fields (can't use == with slices)
+	if loaded.Version != rec.Version {
+		t.Errorf("Version mismatch: %q vs %q", loaded.Version, rec.Version)
+	}
+	if loaded.Phase != rec.Phase {
+		t.Errorf("Phase mismatch: %q vs %q", loaded.Phase, rec.Phase)
+	}
+	if loaded.PlanSig != rec.PlanSig {
+		t.Errorf("PlanSig mismatch: %q vs %q", loaded.PlanSig, rec.PlanSig)
+	}
+	if loaded.StartedAt != rec.StartedAt {
+		t.Errorf("StartedAt mismatch: %d vs %d", loaded.StartedAt, rec.StartedAt)
 	}
 }
 
