@@ -42,6 +42,8 @@ type Budgets struct {
   MaxWallClock time.Duration
   MaxSteps int
   MaxConsecutiveToolSteps int
+  MaxTokens int
+  MaxCostUSD float64
   StepToolTimeout time.Duration
 }
 
@@ -348,6 +350,7 @@ type ApprovalRequest struct {
   ID        string    `json:"id"`             // unique request id
   Type      string    `json:"type"`           // "plan"|"tool"
   PlanPath  string    `json:"plan_path,omitempty"`
+  PlanSig   string    `json:"plan_sig,omitempty"`
   ToolName  string    `json:"tool_name,omitempty"`
   Rationale string    `json:"rationale,omitempty"`
   ExpiresAt time.Time `json:"expires_at"`
@@ -399,7 +402,7 @@ package agentx
 
 import (
   "context"
-  "crypto/sha1"
+  "crypto/sha256"
   "encoding/hex"
   "encoding/json"
   "fmt"
@@ -450,8 +453,13 @@ func readBug(taskDir string) (string, error) {
   return string(data), nil
 }
 
-// cheap content hash for approvals
-func hash(data string) string { h := sha1.Sum([]byte(data)); return hex.EncodeToString(h[:]) }
+// planSig computes sha256 over JSON-serialized plan (use canonical JSON in production)
+func planSig(plan any) (string, error) {
+  b, err := json.Marshal(plan)
+  if err != nil { return "", err }
+  sum := sha256.Sum256(b)
+  return hex.EncodeToString(sum[:]), nil
+}
 
 // runGather: explore task and repo, write findings to progress/findings.md
 func (a *Agent) stepGather(ctx context.Context, env TaskEnv) error {
@@ -484,10 +492,12 @@ func (a *Agent) stepGather(ctx context.Context, env TaskEnv) error {
 }
 
 // runPlan: produce a structured plan JSON and (optionally) gate on approval
-type Plan struct {
-  Goal   string   `json:"goal"`
-  Steps  []string `json:"steps"`
-  Tools  []string `json:"tools"`
+type PlanV1 struct {
+  Version      string   `json:"version"`       // "plan.v1"
+  Goal         string   `json:"goal"`
+  Steps        []string `json:"steps"`
+  AllowedTools []string `json:"allowed_tools"`
+  Acceptance   []string `json:"acceptance"`
 }
 
 func (a *Agent) stepPlan(ctx context.Context, env TaskEnv, requireApproval bool) error {
@@ -500,13 +510,24 @@ func (a *Agent) stepPlan(ctx context.Context, env TaskEnv, requireApproval bool)
   msgs := append(a.assembleMessages(a.persona, pinned, []string{"progress/findings.md"}, phase, fmt.Sprintf("Based on the bug and findings, produce a minimal plan to write a failing test, fix code, and re-run tests.\n\nBug:\n%s\n\nFindings:\n%s", bug, string(findings))), history...)
   // One‑shot structured output (simplified):
   if _, err := a.provider.GenerateText(ctx, core.Request{Messages: msgs, MaxTokens: 400}); err != nil { return err }
-  plan := Plan{Goal: "Fix pagination bug", Steps: []string{"Write failing test", "Implement fix", "Re-run tests"}, Tools: []string{"run_tests", "repo_search"}}
+  plan := PlanV1{
+    Version:      "plan.v1",
+    Goal:         "Fix pagination bug",
+    Steps:        []string{"Write failing test", "Implement fix", "Re-run tests"},
+    AllowedTools: []string{"run_tests", "repo_search"},
+    Acceptance:   []string{"Failing test passes", "No regression in pagination"},
+  }
   _ = os.MkdirAll(env.Progress("plan"), 0o755)
-  _ = os.WriteFile(env.Progress("plan/current.json"), []byte(fmt.Sprintf("{\n  \"goal\": %q,\n  \"steps\": [\n    %q,\n    %q,\n    %q\n  ],\n  \"tools\": [\n    %q, %q\n  ]\n}\n", plan.Goal, plan.Steps[0], plan.Steps[1], plan.Steps[2], plan.Tools[0], plan.Tools[1])), 0o644)
+  // Persist plan as JSON
+  if data, err := json.MarshalIndent(plan, "", "  "); err == nil {
+    _ = os.WriteFile(env.Progress("plan/current.json"), data, 0o644)
+  }
+
+  sig, _ := planSig(plan)
 
   if requireApproval {
     id := uuid.NewString()
-    req := ApprovalRequest{ID: id, Type: "plan", PlanPath: env.Progress("plan/current.json"), Rationale: "Plan to fix pagination bug", ExpiresAt: time.Now().Add(2 * time.Hour)}
+    req := ApprovalRequest{ID: id, Type: "plan", PlanPath: env.Progress("plan/current.json"), PlanSig: sig, Rationale: "Plan to fix pagination bug", ExpiresAt: time.Now().Add(2 * time.Hour)}
     if err := writeApprovalRequest(env.Progress("."), req); err != nil { return err }
     // In demos, auto‑approve immediately (comment out to require human approval)
     _ = func() error {
@@ -545,8 +566,16 @@ func (a *Agent) stepAct(ctx context.Context, env TaskEnv) error {
   }
   result, err := a.taskRunner.ExecuteRequest(ctx, req)
   if err != nil { return err }
-  // Persist a short action log
-  _ = os.WriteFile(env.Progress("events.ndjson"), []byte(fmt.Sprintf("{\"steps\": %d}\n", len(result.Steps))), 0o644)
+  // Append a couple of versioned agent events
+  _ = func() error {
+    path := env.Progress("events.ndjson")
+    f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+    if err != nil { return err }
+    defer f.Close()
+    fmt.Fprintln(f, `{"version":"gai.agent.events.v1","type":"phase.finish","ts":`, time.Now().UTC().UnixMilli(), `,"step":"act","data":{"steps":`, len(result.Steps), `}}`)
+    fmt.Fprintln(f, `{"version":"gai.agent.events.v1","type":"usage.delta","ts":`, time.Now().UTC().UnixMilli(), `,"data":{"total_tokens":`, result.Usage.TotalTokens, `}}`)
+    return nil
+  }()
   return nil
 }
 
@@ -607,7 +636,7 @@ func main() {
     Goal: "Fix bug",
     UserID: "user_42",
     RequirePlanApproval: true,
-    Budgets: agentx.Budgets{ MaxWallClock: 3 * time.Minute, MaxSteps: 8, StepToolTimeout: 60 * time.Second },
+    Budgets: agentx.Budgets{ MaxWallClock: 3 * time.Minute, MaxSteps: 8, MaxTokens: 0, MaxCostUSD: 0, StepToolTimeout: 60 * time.Second },
   })
   if err != nil { log.Fatal(err) }
   log.Println("Progress dir:", final.ProgressDir)
@@ -623,7 +652,7 @@ if err != nil { /* handle */ }
 fmt.Println("Summary:", res.OutputText)
 
 // 2) Streaming events during DoTask: provide an event sink
-events := make(chan agentx.AgentEvent, 64)
+events := make(chan agentx.AgentEventV1, 64)
 go func() {
   for ev := range events {
     fmt.Println(ev.Type, ev.Step, ev.Message)
@@ -639,7 +668,7 @@ fmt.Println("Finished:", res2.FinishReason.Type)
 ## Observability And Journaling
 
 - Stream model events using the runner’s stream APIs if building live UIs.
-- Emit agent‑level events (phase start/finish, approvals, memory read/write) to `progress/events.ndjson` and an obs sink.
+- Emit versioned agent‑level events (`gai.agent.events.v1`) to `progress/events.ndjson` and mirror to an obs sink.
 - Record final usage/cost for budget tracking.
 
 ## What To Customize Next

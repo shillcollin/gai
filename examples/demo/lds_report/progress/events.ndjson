@@ -1,0 +1,6 @@
+{"version":"gai.agent.events.v1","id":"e873125233d3522992656085480d710a","type":"phase.start","ts":1761809885512,"step":"gather"}
+{"version":"gai.agent.events.v1","id":"ee800b1913a8a9bda0f934a4e7e63c32","type":"usage.delta","ts":1761809901499,"data":{"budgets_remaining":{"steps":12,"tokens":10832},"cost_usd":0,"input_tokens":368,"output_tokens":800,"total_tokens":1168}}
+{"version":"gai.agent.events.v1","id":"a60d9a113edb3eaad62036442bd1e44f","type":"phase.finish","ts":1761809901512,"step":"gather","data":{"duration_ms":15996}}
+{"version":"gai.agent.events.v1","id":"8e66501687bf7c7f5ed216702e57ae8c","type":"phase.start","ts":1761809901521,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"d6abff8dffde24cdfe7808a927bd8c25","type":"usage.delta","ts":1761809915053,"data":{"budgets_remaining":{"steps":11,"tokens":9893},"cost_usd":0,"input_tokens":139,"output_tokens":800,"total_tokens":939}}
+{"version":"gai.agent.events.v1","id":"7cd128e2c78ff9a0a845337fe631397f","type":"error","ts":1761809915069,"step":"plan","error":"agent: parse plan JSON: unexpected end of JSON input"}

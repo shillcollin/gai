@@ -1,0 +1,22 @@
+{"version":"gai.agent.events.v1","id":"8bed9222944569794d2a300fedc31215","type":"phase.start","ts":1761806765914,"step":"gather"}
+{"version":"gai.agent.events.v1","id":"28c5f597e4f79e026e7d33a10d57aaa9","type":"usage.delta","ts":1761806786010,"data":{"budgets_remaining":{"steps":12,"tokens":11110},"cost_usd":0,"input_tokens":90,"output_tokens":800,"total_tokens":890}}
+{"version":"gai.agent.events.v1","id":"d141452a0acbc3ace4e6ebd5a303d5bb","type":"phase.finish","ts":1761806786022,"step":"gather","data":{"duration_ms":20104}}
+{"version":"gai.agent.events.v1","id":"3e8243e3e7ffd75e54eebe05231c4312","type":"phase.start","ts":1761806786031,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"8f58f1b4c155e97aae75f8b7ff988671","type":"usage.delta","ts":1761806793869,"data":{"budgets_remaining":{"steps":11,"tokens":9935},"cost_usd":0,"input_tokens":939,"output_tokens":236,"total_tokens":1175}}
+{"version":"gai.agent.events.v1","id":"870619e61c273b560273ab4b472e89d6","type":"error","ts":1761806793881,"step":"plan","error":"agent: parse plan JSON: invalid character '`' looking for beginning of value"}
+{"version":"gai.agent.events.v1","id":"a2a9efa68684945aab7f409b394aa668","type":"phase.start","ts":1761806838662,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"67a138c1613bb5c020518367c644d27a","type":"usage.delta","ts":1761806847114,"data":{"budgets_remaining":{"steps":12,"tokens":8742},"cost_usd":0,"input_tokens":939,"output_tokens":254,"total_tokens":1193}}
+{"version":"gai.agent.events.v1","id":"1763f6ad4795b1eea64eb91ce64d66f8","type":"approval.requested","ts":1761806847127,"step":"plan","data":{"approval_id":"fcc35341500eca78c68f4adee2588043","kind":"plan"}}
+{"version":"gai.agent.events.v1","id":"4f91a65621af03dfc9d93e3b13c86714","type":"phase.start","ts":1761807079196,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"2ef097a426e167fd74f0e9cacdaf8f52","type":"approval.requested","ts":1761807079206,"step":"plan","data":{"approval_id":"4c68f8210d75562895e81c4983ca87fb","kind":"plan"}}
+{"version":"gai.agent.events.v1","id":"05884239232f7102a7ea8a9db63091c2","type":"error","ts":1761807198643,"step":"plan","error":"context deadline exceeded"}
+{"version":"gai.agent.events.v1","id":"1113ff73ab7b7bd66de5e8dc1c11894e","type":"phase.start","ts":1761807485746,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"91418038e73570e0de91c4889b8468ad","type":"approval.requested","ts":1761807485758,"step":"plan","data":{"approval_id":"df1c7263293216199783b9403549378f","kind":"plan"}}
+{"version":"gai.agent.events.v1","id":"2df1c1ca5f02963b818abf109830669c","type":"phase.start","ts":1761807568516,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"162e3f53937cdc313e4f71596e64edf6","type":"approval.requested","ts":1761807568527,"step":"plan","data":{"approval_id":"8d7e991977d68f5319d934229c76921d","kind":"plan"}}
+{"version":"gai.agent.events.v1","id":"4031e036bee1d73d76b6c6c18ad7ee55","type":"phase.start","ts":1761807647432,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"0812daf0b1b9678adeff29828a420996","type":"approval.requested","ts":1761807647443,"step":"plan","data":{"approval_id":"34617ddebd92900caacd239cb72430c2","kind":"plan"}}
+{"version":"gai.agent.events.v1","id":"d955fd9cd15933a924d82c4b4e9510a4","type":"error","ts":1761807845741,"step":"plan","error":"context deadline exceeded"}
+{"version":"gai.agent.events.v1","id":"1bcdb1f11072a63233e457d9dc2b7d31","type":"phase.start","ts":1761809383759,"step":"plan"}
+{"version":"gai.agent.events.v1","id":"8c563495ddd25bfde926f765a6a43ddc","type":"approval.requested","ts":1761809383771,"step":"plan","data":{"approval_id":"f117f35f7909fea3c6cedabffd559956","kind":"plan"}}
+{"version":"gai.agent.events.v1","id":"045f891e4abb2f36f34088daf5046164","type":"error","ts":1761809483788,"step":"plan","error":"context canceled"}
