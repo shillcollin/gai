@@ -56,7 +56,7 @@ func (s *Skill) AnthropicDescriptor() AnthropicDescriptor {
 		Tags:         append([]string(nil), s.Manifest.Tags...),
 		Tools:        tools,
 		Sandbox: AnthropicSandbox{
-			Image:      rt.Image,
+			Image:      "local", // Placeholder as Image field was removed from RuntimeSpec
 			Workdir:    rt.Workdir,
 			Entrypoint: append([]string(nil), rt.Entrypoint...),
 			Env:        cloneStringMap(rt.Env),

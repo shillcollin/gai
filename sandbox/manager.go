@@ -7,60 +7,34 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"dagger.io/dagger"
-	"github.com/shillcollin/gai/obs"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 )
 
 // Manager orchestrates sandbox sessions backed by a specific runtime backend.
 type Manager struct {
 	opts     ManagerOptions
 	mu       sync.Mutex
-	client   daggerClient
 	closed   bool
 	sessions map[string]*Session
 	ctx      context.Context
 	cancel   context.CancelFunc
 }
 
-// NewManager constructs a sandbox manager. When no backend is specified the Dagger backend is used.
+// NewManager constructs a sandbox manager. When no backend is specified the Local backend is used.
 func NewManager(ctx context.Context, opts ManagerOptions) (*Manager, error) {
-	// The Dagger client ties the engine lifecycle to the Connect context.
-	// Use a long-lived context we can cancel on Manager.Close.
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	mgrCtx, cancel := context.WithCancel(ctx)
 
-	factory := opts.clientFactory
-	if factory == nil {
-		factory = defaultDaggerFactory{}
-	}
-
-	client, err := factory.Connect(mgrCtx, opts.DaggerOpts...)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("sandbox: connect dagger: %w", err)
-	}
-
 	m := &Manager{
 		opts:     opts,
-		client:   client,
 		sessions: make(map[string]*Session),
 		ctx:      mgrCtx,
 		cancel:   cancel,
 	}
 
-	if m.opts.DefaultRuntime.Image == "" {
-		m.opts.DefaultRuntime.Image = "ghcr.io/catthehacker/ubuntu:jammy"
-	}
-	if m.opts.DefaultRuntime.Shell == "" {
-		m.opts.DefaultRuntime.Shell = "/bin/sh"
-	}
 	if m.opts.DefaultRuntime.Backend == "" {
-		m.opts.DefaultRuntime.Backend = BackendDagger
+		m.opts.DefaultRuntime.Backend = BackendLocal
 	}
 	return m, nil
 }
@@ -79,9 +53,6 @@ func (m *Manager) Close() error {
 	m.closed = true
 	if m.cancel != nil {
 		m.cancel()
-	}
-	if m.client != nil {
-		return m.client.Close()
 	}
 	return nil
 }
@@ -135,29 +106,10 @@ func (m *Manager) newSession(ctx context.Context, spec SessionSpec, assets Sessi
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
-	if spec.Runtime.Backend != BackendDagger {
+
+	// Dagger support removed. Only Local backend supported.
+	if spec.Runtime.Backend != BackendLocal {
 		return nil, ErrUnsupportedBackend
-	}
-
-	container := m.client.Container()
-	if spec.Runtime.Platform != "" {
-		container = m.client.Container(dagger.ContainerOpts{Platform: dagger.Platform(spec.Runtime.Platform)})
-	}
-	container = container.From(spec.Runtime.Image)
-	for key, value := range spec.Runtime.Env {
-		container = container.WithEnvVariable(key, value)
-	}
-	if spec.Runtime.Workdir != "" {
-		container = container.WithWorkdir(spec.Runtime.Workdir)
-	}
-	if len(spec.Runtime.Entrypoint) > 0 {
-		container = container.WithEntrypoint(spec.Runtime.Entrypoint)
-	}
-
-	var err error
-	container, err = m.applyFilesystem(container, spec.Filesystem, spec.Runtime, assets)
-	if err != nil {
-		return nil, err
 	}
 
 	limits := m.opts.DefaultLimits.Merge(spec.Limits)
@@ -165,62 +117,12 @@ func (m *Manager) newSession(ctx context.Context, spec SessionSpec, assets Sessi
 	session := &Session{
 		ID:         generateSessionID(),
 		manager:    m,
-		client:     m.client,
-		container:  container,
 		runtime:    spec.Runtime,
 		filesystem: spec.Filesystem,
 		limits:     limits,
 		metadata:   cloneStringMap(spec.Metadata),
 	}
 	return session, nil
-}
-
-func (m *Manager) applyFilesystem(container *dagger.Container, fsSpec FilesystemSpec, runtime RuntimeSpec, assets SessionAssets) (*dagger.Container, error) {
-	result := container
-	for _, tmpl := range fsSpec.Templates {
-		mode := 0
-		if tmpl.Mode != 0 {
-			mode = int(tmpl.Mode.Perm())
-		}
-		opts := dagger.ContainerWithNewFileOpts{
-			Permissions: mode,
-		}
-		if tmpl.Owner != "" {
-			opts.Owner = tmpl.Owner
-		}
-		result = result.WithNewFile(tmpl.Path, tmpl.Contents, opts)
-	}
-
-	for _, mount := range fsSpec.Mounts {
-		if err := mount.Validate(); err != nil {
-			return nil, err
-		}
-		hostDir := m.client.Host().Directory(mount.Source)
-		if mount.ReadOnly {
-			// Copy contents into container to keep read-only semantics.
-			result = result.WithDirectory(mount.Target, hostDir)
-		} else {
-			result = result.WithMountedDirectory(mount.Target, hostDir)
-		}
-	}
-
-	if assets.Workspace != "" {
-		hostDir := m.client.Host().Directory(assets.Workspace)
-		target := runtime.Workdir
-		if target == "" {
-			target = "/workspace"
-		}
-		result = result.WithDirectory(target, hostDir)
-	}
-	for _, mount := range assets.Mounts {
-		hostDir := m.client.Host().Directory(mount.Source)
-		if mount.ReadOnly {
-			result = result.WithDirectory(mount.Target, hostDir)
-		} else {
-			result = result.WithMountedDirectory(mount.Target, hostDir)
-		}
-	}
-	return result, nil
 }
 
 func generateSessionID() string {
@@ -231,9 +133,6 @@ func mergeRuntime(base, override RuntimeSpec) RuntimeSpec {
 	out := base
 	if override.Backend != "" {
 		out.Backend = override.Backend
-	}
-	if override.Image != "" {
-		out.Image = override.Image
 	}
 	if override.Workdir != "" {
 		out.Workdir = override.Workdir
@@ -252,9 +151,6 @@ func mergeRuntime(base, override RuntimeSpec) RuntimeSpec {
 	if override.Shell != "" {
 		out.Shell = override.Shell
 	}
-	if override.Platform != "" {
-		out.Platform = override.Platform
-	}
 	return out
 }
 
@@ -262,8 +158,6 @@ func mergeRuntime(base, override RuntimeSpec) RuntimeSpec {
 type Session struct {
 	ID         string
 	manager    *Manager
-	client     daggerClient
-	container  *dagger.Container
 	runtime    RuntimeSpec
 	filesystem FilesystemSpec
 	limits     ResourceLimits
@@ -301,130 +195,8 @@ func (s *Session) Exec(ctx context.Context, opts ExecOptions) (ExecResult, error
 }
 
 func (s *Session) execLocked(ctx context.Context, opts ExecOptions) (ExecResult, error) {
-	limits := s.limits.Clone()
-	if opts.Timeout > 0 {
-		limits.Timeout = opts.Timeout
-	}
-
-	execCtx := ctx
-	if limits.Timeout > 0 {
-		var cancel context.CancelFunc
-		execCtx, cancel = context.WithTimeout(ctx, limits.Timeout)
-		defer cancel()
-	}
-
-	attrs := []attribute.KeyValue{
-		attribute.String("sandbox.session", s.ID),
-		attribute.String("sandbox.image", s.runtime.Image),
-		attribute.StringSlice("sandbox.command", opts.Command),
-	}
-	spanCtx, span := obs.Tracer().Start(execCtx, "sandbox.exec")
-	span.SetAttributes(attrs...)
-	defer span.End()
-
-	container := s.container
-	if opts.Workdir != "" {
-		container = container.WithWorkdir(opts.Workdir)
-	}
-	for key, value := range opts.Env {
-		container = container.WithEnvVariable(key, value)
-	}
-
-	var err error
-	container, err = s.applyEphemeralFilesystem(container, opts)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return ExecResult{}, err
-	}
-
-	execArgs := s.decorateCommand(opts.Command, limits)
-	execOpts := []dagger.ContainerWithExecOpts{
-		{Expect: dagger.ReturnTypeAny},
-	}
-	if len(opts.Stdin) > 0 {
-		execOpts = append(execOpts, dagger.ContainerWithExecOpts{Stdin: string(opts.Stdin)})
-	}
-	execContainer := container.WithExec(execArgs, execOpts...)
-
-	start := time.Now()
-	stdout, err := execContainer.Stdout(spanCtx)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return ExecResult{}, err
-	}
-	stderr, err := execContainer.Stderr(spanCtx)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return ExecResult{}, err
-	}
-	exitCode, err := execContainer.ExitCode(spanCtx)
-	duration := time.Since(start)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return ExecResult{}, err
-	}
-
-	if opts.Stdout != nil && stdout != "" {
-		_, _ = opts.Stdout.Write([]byte(stdout))
-	}
-	if opts.Stderr != nil && stderr != "" {
-		_, _ = opts.Stderr.Write([]byte(stderr))
-	}
-
-	s.container = execContainer
-
-	if exitCode != 0 {
-		span.SetStatus(codes.Error, fmt.Sprintf("exit code %d", exitCode))
-	} else {
-		span.SetStatus(codes.Ok, "")
-	}
-	span.SetAttributes(
-		attribute.Int("sandbox.exit_code", exitCode),
-		attribute.Int64("sandbox.duration_ms", duration.Milliseconds()),
-	)
-
-	return ExecResult{
-		Command:       append([]string(nil), opts.Command...),
-		ExitCode:      exitCode,
-		Duration:      duration,
-		Stdout:        stdout,
-		Stderr:        stderr,
-		AppliedLimits: limits,
-	}, nil
-}
-
-func (s *Session) applyEphemeralFilesystem(container *dagger.Container, opts ExecOptions) (*dagger.Container, error) {
-	result := container
-	for _, tmpl := range opts.Templates {
-		if err := tmpl.Validate(); err != nil {
-			return nil, err
-		}
-		mode := 0
-		if tmpl.Mode != 0 {
-			mode = int(tmpl.Mode.Perm())
-		}
-		opt := dagger.ContainerWithNewFileOpts{Permissions: mode}
-		if tmpl.Owner != "" {
-			opt.Owner = tmpl.Owner
-		}
-		result = result.WithNewFile(tmpl.Path, tmpl.Contents, opt)
-	}
-	for _, mount := range opts.Mounts {
-		if err := mount.Validate(); err != nil {
-			return nil, err
-		}
-		dir := s.client.Host().Directory(mount.Source)
-		if mount.ReadOnly {
-			result = result.WithDirectory(mount.Target, dir)
-		} else {
-			result = result.WithMountedDirectory(mount.Target, dir)
-		}
-	}
-	return result, nil
+	// Only Local backend supported
+	return s.execLocal(ctx, opts)
 }
 
 func (s *Session) decorateCommand(command []string, limits ResourceLimits) []string {

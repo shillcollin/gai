@@ -19,6 +19,8 @@ import (
 	"github.com/shillcollin/gai/providers/openai"
 	"github.com/shillcollin/gai/providers/xai"
 	"github.com/shillcollin/gai/runner"
+	"github.com/shillcollin/gai/sandbox"
+	"github.com/shillcollin/gai/tools"
 )
 
 type providerEntry struct {
@@ -69,15 +71,41 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize Sandbox Manager (Local Backend)
+	// Note: We need a context that persists for the lifecycle of the manager
+	mgrCtx, mgrCancel := context.WithCancel(context.Background())
+	defer mgrCancel()
+
+	sandboxManager, err := sandbox.NewManager(mgrCtx, sandbox.ManagerOptions{
+		DefaultRuntime: sandbox.RuntimeSpec{Backend: sandbox.BackendLocal},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing sandbox: %v\n", err)
+		os.Exit(1)
+	}
+	defer sandboxManager.Close()
+
+	// Create a persistent session for the agent
+	session, err := sandboxManager.CreateSession(mgrCtx, sandbox.SessionSpec{
+		Runtime: sandbox.RuntimeSpec{Backend: sandbox.BackendLocal},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating sandbox session: %v\n", err)
+		os.Exit(1)
+	}
+	defer session.Close()
+
 	// Initialize Conversation
 	conv := &conversation{
 		reader:       bufio.NewReader(os.Stdin),
 		providers:    providers,
 		current:      providers[0],
 		currentModel: providers[0].Default,
-		tools:        buildTools(),
+		tools:        buildTools(session),
 	}
-	conv.runner = newRunner(conv.current.Client)
+	// Register session with runner for specialized handling if needed (e.g. metrics)
+	// But here we bind tools directly to the session.
+	conv.runner = newRunner(conv.current.Client, session)
 
 	// System Prompt
 	systemPrompt := `You are a skilled software engineer assistant, similar to Claude Code.
@@ -112,8 +140,40 @@ Always be concise and helpful. When asked to modify code, prefer reading the fil
 			return
 		}
 		if strings.HasPrefix(text, "/model") {
-			// TODO: implement model switching command
-			fmt.Println("Model switching not yet implemented via command.")
+			parts := strings.Fields(text)
+			if len(parts) > 1 {
+				model := parts[1]
+				// Find provider for model? Or just set it?
+				// For now, assume user knows what they are doing or we search.
+				// Let's look for a provider that supports this model.
+				found := false
+				for _, p := range conv.providers {
+					for _, m := range p.Models {
+						if m == model {
+							conv.current = p
+							conv.currentModel = model
+							conv.runner = newRunner(p.Client, session)
+							found = true
+							fmt.Printf("Switched to %s (%s)\n", p.Label, model)
+							break
+						}
+					}
+					if found { break }
+				}
+				if !found {
+					// Fallback: just set model on current provider
+					conv.currentModel = model
+					// Re-init runner? Not strictly needed if provider is same, but safer.
+					// Actually runner doesn't hold model state, request does.
+					// But newRunner might be useful if we want to change params.
+					fmt.Printf("Switched model to %s (provider: %s)\n", model, conv.current.Label)
+				}
+			} else {
+				fmt.Println("Available models:")
+				for _, p := range conv.providers {
+					fmt.Printf("  %s: %s\n", p.Label, strings.Join(p.Models, ", "))
+				}
+			}
 			continue
 		}
 
@@ -247,37 +307,147 @@ func (c *conversation) processTurn(ctx context.Context, userInput string) error 
 	return nil
 }
 
-func builderTextForStep(m map[int]*strings.Builder, step int) string {
-	if b := m[step]; b != nil {
-		return b.String()
+func buildTools(session *sandbox.Session) []core.ToolHandle {
+	// Register standardized sandbox tools
+
+	// 1. run_command (using standardized SDK tool)
+	// We need to inject the session into the tool execution metadata.
+	// The runner handles this via WithSkill or we can use a closure wrapper?
+	// Since tools are created here, we can close over 'session' if we write custom adapters,
+	// OR we rely on the runner to inject "sandbox.session" into metadata if we use `runner.WithSkillAssets`.
+	// However, we are manually building tools here.
+	// `tools.NewSandboxCommand` expects "sandbox.session" in metadata.
+	// So we need a way to ensure that metadata is present.
+	// The Runner has `interceptors`. We can add an interceptor to inject the session!
+	// OR, simpler: The Runner has `WithSkillAssets`? No, we aren't using a "Skill" object here, just raw tools.
+	// Wait, `runner.WithSkill` binds a manager.
+	// Let's look at `runner.go`: `prepareSkillSession` creates a session. We already have one.
+
+	// Simple solution: Wrap the tool execution to inject session into context or metadata.
+	// Or just implement the tool closure to use the session directly (since we have it in scope).
+
+	// run_command adapter
+	runCmd := tools.NewCoreAdapter(tools.New[tools.SandboxCommandInput, tools.SandboxCommandOutput](
+		"run_command",
+		"Execute a shell command.",
+		func(ctx context.Context, in tools.SandboxCommandInput, meta core.ToolMeta) (tools.SandboxCommandOutput, error) {
+			// Reuse the logic from sandbox_command.go but with our captured session
+			timeout := time.Duration(in.TimeoutSeconds) * time.Second
+			opts := sandbox.ExecOptions{
+				Command: in.Args,
+				Workdir: in.Workdir,
+				Timeout: timeout,
+			}
+			if in.Stdin != "" {
+				opts.Stdin = []byte(in.Stdin)
+			}
+			result, err := session.Exec(ctx, opts)
+			if err != nil {
+				return tools.SandboxCommandOutput{}, err
+			}
+			return tools.SandboxCommandOutput{
+				ExitCode: result.ExitCode,
+				Stdout:   result.Stdout,
+				Stderr:   result.Stderr,
+				Duration: result.Duration.Milliseconds(),
+				Command:  result.Command,
+			}, nil
+		},
+	))
+
+	// read_file adapter
+	type readFileInput struct {
+		Path string `json:"path"`
 	}
-	var maxStep int
-	for s := range m {
-		if s > maxStep {
-			maxStep = s
-		}
+	type readFileOutput struct {
+		Content string `json:"content"`
 	}
-	if b := m[maxStep]; b != nil {
-		return b.String()
+	readFile := tools.NewCoreAdapter(tools.New[readFileInput, readFileOutput](
+		"read_file",
+		"Read file content.",
+		func(ctx context.Context, in readFileInput, meta core.ToolMeta) (readFileOutput, error) {
+			// Use 'cat' via session
+			res, err := session.Exec(ctx, sandbox.ExecOptions{
+				Command: []string{"cat", in.Path},
+			})
+			if err != nil {
+				return readFileOutput{}, err
+			}
+			if res.ExitCode != 0 {
+				return readFileOutput{}, fmt.Errorf("read failed: %s", res.Stderr)
+			}
+			return readFileOutput{Content: res.Stdout}, nil
+		},
+	))
+
+	// write_file adapter
+	type writeFileInput struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
 	}
-	return ""
+	type writeFileOutput struct {
+		Success bool `json:"success"`
+	}
+	writeFile := tools.NewCoreAdapter(tools.New[writeFileInput, writeFileOutput](
+		"write_file",
+		"Write file content.",
+		func(ctx context.Context, in writeFileInput, meta core.ToolMeta) (writeFileOutput, error) {
+			// Use FileTemplate to write safely via manager
+			_, err := session.Exec(ctx, sandbox.ExecOptions{
+				Command: []string{"true"}, // No-op command, just side effect of template writing
+				Templates: []sandbox.FileTemplate{{
+					Path: in.Path,
+					Contents: in.Content,
+					Mode: 0644,
+				}},
+			})
+			if err != nil {
+				return writeFileOutput{}, err
+			}
+			return writeFileOutput{Success: true}, nil
+		},
+	))
+
+	// list_dir adapter
+	type listDirInput struct {
+		Path string `json:"path"`
+	}
+	type listDirOutput struct {
+		Entries []string `json:"entries"`
+	}
+	listDir := tools.NewCoreAdapter(tools.New[listDirInput, listDirOutput](
+		"list_directory",
+		"List directory entries.",
+		func(ctx context.Context, in listDirInput, meta core.ToolMeta) (listDirOutput, error) {
+			// Use 'ls -F' via session
+			path := in.Path
+			if path == "" {
+				path = "."
+			}
+			res, err := session.Exec(ctx, sandbox.ExecOptions{
+				Command: []string{"ls", "-1F", path},
+			})
+			if err != nil {
+				return listDirOutput{}, err
+			}
+			if res.ExitCode != 0 {
+				return listDirOutput{}, fmt.Errorf("ls failed: %s", res.Stderr)
+			}
+			entries := strings.Split(strings.TrimSpace(res.Stdout), "\n")
+			return listDirOutput{Entries: entries}, nil
+		},
+	))
+
+	return []core.ToolHandle{runCmd, readFile, writeFile, listDir}
 }
 
-func buildTools() []core.ToolHandle {
-	return []core.ToolHandle{
-		newReadFileTool(),
-		newWriteFileTool(),
-		newListDirTool(),
-		newRunCommandTool(),
-	}
-}
-
-func newRunner(p core.Provider) *runner.Runner {
+func newRunner(p core.Provider, session *sandbox.Session) *runner.Runner {
 	return runner.New(
 		p,
 		runner.WithMaxParallel(1), // Sequential for clarity in CLI usually
 		runner.WithToolTimeout(60*time.Second),
 		runner.WithOnToolError(runner.ToolErrorAppendAndContinue),
+		// We don't use WithSkill because we are managing the session manually in buildTools
 	)
 }
 

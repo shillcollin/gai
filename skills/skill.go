@@ -184,7 +184,6 @@ func manifestFingerprint(m Manifest) string {
 		hash.Write([]byte(tool.Name))
 		hash.Write([]byte(tool.Description))
 	}
-	hash.Write([]byte(m.Sandbox.Session.Runtime.Image))
 	hash.Write([]byte(fmt.Sprintf("%v", m.Sandbox.Session.Runtime)))
     for _, mount := range m.Sandbox.Session.Filesystem.Mounts {
         hash.Write([]byte(mount.Source))

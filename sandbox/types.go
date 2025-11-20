@@ -13,32 +13,28 @@ import (
 type Backend string
 
 const (
-	// BackendDagger executes workloads inside ephemeral OCI containers managed by Dagger.
-	BackendDagger Backend = "dagger"
+	// BackendLocal executes workloads directly on the host OS.
+	BackendLocal Backend = "local"
 )
 
 // RuntimeSpec describes how the sandbox runtime should be initialised.
 type RuntimeSpec struct {
 	Backend    Backend           `json:"backend" yaml:"backend"`
-	Image      string            `json:"image" yaml:"image"`
 	Workdir    string            `json:"workdir,omitempty" yaml:"workdir,omitempty"`
 	Entrypoint []string          `json:"entrypoint,omitempty" yaml:"entrypoint,omitempty"`
 	Env        map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
 	Shell      string            `json:"shell,omitempty" yaml:"shell,omitempty"`
-	Platform   string            `json:"platform,omitempty" yaml:"platform,omitempty"`
 }
 
 // Validate ensures the runtime specification is well formed.
 func (r RuntimeSpec) Validate() error {
-	if r.Image == "" {
-		return fmt.Errorf("runtime image is required")
-	}
 	switch r.Backend {
-	case "", BackendDagger:
-		// Allow empty so manager defaults to BackendDagger.
+	case "", BackendLocal:
+		// Allow empty so manager defaults to BackendLocal.
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedBackend, r.Backend)
 	}
+
 	if r.Workdir != "" && !filepath.IsAbs(r.Workdir) {
 		return fmt.Errorf("runtime workdir must be absolute: %s", r.Workdir)
 	}
@@ -112,9 +108,6 @@ type FileMount struct {
 func (m FileMount) Validate() error {
 	if m.Source == "" {
 		return fmt.Errorf("mount source is required")
-	}
-	if m.Target == "" {
-		return fmt.Errorf("mount target is required")
 	}
 	if !filepath.IsAbs(m.Target) {
 		return fmt.Errorf("mount target must be absolute: %s", m.Target)
