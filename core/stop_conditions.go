@@ -126,3 +126,61 @@ func All(conds ...StopCondition) StopCondition {
 func CombineConditions(conds ...StopCondition) StopCondition {
 	return Any(conds...)
 }
+
+// MaxTokens stops when total token usage reaches the threshold.
+// This helps control costs by limiting the total tokens consumed across all steps.
+func MaxTokens(n int) StopCondition {
+	if n <= 0 {
+		n = 1
+	}
+	return func(state *RunnerState) (bool, StopReason) {
+		if state == nil {
+			return false, StopReason{}
+		}
+		if state.Usage.TotalTokens >= n {
+			return true, StopReason{
+				Type:        StopReasonMaxTokens,
+				Description: fmt.Sprintf("total tokens reached %d (limit: %d)", state.Usage.TotalTokens, n),
+			}
+		}
+		return false, StopReason{}
+	}
+}
+
+// MaxCost stops when total cost reaches the threshold in USD.
+// This helps control spending by limiting the total cost across all steps.
+func MaxCost(usd float64) StopCondition {
+	if usd <= 0 {
+		usd = 0.01 // minimum 1 cent
+	}
+	return func(state *RunnerState) (bool, StopReason) {
+		if state == nil {
+			return false, StopReason{}
+		}
+		if state.Usage.CostUSD >= usd {
+			return true, StopReason{
+				Type:        StopReasonMaxCost,
+				Description: fmt.Sprintf("cost reached $%.4f (limit: $%.4f)", state.Usage.CostUSD, usd),
+			}
+		}
+		return false, StopReason{}
+	}
+}
+
+// Custom allows user-defined stop conditions.
+// The provided function receives the current runner state and returns whether
+// to stop and an optional reason.
+func Custom(fn func(state *RunnerState) (stop bool, reason StopReason)) StopCondition {
+	if fn == nil {
+		return func(*RunnerState) (bool, StopReason) {
+			return false, StopReason{}
+		}
+	}
+	return func(state *RunnerState) (bool, StopReason) {
+		stop, reason := fn(state)
+		if stop && reason.Type == "" {
+			reason.Type = StopReasonCustom
+		}
+		return stop, reason
+	}
+}

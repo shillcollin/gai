@@ -34,6 +34,8 @@ const (
 	StopReasonUnknown        = "unknown"
 	StopReasonComplete       = "complete"
 	StopReasonMaxSteps       = "max_steps"
+	StopReasonMaxTokens      = "max_tokens"
+	StopReasonMaxCost        = "max_cost"
 	StopReasonNoMoreTools    = "no_more_tools"
 	StopReasonToolSeen       = "tool_seen"
 	StopReasonTextLength     = "text_length"
@@ -41,6 +43,7 @@ const (
 	StopReasonAllConditions  = "all_conditions_met"
 	StopReasonToolError      = "tool_error"
 	StopReasonProviderFinish = "provider_finish"
+	StopReasonCustom         = "custom"
 )
 
 // Citation points to a supporting source reference.

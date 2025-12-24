@@ -1,0 +1,320 @@
+// Package main provides a CLI chatbot with streaming text and audio output.
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+
+	vango "github.com/vango-ai/vango/sdk"
+)
+
+const (
+	model       = "anthropic/claude-haiku-4-5-20251001"
+	voiceID     = "5ee9feff-1265-424a-9d7f-8e4d431a12c7" // Cartesia default voice
+	audioFormat = "pcm"                                  // PCM for lower latency streaming
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	// Load .env file
+	loadEnvFile()
+
+	// Create client
+	client := vango.NewClient()
+
+	// Check for required API keys
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		return fmt.Errorf("ANTHROPIC_API_KEY not set")
+	}
+	if os.Getenv("CARTESIA_API_KEY") == "" {
+		return fmt.Errorf("CARTESIA_API_KEY not set (required for voice)")
+	}
+
+	// Set up signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nGoodbye!")
+		cancel()
+		os.Exit(0)
+	}()
+
+	// Conversation history
+	var messages []vango.Message
+
+	fmt.Println("Chat with Claude (with voice output)")
+	fmt.Println("Type your message and press Enter. Ctrl+C to exit.")
+	fmt.Println(strings.Repeat("-", 50))
+
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		// Prompt
+		fmt.Print("\nYou: ")
+
+		// Read user input
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println("\nGoodbye!")
+				return nil
+			}
+			return fmt.Errorf("read input: %w", err)
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+
+		// Handle exit commands
+		if input == "exit" || input == "quit" || input == "bye" {
+			fmt.Println("Goodbye!")
+			return nil
+		}
+
+		// Add user message to history
+		messages = append(messages, vango.Message{
+			Role:    "user",
+			Content: vango.Text(input),
+		})
+
+		// Get streaming response with voice
+		fmt.Print("\nClaude: ")
+		assistantText, err := streamWithVoice(ctx, client, messages)
+		if err != nil {
+			fmt.Printf("\nError: %v\n", err)
+			continue
+		}
+		fmt.Println() // New line after response
+
+		// Add assistant response to history
+		messages = append(messages, vango.Message{
+			Role:    "assistant",
+			Content: vango.Text(assistantText),
+		})
+	}
+}
+
+// streamWithVoice streams the response with text output and audio.
+func streamWithVoice(ctx context.Context, client *vango.Client, messages []vango.Message) (string, error) {
+	// Create streaming request with voice output
+	stream, err := client.Messages.RunStream(ctx, &vango.MessageRequest{
+		Model:     model,
+		Messages:  messages,
+		MaxTokens: 1024,
+		Voice:     vango.VoiceOutput(voiceID, vango.WithAudioFormat(audioFormat)),
+		System:    vango.Text("Don't respond in markdown, just normal text."),
+		Tools:     []vango.Tool{vango.WebSearch()},
+	})
+	if err != nil {
+		return "", fmt.Errorf("create stream: %w", err)
+	}
+	defer stream.Close()
+
+	// Start audio player
+	player := newAudioPlayer(ctx)
+	defer player.Close()
+
+	// Process stream with callbacks
+	text, err := stream.Process(vango.StreamCallbacks{
+		OnTextDelta:  func(t string) { fmt.Print(t) },
+		OnAudioChunk: func(data []byte) { player.Write(data) },
+		OnToolCallStart: func(id, name string, input map[string]any) {
+			fmt.Printf("\n[🔧 %s", name)
+			// Show query if available (may be empty for streaming)
+			if q, ok := input["query"].(string); ok && q != "" {
+				fmt.Printf(": %s", q)
+			}
+			fmt.Print("]\n")
+		},
+		OnToolResult: func(id, name string, content []vango.ContentBlock, err error) {
+			if err != nil {
+				fmt.Printf("[❌ %s failed: %v]\n", name, err)
+				return
+			}
+			// Show preview of result
+			preview := contentPreview(content, 60)
+			fmt.Printf("[✓ %s: %s]\n", name, preview)
+		},
+	})
+
+	if err != nil && err != io.EOF {
+		return text, err
+	}
+
+	return text, nil
+}
+
+// contentPreview extracts a text preview from content blocks.
+func contentPreview(content []vango.ContentBlock, maxLen int) string {
+	if len(content) == 0 {
+		return "done"
+	}
+	for _, block := range content {
+		if tb, ok := block.(vango.TextBlock); ok {
+			text := tb.Text
+			if len(text) > maxLen {
+				return text[:maxLen] + "..."
+			}
+			return text
+		}
+	}
+	return "done"
+}
+
+// audioPlayer wraps audio playback with a simple Write/Close interface.
+type audioPlayer struct {
+	ctx    context.Context
+	chunks chan []byte
+	wg     sync.WaitGroup
+}
+
+func newAudioPlayer(ctx context.Context) *audioPlayer {
+	p := &audioPlayer{
+		ctx:    ctx,
+		chunks: make(chan []byte, 50),
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		playAudioChunks(ctx, p.chunks)
+	}()
+	return p
+}
+
+func (p *audioPlayer) Write(data []byte) {
+	select {
+	case p.chunks <- data:
+	case <-p.ctx.Done():
+	}
+}
+
+func (p *audioPlayer) Close() {
+	close(p.chunks)
+	p.wg.Wait()
+}
+
+// playAudioChunks plays PCM audio chunks using sox (for streaming) or ffplay.
+func playAudioChunks(ctx context.Context, chunks <-chan []byte) {
+	// For PCM, we can pipe directly to sox/ffplay for continuous playback
+	// This avoids the latency of writing files
+
+	// Try to find a streaming audio player
+	var cmd *exec.Cmd
+
+	if _, err := exec.LookPath("play"); err == nil {
+		// sox's play command - can read PCM from stdin
+		// Format: signed 16-bit little-endian, 24kHz, mono
+		cmd = exec.CommandContext(ctx, "play", "-t", "raw", "-r", "24000", "-e", "signed", "-b", "16", "-c", "1", "-")
+	} else if _, err := exec.LookPath("ffplay"); err == nil {
+		// ffplay can also read from stdin
+		cmd = exec.CommandContext(ctx, "ffplay", "-f", "s16le", "-ar", "24000", "-ac", "1", "-nodisp", "-autoexit", "-")
+	} else if _, err := exec.LookPath("aplay"); err == nil {
+		// aplay on Linux
+		cmd = exec.CommandContext(ctx, "aplay", "-f", "S16_LE", "-r", "24000", "-c", "1", "-q", "-")
+	}
+
+	if cmd != nil {
+		stdin, err := cmd.StdinPipe()
+		if err == nil {
+			cmd.Start()
+
+			// Write chunks to stdin
+			for chunk := range chunks {
+				select {
+				case <-ctx.Done():
+					stdin.Close()
+					cmd.Wait()
+					return
+				default:
+					stdin.Write(chunk)
+				}
+			}
+
+			stdin.Close()
+			cmd.Wait()
+			return
+		}
+	}
+
+	// Fallback: write to file and play (higher latency)
+	fallbackPlayAudio(ctx, chunks)
+}
+
+// fallbackPlayAudio writes chunks to a file and plays with afplay.
+func fallbackPlayAudio(ctx context.Context, chunks <-chan []byte) {
+	// Collect all chunks
+	var allData []byte
+	for chunk := range chunks {
+		allData = append(allData, chunk...)
+	}
+
+	if len(allData) == 0 {
+		return
+	}
+
+	// Convert PCM to WAV using SDK helper
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("vango_audio_%d.wav", os.Getpid()))
+	wavData := vango.PCMToWAVDefault(allData)
+	if err := os.WriteFile(tmpFile, wavData, 0644); err != nil {
+		return
+	}
+	defer os.Remove(tmpFile)
+
+	// Play using afplay (macOS) or aplay (Linux)
+	var cmd *exec.Cmd
+	if _, err := exec.LookPath("afplay"); err == nil {
+		cmd = exec.CommandContext(ctx, "afplay", tmpFile)
+	} else if _, err := exec.LookPath("aplay"); err == nil {
+		cmd = exec.CommandContext(ctx, "aplay", "-q", tmpFile)
+	}
+
+	if cmd != nil {
+		cmd.Run()
+	}
+}
+
+// loadEnvFile loads environment variables from .env file.
+func loadEnvFile() {
+	// Try to find .env in current dir or parent dirs
+	dir, _ := os.Getwd()
+	for i := 0; i < 5; i++ {
+		envPath := filepath.Join(dir, ".env")
+		if data, err := os.ReadFile(envPath); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				if idx := strings.Index(line, "="); idx > 0 {
+					key := strings.TrimSpace(line[:idx])
+					value := strings.TrimSpace(line[idx+1:])
+					if os.Getenv(key) == "" {
+						os.Setenv(key, value)
+					}
+				}
+			}
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
+}

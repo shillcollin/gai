@@ -1,8 +1,0 @@
-name: python-sandbox-demo
-version: "0.1.0"
-default_skill: python-sandbox
-max_steps: 6
-provider_preferences:
-  - openai-responses
-  - openai
-shared_workspace: shared

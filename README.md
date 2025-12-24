@@ -1,28 +1,95 @@
-gai — Go AI SDK (docs-first)
+# gai - Go AI SDK
 
-Status
-- This repository currently contains documentation, schema, and examples for the upcoming Go SDK named `gai` (repo: github.com/shillcollin/gai).
-- Code is not yet implemented; we are finalizing PRDs and the build plan before scaffolding packages.
+A production-ready Go SDK for building AI-powered applications. Provider-agnostic, type-safe, and observable.
 
-Quick Links
-- Developer Guide: `docs/DEVELOPER_GUIDE.md`
-- Product Requirements (PRDs):
-  - Core: `docs/PRD_CORE.md`
-  - Runner & Tools: `docs/PRD_RUNNER_TOOLS.md`
-  - Structured Outputs: `docs/PRD_STRUCTURED_OUTPUTS.md`
-  - Streaming Normalization: `docs/PRD_STREAMING_NORMALIZATION.md`
-  - Providers & Capabilities: `docs/PRD_PROVIDERS.md`
-  - Observability & Evals: `docs/PRD_OBS_EVALS.md`
-  - UI (Transcript & Hooks): `docs/PRD_UI.md`
-  - Voice: `docs/PRD_VOICE.md`
-- Streaming Spec: `docs/STREAMING_SPEC.md`
-- UI Guide: `docs/UI_GUIDE.md`
-- Schema + Types + Fixtures: `docs/schema/`
-- Providers: `docs/PROVIDER_*`
-- Testing & Evals: `docs/TESTING.md`, `docs/OBS_EVALS.md`
-- Roadmap: `docs/ROADMAP.md`
+## Features
 
-Next Steps
-- Decide on license (MIT or Apache-2.0 are common for SDKs).
-- Finalize Phase 1 build plan (`docs/PHASE1_IMPLEMENTATION_PLAN.md`).
-- Scaffold Go module and packages per `docs/PHASE1_IMPLEMENTATION_PLAN.md` once PRDs are stable.
+- **Multi-Provider Support**: OpenAI, Anthropic, Gemini, Groq, xAI, and any OpenAI-compatible endpoint
+- **Type-Safe Tools**: Generic tool framework with automatic JSON schema derivation from Go types
+- **Normalized Streaming**: Unified `gai.events.v1` event schema across all providers (SSE/NDJSON)
+- **Structured Outputs**: Type-safe structured generation with automatic repair
+- **Multi-Step Runner**: Orchestrates tool execution with stop conditions and finalizers
+- **Observability**: Built-in OpenTelemetry tracing and metrics
+- **Multimodal**: Support for text, images, audio, video, and files
+
+## Installation
+
+```bash
+go get github.com/shillcollin/gai
+```
+
+## Quick Start
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "os"
+
+    "github.com/shillcollin/gai/core"
+    "github.com/shillcollin/gai/providers/openai"
+)
+
+func main() {
+    client := openai.New(
+        openai.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
+        openai.WithModel("gpt-4o"),
+    )
+
+    result, err := client.GenerateText(context.Background(), core.Request{
+        Messages: []core.Message{
+            core.UserMessage(core.TextPart("Hello, world!")),
+        },
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    fmt.Println(result.Text)
+}
+```
+
+## Providers
+
+| Provider | Package | Status |
+|----------|---------|--------|
+| OpenAI | `providers/openai` | Stable |
+| OpenAI Responses API | `providers/openai-responses` | Stable |
+| Anthropic | `providers/anthropic` | Stable |
+| Google Gemini | `providers/gemini` | Stable |
+| Groq | `providers/groq` | Stable |
+| xAI | `providers/xai` | Stable |
+| OpenAI-Compatible | `providers/compat` | Stable |
+
+## Core Packages
+
+- **`core/`** - Provider interface, messages, parts, requests, streaming, structured outputs
+- **`providers/`** - Provider implementations
+- **`runner/`** - Multi-step tool execution orchestrator
+- **`tools/`** - Type-safe tool framework
+- **`stream/`** - Streaming helpers for SSE/NDJSON
+- **`obs/`** - OpenTelemetry integration
+- **`prompts/`** - Versioned prompt registry
+
+## Documentation
+
+- [Developer Guide](docs/DEVELOPER_GUIDE.md)
+- [API Reference](docs/API_REFERENCE.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Testing Guide](docs/TESTING.md)
+
+## Examples
+
+See the [examples/](examples/) directory for runnable examples:
+
+- `examples/basic/` - Basic text generation
+- `examples/streaming/` - Streaming responses
+- `examples/structured/` - Structured outputs
+- `examples/tools/` - Tool usage
+- `examples/observability/` - OpenTelemetry integration
+
+## License
+
+MIT
