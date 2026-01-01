@@ -1069,122 +1069,233 @@ This provides low-latency audio while maintaining natural speech patterns.
 
 **Endpoint**: `WebSocket /v1/messages/live`
 
-Real-time bidirectional voice and text communication.
+Real-time bidirectional voice communication using Vango's Universal Voice Pipeline. This endpoint works with **any text-based LLM** (Claude, GPT-4, Llama, Mistral) by orchestrating STT → LLM → TTS in real-time.
+
+**Key Features:**
+- Hybrid VAD: Energy detection + semantic analysis for intelligent turn-taking
+- Smart interruption: Semantic barge-in detection distinguishes real interrupts from backchannels
+- Mid-session configuration: Change model, tools, or voice settings without reconnecting
+- Unified agent definition: Same config works for HTTP and WebSocket
 
 ### 11.1 Connection
 
 ```javascript
-const ws = new WebSocket('wss://api.Vango AI.dev/v1/messages/live', {
+const ws = new WebSocket('wss://api.vango.dev/v1/messages/live', {
   headers: {
-    'Authorization': 'Bearer Vango AI_sk_...'
+    'Authorization': 'Bearer vango_sk_...'
   }
 });
 ```
 
-### 11.2 Client Events (Outgoing)
+### 11.2 Session Configuration
 
-#### session.configure
+The first message **must** be `session.configure` with the full agent definition:
+
 ```json
 {
   "type": "session.configure",
-  "model": "openai/gpt-4o-realtime",
-  "modalities": ["text", "audio"],
-  "voice": "alloy",
-  "system": "You are a helpful assistant.",
-  "tools": [...]
+  "config": {
+    "model": "anthropic/claude-sonnet-4-20250514",
+    "system": "You are a helpful voice assistant.",
+    "tools": [...],
+    "voice": {
+      "input": {
+        "provider": "cartesia",
+        "language": "en"
+      },
+      "output": {
+        "provider": "cartesia",
+        "voice": "a0e99841-438c-4a64-b679-ae501e7d6091",
+        "speed": 1.0
+      },
+      "vad": {
+        "model": "anthropic/claude-haiku-4-5-20251001",
+        "energy_threshold": 0.02,
+        "silence_duration_ms": 600,
+        "semantic_check": true,
+        "min_words_for_check": 2,
+        "max_silence_ms": 3000
+      },
+      "interrupt": {
+        "mode": "auto",
+        "energy_threshold": 0.05,
+        "debounce_ms": 100,
+        "semantic_check": true,
+        "semantic_model": "anthropic/claude-haiku-4-5-20251001",
+        "save_partial": "marked"
+      }
+    }
+  }
 }
 ```
 
-#### audio.append
+### 11.3 VAD Configuration
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | `anthropic/claude-haiku-4-5-20251001` | Fast LLM for semantic turn completion |
+| `energy_threshold` | float | `0.02` | RMS energy level for silence detection |
+| `silence_duration_ms` | int | `600` | Silence duration before semantic check |
+| `semantic_check` | bool | `true` | Enable semantic turn completion analysis |
+| `min_words_for_check` | int | `2` | Minimum words before semantic check |
+| `max_silence_ms` | int | `3000` | Force commit after this silence |
+
+### 11.4 Interrupt Configuration
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | string | `auto` | `auto`, `manual`, or `disabled` |
+| `energy_threshold` | float | `0.05` | RMS threshold (higher than VAD) |
+| `debounce_ms` | int | `100` | Minimum sustained speech before check |
+| `semantic_check` | bool | `true` | Distinguish interrupts from backchannels |
+| `semantic_model` | string | `anthropic/claude-haiku-4-5-20251001` | Fast LLM for interrupt detection |
+| `save_partial` | string | `marked` | `discard`, `save`, or `marked` |
+
+### 11.5 Client → Server Messages
+
+#### session.configure (Required first message)
 ```json
 {
-  "type": "audio.append",
-  "data": "base64_encoded_pcm..."
+  "type": "session.configure",
+  "config": {
+    "model": "anthropic/claude-sonnet-4-20250514",
+    "system": "...",
+    "tools": [...],
+    "voice": {...}
+  }
 }
 ```
 
-Or send raw binary frames for lower latency.
-
-#### audio.commit
+#### session.update (Change config mid-session)
 ```json
 {
-  "type": "audio.commit"
+  "type": "session.update",
+  "config": {
+    "model": "openai/gpt-4o",
+    "voice": {
+      "output": { "voice": "different-voice-id" }
+    }
+  }
 }
 ```
 
-#### text.send
+#### input.interrupt (Force interrupt, skip semantic check)
 ```json
 {
-  "type": "text.send",
-  "text": "Hello, can you help me?"
+  "type": "input.interrupt",
+  "transcript": "Actually, never mind."
 }
 ```
 
-#### response.cancel
+#### input.commit (Force end-of-turn, e.g., push-to-talk release)
 ```json
 {
-  "type": "response.cancel"
+  "type": "input.commit"
 }
 ```
 
-### 11.3 Server Events (Incoming)
+#### input.text (Send text directly for testing)
+```json
+{
+  "type": "input.text",
+  "text": "Hello, what can you help me with?"
+}
+```
+
+#### tool_result (Return tool execution result)
+```json
+{
+  "type": "tool_result",
+  "tool_use_id": "toolu_01ABC",
+  "content": [{"type": "text", "text": "The weather is sunny."}]
+}
+```
+
+#### Binary Frames
+Raw PCM audio: 16-bit signed integer, configurable sample rate (16kHz/24kHz/48kHz), mono.
+
+### 11.6 Server → Client Messages
 
 #### session.created
 ```json
 {
   "type": "session.created",
-  "session_id": "sess_abc123",
-  "model": "openai/gpt-4o-realtime"
+  "session_id": "live_01abc...",
+  "config": {
+    "model": "anthropic/claude-sonnet-4-20250514",
+    "sample_rate": 24000,
+    "channels": 1
+  }
 }
 ```
 
-#### input_audio_transcription.delta
+#### vad.listening / vad.analyzing / vad.silence
+```json
+{"type": "vad.listening"}
+{"type": "vad.analyzing"}
+{"type": "vad.silence", "duration_ms": 1500}
+```
+
+#### transcript.delta (Real-time transcription as user speaks)
 ```json
 {
-  "type": "input_audio_transcription.delta",
-  "delta": "What's the weather"
+  "type": "transcript.delta",
+  "delta": "Book me a"
 }
 ```
 
-#### input_audio_transcription.done
+#### input.committed (Turn complete, processing starts)
 ```json
 {
-  "type": "input_audio_transcription.done",
-  "text": "What's the weather in Tokyo?"
+  "type": "input.committed",
+  "transcript": "Book me a flight to Paris tomorrow"
 }
 ```
 
-#### response.audio.delta
+#### content_block_start / content_block_delta / content_block_stop
+Standard Vango streaming events, identical to HTTP streaming.
+
+#### audio_delta (Audio output chunk)
 ```json
 {
-  "type": "response.audio.delta",
-  "delta": "base64_encoded_audio..."
+  "type": "audio_delta",
+  "data": "<BASE64_PCM>"
+}
+```
+Or sent as raw binary WebSocket frame.
+
+#### interrupt.detecting (TTS paused, checking if real interrupt)
+```json
+{
+  "type": "interrupt.detecting",
+  "transcript": "uh huh"
 }
 ```
 
-#### response.text.delta
+#### interrupt.dismissed (Not a real interrupt, TTS resuming)
 ```json
 {
-  "type": "response.text.delta",
-  "delta": "The weather in"
+  "type": "interrupt.dismissed",
+  "transcript": "uh huh",
+  "reason": "backchannel"
 }
 ```
 
-#### response.tool_call
+#### response.interrupted (Real interrupt confirmed)
 ```json
 {
-  "type": "response.tool_call",
-  "id": "call_abc123",
-  "name": "get_weather",
-  "input": {"location": "Tokyo"}
+  "type": "response.interrupted",
+  "partial_text": "I'd be happy to help you book a fli—",
+  "interrupt_transcript": "Actually wait",
+  "audio_position_ms": 2340
 }
 ```
 
-#### response.done
+#### message_stop
 ```json
 {
-  "type": "response.done",
-  "usage": {"input_tokens": 150, "output_tokens": 87}
+  "type": "message_stop",
+  "stop_reason": "end_turn"
 }
 ```
 
@@ -1192,18 +1303,54 @@ Or send raw binary frames for lower latency.
 ```json
 {
   "type": "error",
-  "code": "rate_limit",
-  "message": "Rate limit exceeded"
+  "code": "vad_timeout",
+  "message": "No speech detected for 30 seconds"
 }
 ```
 
-### 11.4 Provider Routing
+### 11.7 Connection Flow
 
-| Model Pattern | Implementation |
-|---------------|----------------|
-| `openai/gpt-4o-realtime*` | Native OpenAI Realtime API |
-| `gemini/gemini-*-live` | Native Gemini Live |
-| Any other model | STT → LLM → TTS pipeline |
+```
+Client                                          Server
+   │                                               │
+   │──────── WebSocket Connect ───────────────────▶│
+   │                                               │
+   │──────── session.configure (JSON) ────────────▶│
+   │                                               │
+   │◀─────── session.created (JSON) ──────────────│
+   │                                               │
+   │──────── Binary Audio Frames ─────────────────▶│
+   │                                               │
+   │◀─────── vad.listening (JSON) ────────────────│
+   │                                               │
+   │◀─────── transcript.delta (JSON) ─────────────│
+   │                                               │
+   │◀─────── vad.analyzing (JSON) ────────────────│
+   │                                               │
+   │◀─────── input.committed (JSON) ──────────────│
+   │                                               │
+   │◀─────── content_block_delta (JSON) ──────────│
+   │◀─────── Binary Audio Frame ──────────────────│
+   │                                               │
+   │──────── Binary Audio (user interrupts) ──────▶│
+   │                                               │
+   │◀─────── interrupt.detecting (JSON) ──────────│
+   │◀─────── response.interrupted (JSON) ─────────│
+   │                                               │
+```
+
+### 11.8 Audio Format Requirements
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| **Encoding** | PCM signed 16-bit | Little-endian |
+| **Sample Rate** | 24000 Hz | Configurable: 16000, 24000, 48000 |
+| **Channels** | 1 (mono) | Required |
+| **Chunk Size** | 4096 bytes | ~85ms at 24kHz |
+
+### 11.9 Implementation Note
+
+Unlike proprietary realtime APIs, Vango's Live endpoint uses a **Universal Voice Pipeline** that works with any text-based LLM. The same agent definition (model, tools, system prompt) works identically across HTTP `/v1/messages` (with audio content blocks) and WebSocket `/v1/messages/live`.
 
 ---
 

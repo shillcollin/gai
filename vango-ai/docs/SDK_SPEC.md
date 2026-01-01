@@ -1098,65 +1098,184 @@ playAudio(resp.AudioContent().Data())
 
 ## 13. Live Sessions
 
-### 13.1 LiveSession
+Live Sessions provide real-time bidirectional voice communication using Vango's Universal Voice Pipeline. The same agent definition (model, tools, system prompt) works identically whether you use `Messages.Create()` with audio content blocks or `Messages.Live()` for real-time voice.
+
+### 13.1 Configuration Types
 
 ```go
-type LiveSession struct {
+// LiveConfig defines the full agent configuration for a live session.
+type LiveConfig struct {
+    Model   string       `json:"model"`
+    System  string       `json:"system"`
+    Tools   []Tool       `json:"tools"`
+    Voice   *VoiceConfig `json:"voice"`
+}
+
+// VoiceConfig contains all voice-related settings.
+type VoiceConfig struct {
+    Input     *VoiceInputConfig  `json:"input"`
+    Output    *VoiceOutputConfig `json:"output"`
+    VAD       *VADConfig         `json:"vad"`
+    Interrupt *InterruptConfig   `json:"interrupt"`
+}
+
+// VADConfig controls the hybrid voice activity detection.
+type VADConfig struct {
+    Model             string  `json:"model"`              // Fast LLM for semantic check (default: "anthropic/claude-haiku-4-5-20251001")
+    EnergyThreshold   float64 `json:"energy_threshold"`   // RMS threshold (default: 0.02)
+    SilenceDurationMs int     `json:"silence_duration_ms"` // Silence before check (default: 600)
+    SemanticCheck     bool    `json:"semantic_check"`     // Enable semantic analysis (default: true)
+    MinWordsForCheck  int     `json:"min_words_for_check"` // Minimum words (default: 2)
+    MaxSilenceMs      int     `json:"max_silence_ms"`     // Force commit timeout (default: 3000)
+}
+
+// InterruptConfig controls barge-in detection.
+type InterruptConfig struct {
+    Mode           string  `json:"mode"`            // "auto", "manual", "disabled" (default: "auto")
+    EnergyThreshold float64 `json:"energy_threshold"` // Higher than VAD (default: 0.05)
+    DebounceMs      int     `json:"debounce_ms"`     // Minimum sustained speech (default: 100)
+    SemanticCheck   bool    `json:"semantic_check"`  // Distinguish interrupts from backchannels (default: true)
+    SemanticModel   string  `json:"semantic_model"`  // Fast LLM (default: "anthropic/claude-haiku-4-5-20251001")
+    SavePartial     string  `json:"save_partial"`    // "discard", "save", "marked" (default: "marked")
+}
+```
+
+### 13.2 LiveStream
+
+```go
+type LiveStream struct {
     // Send methods
-    SendAudio(data []byte) error
-    SendText(text string) error
-    SendToolResult(toolUseID string, content any) error
-    Commit() error // Signal end of user input
-    Cancel() error // Cancel current response
-    
+    SendAudio(pcm []byte) error           // Send raw PCM audio (16-bit, mono)
+    SendText(text string) error           // Send text directly (for testing)
+    Interrupt(transcript string) error    // Force interrupt (skip semantic check)
+    Commit() error                        // Force end-of-turn (push-to-talk)
+    UpdateConfig(cfg *LiveConfig) error   // Update model/voice/tools mid-session
+
     // Receive
     Events() <-chan LiveEvent
-    
+
     // Lifecycle
     Close() error
 }
 ```
 
-### 13.2 Live Events
+### 13.3 Live Events
 
 ```go
-type SessionCreatedEvent struct { SessionID string }
-type TranscriptDeltaEvent struct { Role string; Text string }
-type TranscriptDoneEvent struct { Role string; Text string }
-type ResponseAudioDeltaEvent struct { Data []byte }
-type ResponseTextDeltaEvent struct { Text string }
-type ResponseToolCallEvent struct { ID, Name string; Input map[string]any }
-type ResponseDoneEvent struct { Usage Usage }
-type ErrorEvent struct { Code, Message string }
+// Session lifecycle
+type SessionCreatedEvent struct {
+    SessionID  string `json:"session_id"`
+    SampleRate int    `json:"sample_rate"`
+    Channels   int    `json:"channels"`
+}
+
+// VAD status events
+type VADStatusEvent struct {
+    Type       string `json:"type"` // "vad.listening", "vad.analyzing", "vad.silence"
+    DurationMs int    `json:"duration_ms,omitempty"`
+}
+
+// Transcription events
+type TranscriptDeltaEvent struct {
+    Delta string `json:"delta"`
+}
+
+type InputCommittedEvent struct {
+    Transcript string `json:"transcript"`
+}
+
+// Audio output
+type AudioChunkEvent struct {
+    Data []byte // Raw PCM audio
+}
+
+// Interrupt events
+type InterruptDetectingEvent struct {
+    Transcript string `json:"transcript"`
+}
+
+type InterruptDismissedEvent struct {
+    Transcript string `json:"transcript"`
+    Reason     string `json:"reason"` // "backchannel", "noise", etc.
+}
+
+type ResponseInterruptedEvent struct {
+    PartialText         string `json:"partial_text"`
+    InterruptTranscript string `json:"interrupt_transcript"`
+    AudioPositionMs     int    `json:"audio_position_ms"`
+}
+
+// Standard streaming events (reused from Messages.Stream)
+type ContentBlockStartEvent struct { ... }
+type ContentBlockDeltaEvent struct { ... }
+type ContentBlockStopEvent struct { ... }
+type MessageStopEvent struct { ... }
+
+// Error
+type ErrorEvent struct {
+    Code    string `json:"code"`
+    Message string `json:"message"`
+}
 ```
 
-### 13.3 Live Usage
+### 13.4 Live Usage Example
 
 ```go
 session, err := client.Messages.Live(ctx, &vango.LiveConfig{
-    Model: "openai/gpt-4o-realtime",
-    Voice: &vango.VoiceConfig{
-        Input:  &vango.VoiceInputConfig{Enabled: true},
-        Output: &vango.VoiceOutputConfig{Voice: "alloy"},
-    },
-    System: "You are a helpful assistant.",
+    Model:  "anthropic/claude-sonnet-4-20250514",
+    System: "You are a helpful voice assistant.",
     Tools:  []vango.Tool{vango.WebSearch()},
+    Voice: &vango.VoiceConfig{
+        Input:  &vango.VoiceInputConfig{Provider: "cartesia", Language: "en"},
+        Output: &vango.VoiceOutputConfig{Provider: "cartesia", Voice: "a0e99841-438c-4a64-b679-ae501e7d6091"},
+        VAD: &vango.VADConfig{
+            Model:             "anthropic/claude-haiku-4-5-20251001",
+            SilenceDurationMs: 600,
+            SemanticCheck:     true,
+        },
+        Interrupt: &vango.InterruptConfig{
+            Mode:          "auto",
+            SemanticCheck: true,
+        },
+    },
 })
+if err != nil {
+    return err
+}
 defer session.Close()
 
 // Handle events
 go func() {
     for event := range session.Events() {
         switch e := event.(type) {
+        case *vango.VADStatusEvent:
+            fmt.Printf("[VAD] %s\n", e.Type)
+
         case *vango.TranscriptDeltaEvent:
-            fmt.Printf("[%s]: %s", e.Role, e.Text)
-        case *vango.ResponseAudioDeltaEvent:
+            fmt.Printf("[User] %s", e.Delta)
+
+        case *vango.InputCommittedEvent:
+            fmt.Printf("\n[Committed] %s\n", e.Transcript)
+
+        case *vango.ContentBlockDeltaEvent:
+            if text, ok := e.Delta.(*vango.TextDelta); ok {
+                fmt.Printf("[Assistant] %s", text.Text)
+            }
+
+        case *vango.AudioChunkEvent:
             speaker.Write(e.Data)
-        case *vango.ResponseToolCallEvent:
-            result := executeToolCall(e.Name, e.Input)
-            session.SendToolResult(e.ID, result)
+
+        case *vango.InterruptDetectingEvent:
+            fmt.Printf("[Interrupt?] %s\n", e.Transcript)
+
+        case *vango.InterruptDismissedEvent:
+            fmt.Printf("[Backchannel] %s (%s)\n", e.Transcript, e.Reason)
+
+        case *vango.ResponseInterruptedEvent:
+            fmt.Printf("[Interrupted] at %dms: %s\n", e.AudioPositionMs, e.InterruptTranscript)
+
         case *vango.ErrorEvent:
-            log.Printf("Error: %s", e.Message)
+            log.Printf("[Error] %s: %s", e.Code, e.Message)
         }
     }
 }()
@@ -1166,6 +1285,60 @@ for chunk := range microphone.Chunks() {
     session.SendAudio(chunk)
 }
 ```
+
+### 13.5 Mid-Session Configuration Updates
+
+```go
+// Switch to a different model mid-conversation
+session.UpdateConfig(&vango.LiveConfig{
+    Model: "openai/gpt-4o",
+})
+
+// Change voice settings
+session.UpdateConfig(&vango.LiveConfig{
+    Voice: &vango.VoiceConfig{
+        Output: &vango.VoiceOutputConfig{
+            Voice: "different-voice-id",
+            Speed: 1.2,
+        },
+    },
+})
+
+// Add new tools
+session.UpdateConfig(&vango.LiveConfig{
+    Tools: []vango.Tool{
+        vango.WebSearch(),
+        newCustomTool,
+    },
+})
+```
+
+### 13.6 RunStream Integration
+
+Live mode internally uses `RunStream` for agent execution, leveraging its existing interrupt support:
+
+```go
+// RunStream's Interrupt method is used when user interrupts during bot speech
+func (rs *RunStream) Interrupt(msg Message, behavior InterruptBehavior) error
+
+type InterruptBehavior int
+const (
+    InterruptDiscard    InterruptBehavior = iota // Don't save partial response
+    InterruptSavePartial                          // Save as-is
+    InterruptSaveMarked                           // Save with [interrupted] marker
+)
+```
+
+This means the same tool execution loop, multi-turn state management, and interrupt handling works identically whether you're using `Messages.Run()` or `Messages.Live()`.
+
+### 13.7 Audio Format Requirements
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| **Encoding** | PCM signed 16-bit | Little-endian |
+| **Sample Rate** | 24000 Hz | Configurable: 16000, 24000, 48000 |
+| **Channels** | 1 (mono) | Required |
+| **Chunk Size** | 4096 bytes | ~85ms at 24kHz |
 
 ---
 

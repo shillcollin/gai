@@ -16,11 +16,12 @@ type VoiceInputConfig struct {
 // VoiceOutputConfig configures text-to-speech.
 // Currently only Cartesia (sonic-3) is supported.
 type VoiceOutputConfig struct {
-	Voice   string  `json:"voice"`             // Cartesia voice ID (required)
-	Speed   float64 `json:"speed,omitempty"`   // Speed: 0.6-1.5 (default: 1.0)
-	Volume  float64 `json:"volume,omitempty"`  // Volume: 0.5-2.0 (default: 1.0)
-	Emotion string  `json:"emotion,omitempty"` // Emotion (neutral, happy, sad, angry, etc.)
-	Format  string  `json:"format,omitempty"`  // Output format: wav, mp3, pcm (default: wav)
+	Voice      string  `json:"voice"`                  // Cartesia voice ID (required)
+	Speed      float64 `json:"speed,omitempty"`        // Speed: 0.6-1.5 (default: 1.0)
+	Volume     float64 `json:"volume,omitempty"`       // Volume: 0.5-2.0 (default: 1.0)
+	Emotion    string  `json:"emotion,omitempty"`      // Emotion (neutral, happy, sad, angry, etc.)
+	Format     string  `json:"format,omitempty"`       // Output format: wav, mp3, pcm (default: wav)
+	SampleRate int     `json:"sample_rate,omitempty"`  // Sample rate in Hz (default: 24000)
 }
 
 // Voice format constants

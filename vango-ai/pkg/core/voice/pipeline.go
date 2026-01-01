@@ -112,12 +112,19 @@ func (p *Pipeline) SynthesizeResponse(ctx context.Context, text string, cfg *typ
 		return nil, nil
 	}
 
+	// Use configured sample rate or default to 44100 Hz
+	sampleRate := cfg.Output.SampleRate
+	if sampleRate == 0 {
+		sampleRate = 44100
+	}
+
 	synth, err := p.ttsProvider.Synthesize(ctx, text, tts.SynthesizeOptions{
-		Voice:   cfg.Output.Voice,
-		Speed:   cfg.Output.Speed,
-		Volume:  cfg.Output.Volume,
-		Emotion: cfg.Output.Emotion,
-		Format:  cfg.Output.Format,
+		Voice:      cfg.Output.Voice,
+		Speed:      cfg.Output.Speed,
+		Volume:     cfg.Output.Volume,
+		Emotion:    cfg.Output.Emotion,
+		Format:     cfg.Output.Format,
+		SampleRate: sampleRate,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("synthesize: %w", err)
@@ -160,17 +167,24 @@ func (p *Pipeline) NewStreamingSynthesizer(ctx context.Context, cfg *types.Voice
 func (s *StreamingSynthesizer) AddText(text string) {
 	sentences := s.buffer.Add(text)
 
+	// Use configured sample rate or default to 44100 Hz
+	sampleRate := s.cfg.Output.SampleRate
+	if sampleRate == 0 {
+		sampleRate = 44100
+	}
+
 	for _, sentence := range sentences {
 		s.wg.Add(1)
 		go func(sent string) {
 			defer s.wg.Done()
 
 			synth, err := s.pipeline.ttsProvider.Synthesize(s.ctx, sent, tts.SynthesizeOptions{
-				Voice:   s.cfg.Output.Voice,
-				Speed:   s.cfg.Output.Speed,
-				Volume:  s.cfg.Output.Volume,
-				Emotion: s.cfg.Output.Emotion,
-				Format:  s.cfg.Output.Format,
+				Voice:      s.cfg.Output.Voice,
+				Speed:      s.cfg.Output.Speed,
+				Volume:     s.cfg.Output.Volume,
+				Emotion:    s.cfg.Output.Emotion,
+				Format:     s.cfg.Output.Format,
+				SampleRate: sampleRate,
 			})
 			if err != nil {
 				return

@@ -22,6 +22,7 @@ type StreamCallbacks struct {
 	// Lifecycle (for RunStream)
 	OnStepStart    func(index int)                    // New step beginning
 	OnStepComplete func(index int, response *Response) // Step finished
+	OnInterrupted  func(partialText string, behavior InterruptBehavior) // Stream was interrupted
 
 	// Errors
 	OnError func(err error)
@@ -104,6 +105,11 @@ func (rs *RunStream) Process(callbacks StreamCallbacks) (string, error) {
 		case ToolResultEvent:
 			if callbacks.OnToolResult != nil {
 				callbacks.OnToolResult(e.ID, e.Name, e.Content, e.Error)
+			}
+
+		case InterruptedEvent:
+			if callbacks.OnInterrupted != nil {
+				callbacks.OnInterrupted(e.PartialText, e.Behavior)
 			}
 
 		case RunCompleteEvent:

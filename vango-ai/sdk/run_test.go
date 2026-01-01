@@ -405,3 +405,384 @@ func TestToolExecutionResult_Structure(t *testing.T) {
 		t.Errorf("len(Content) = %d, want 1", len(result.Content))
 	}
 }
+
+// TestInterruptBehavior_Constants verifies the interrupt behavior enum values.
+func TestInterruptBehavior_Constants(t *testing.T) {
+	if InterruptDiscard != 0 {
+		t.Errorf("InterruptDiscard = %d, want 0", InterruptDiscard)
+	}
+	if InterruptSavePartial != 1 {
+		t.Errorf("InterruptSavePartial = %d, want 1", InterruptSavePartial)
+	}
+	if InterruptSaveMarked != 2 {
+		t.Errorf("InterruptSaveMarked = %d, want 2", InterruptSaveMarked)
+	}
+}
+
+// TestRunStream_InterruptRequest_EmptyMessage tests that empty message is detected correctly.
+func TestRunStream_InterruptRequest_EmptyMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      types.Message
+		isCancel bool
+	}{
+		{
+			name:     "empty message (cancel)",
+			msg:      types.Message{},
+			isCancel: true,
+		},
+		{
+			name:     "empty role but nil content (cancel)",
+			msg:      types.Message{Role: "", Content: nil},
+			isCancel: true,
+		},
+		{
+			name: "has role (interrupt)",
+			msg: types.Message{
+				Role:    "user",
+				Content: nil,
+			},
+			isCancel: false,
+		},
+		{
+			name: "has content (interrupt)",
+			msg: types.Message{
+				Role: "",
+				Content: []types.ContentBlock{
+					types.TextBlock{Type: "text", Text: "test"},
+				},
+			},
+			isCancel: false,
+		},
+		{
+			name: "full message (interrupt)",
+			msg: types.Message{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.TextBlock{Type: "text", Text: "test"},
+				},
+			},
+			isCancel: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isCancel := tt.msg.Role == "" && tt.msg.Content == nil
+			if isCancel != tt.isCancel {
+				t.Errorf("isCancel = %v, want %v", isCancel, tt.isCancel)
+			}
+		})
+	}
+}
+
+// TestRunStream_Interrupt_ClosedStream verifies error handling when interrupting a closed stream.
+func TestRunStream_Interrupt_ClosedStream(t *testing.T) {
+	rs := &RunStream{
+		events:    make(chan RunStreamEvent, 1),
+		done:      make(chan struct{}),
+		interrupt: make(chan interruptRequest, 1),
+	}
+
+	// Close the stream
+	close(rs.done)
+	rs.closed.Store(true)
+
+	// Try to interrupt
+	err := rs.Interrupt(types.Message{
+		Role: "user",
+		Content: []types.ContentBlock{
+			types.TextBlock{Type: "text", Text: "test"},
+		},
+	}, InterruptSaveMarked)
+
+	if err == nil {
+		t.Error("Interrupt() should return error for closed stream")
+	}
+	if err.Error() != "stream already closed" {
+		t.Errorf("Error = %q, want %q", err.Error(), "stream already closed")
+	}
+}
+
+// TestRunStream_Cancel_ClosedStream verifies Cancel returns nil for already-closed stream.
+func TestRunStream_Cancel_ClosedStream(t *testing.T) {
+	rs := &RunStream{
+		events:    make(chan RunStreamEvent, 1),
+		done:      make(chan struct{}),
+		interrupt: make(chan interruptRequest, 1),
+	}
+
+	// Close the stream
+	close(rs.done)
+	rs.closed.Store(true)
+
+	// Cancel should return nil (not error) for already-closed stream
+	err := rs.Cancel()
+	if err != nil {
+		t.Errorf("Cancel() returned error for closed stream: %v", err)
+	}
+}
+
+// TestRunStream_InterruptWithText verifies the convenience method.
+func TestRunStream_InterruptWithText_ClosedStream(t *testing.T) {
+	rs := &RunStream{
+		events:    make(chan RunStreamEvent, 1),
+		done:      make(chan struct{}),
+		interrupt: make(chan interruptRequest, 1),
+	}
+
+	// Close the stream
+	close(rs.done)
+	rs.closed.Store(true)
+
+	// Try to interrupt with text
+	err := rs.InterruptWithText("hello")
+
+	if err == nil {
+		t.Error("InterruptWithText() should return error for closed stream")
+	}
+	if err.Error() != "stream already closed" {
+		t.Errorf("Error = %q, want %q", err.Error(), "stream already closed")
+	}
+}
+
+// TestInterruptedEvent_Structure verifies the InterruptedEvent type.
+func TestInterruptedEvent_Structure(t *testing.T) {
+	event := InterruptedEvent{
+		PartialText: "partial response",
+		Behavior:    InterruptSaveMarked,
+	}
+
+	if event.PartialText != "partial response" {
+		t.Errorf("PartialText = %q, want %q", event.PartialText, "partial response")
+	}
+	if event.Behavior != InterruptSaveMarked {
+		t.Errorf("Behavior = %d, want %d", event.Behavior, InterruptSaveMarked)
+	}
+	if event.runStreamEventType() != "interrupted" {
+		t.Errorf("runStreamEventType() = %q, want %q", event.runStreamEventType(), "interrupted")
+	}
+}
+
+// TestWithLive verifies the WithLive RunOption enables live mode.
+func TestWithLive(t *testing.T) {
+	cfg := defaultRunConfig()
+
+	if cfg.live {
+		t.Error("live should be false by default")
+	}
+
+	WithLive()(&cfg)
+
+	if !cfg.live {
+		t.Error("live should be true after WithLive()")
+	}
+}
+
+// TestWithLiveConfig verifies the WithLiveConfig RunOption.
+func TestWithLiveConfig(t *testing.T) {
+	cfg := defaultRunConfig()
+
+	liveCfg := &LiveConfig{
+		Model:  "anthropic/claude-sonnet-4-20250514",
+		System: "You are a voice assistant.",
+	}
+
+	WithLiveConfig(liveCfg)(&cfg)
+
+	if !cfg.live {
+		t.Error("live should be enabled when WithLiveConfig is used")
+	}
+	if cfg.liveConfig != liveCfg {
+		t.Error("liveConfig should be set")
+	}
+	if cfg.liveConfig.Model != "anthropic/claude-sonnet-4-20250514" {
+		t.Errorf("Model = %q, want %q", cfg.liveConfig.Model, "anthropic/claude-sonnet-4-20250514")
+	}
+}
+
+// TestWithLiveOptions verifies the WithLiveOptions RunOption.
+func TestWithLiveOptions(t *testing.T) {
+	cfg := defaultRunConfig()
+
+	opt := func(ls *LiveStream) {
+		// This option would configure the live stream
+	}
+
+	// WithLiveOptions is a supplementary option that adds to live mode
+	// but doesn't enable it by itself - use with WithLive() or WithLiveConfig()
+	WithLiveOptions(opt)(&cfg)
+
+	if len(cfg.liveOptions) != 1 {
+		t.Errorf("len(liveOptions) = %d, want 1", len(cfg.liveOptions))
+	}
+
+	// Verify it works with WithLive()
+	cfg2 := defaultRunConfig()
+	WithLive()(&cfg2)
+	WithLiveOptions(opt)(&cfg2)
+
+	if !cfg2.live {
+		t.Error("live should be enabled when WithLive() is used")
+	}
+	if len(cfg2.liveOptions) != 1 {
+		t.Errorf("len(liveOptions) = %d, want 1", len(cfg2.liveOptions))
+	}
+}
+
+// TestWithVoiceOutput verifies the WithVoiceOutput RunOption.
+func TestWithVoiceOutput(t *testing.T) {
+	cfg := defaultRunConfig()
+
+	voiceCfg := LiveVoiceOutput{
+		Voice:  "alloy",
+		Speed:  1.2,
+		Format: "pcm",
+	}
+
+	// WithVoiceOutput configures voice but doesn't enable live mode by itself
+	// Use with WithLive() or WithLiveConfig()
+	WithVoiceOutput(voiceCfg)(&cfg)
+
+	if cfg.voiceOutput == nil {
+		t.Fatal("voiceOutput should be set")
+	}
+	if cfg.voiceOutput.Voice != "alloy" {
+		t.Errorf("Voice = %q, want %q", cfg.voiceOutput.Voice, "alloy")
+	}
+	if cfg.voiceOutput.Speed != 1.2 {
+		t.Errorf("Speed = %v, want 1.2", cfg.voiceOutput.Speed)
+	}
+	if cfg.voiceOutput.Format != "pcm" {
+		t.Errorf("Format = %q, want %q", cfg.voiceOutput.Format, "pcm")
+	}
+
+	// Verify it works with WithLive()
+	cfg2 := defaultRunConfig()
+	WithLive()(&cfg2)
+	WithVoiceOutput(voiceCfg)(&cfg2)
+
+	if !cfg2.live {
+		t.Error("live should be enabled when WithLive() is used")
+	}
+	if cfg2.voiceOutput == nil {
+		t.Fatal("voiceOutput should be set")
+	}
+}
+
+// TestWithInterruptConfig verifies the WithInterruptConfig RunOption.
+func TestWithInterruptConfig(t *testing.T) {
+	cfg := defaultRunConfig()
+
+	semanticCheck := true
+	interruptCfg := LiveInterrupt{
+		Mode:            "semantic",
+		EnergyThreshold: 0.5,
+		DebounceMs:      200,
+		SemanticCheck:   &semanticCheck,
+		SemanticModel:   "claude-3-haiku",
+		SavePartial:     "marked",
+	}
+
+	// WithInterruptConfig configures interrupt handling but doesn't enable live mode
+	// Use with WithLive() or WithLiveConfig()
+	WithInterruptConfig(interruptCfg)(&cfg)
+
+	if cfg.interruptConfig == nil {
+		t.Fatal("interruptConfig should be set")
+	}
+	if cfg.interruptConfig.Mode != "semantic" {
+		t.Errorf("Mode = %q, want %q", cfg.interruptConfig.Mode, "semantic")
+	}
+	if cfg.interruptConfig.EnergyThreshold != 0.5 {
+		t.Errorf("EnergyThreshold = %v, want 0.5", cfg.interruptConfig.EnergyThreshold)
+	}
+	if cfg.interruptConfig.DebounceMs != 200 {
+		t.Errorf("DebounceMs = %d, want 200", cfg.interruptConfig.DebounceMs)
+	}
+	if cfg.interruptConfig.SemanticCheck == nil || !*cfg.interruptConfig.SemanticCheck {
+		t.Error("SemanticCheck should be true")
+	}
+	if cfg.interruptConfig.SemanticModel != "claude-3-haiku" {
+		t.Errorf("SemanticModel = %q, want %q", cfg.interruptConfig.SemanticModel, "claude-3-haiku")
+	}
+	if cfg.interruptConfig.SavePartial != "marked" {
+		t.Errorf("SavePartial = %q, want %q", cfg.interruptConfig.SavePartial, "marked")
+	}
+
+	// Verify it works with WithLive()
+	cfg2 := defaultRunConfig()
+	WithLive()(&cfg2)
+	WithInterruptConfig(interruptCfg)(&cfg2)
+
+	if !cfg2.live {
+		t.Error("live should be enabled when WithLive() is used")
+	}
+	if cfg2.interruptConfig == nil {
+		t.Fatal("interruptConfig should be set")
+	}
+}
+
+// TestLiveVoiceOutput_Struct verifies the LiveVoiceOutput struct.
+func TestLiveVoiceOutput_Struct(t *testing.T) {
+	vo := LiveVoiceOutput{
+		Provider: "cartesia",
+		Voice:    "echo",
+		Speed:    1.0,
+		Format:   "wav",
+	}
+
+	if vo.Provider != "cartesia" {
+		t.Errorf("Provider = %q, want %q", vo.Provider, "cartesia")
+	}
+	if vo.Voice != "echo" {
+		t.Errorf("Voice = %q, want %q", vo.Voice, "echo")
+	}
+	if vo.Speed != 1.0 {
+		t.Errorf("Speed = %v, want 1.0", vo.Speed)
+	}
+	if vo.Format != "wav" {
+		t.Errorf("Format = %q, want %q", vo.Format, "wav")
+	}
+}
+
+// TestLiveInterrupt_Struct verifies the LiveInterrupt struct.
+func TestLiveInterrupt_Struct(t *testing.T) {
+	semanticCheck := false
+	li := LiveInterrupt{
+		Mode:            "energy",
+		EnergyThreshold: 0.3,
+		DebounceMs:      100,
+		SemanticCheck:   &semanticCheck,
+		SemanticModel:   "",
+		SavePartial:     "discard",
+	}
+
+	if li.Mode != "energy" {
+		t.Errorf("Mode = %q, want %q", li.Mode, "energy")
+	}
+	if li.EnergyThreshold != 0.3 {
+		t.Errorf("EnergyThreshold = %v, want 0.3", li.EnergyThreshold)
+	}
+	if li.DebounceMs != 100 {
+		t.Errorf("DebounceMs = %d, want 100", li.DebounceMs)
+	}
+	if li.SemanticCheck == nil || *li.SemanticCheck {
+		t.Error("SemanticCheck should be false")
+	}
+	if li.SavePartial != "discard" {
+		t.Errorf("SavePartial = %q, want %q", li.SavePartial, "discard")
+	}
+}
+
+// TestInterruptConfigAlias verifies the InterruptConfig type alias.
+func TestInterruptConfigAlias(t *testing.T) {
+	// Verify InterruptConfig is an alias for LiveInterrupt
+	var ic InterruptConfig = LiveInterrupt{
+		Mode: "semantic",
+	}
+
+	if ic.Mode != "semantic" {
+		t.Errorf("Mode = %q, want %q", ic.Mode, "semantic")
+	}
+}

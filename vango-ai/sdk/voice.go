@@ -5,7 +5,7 @@ import "github.com/vango-ai/vango/pkg/core/types"
 // VoiceInput creates a VoiceConfig with input settings for STT.
 func VoiceInput(opts ...VoiceInputOption) *VoiceConfig {
 	cfg := &VoiceConfig{
-		Input: &VoiceInputConfig{
+		Input: &types.VoiceInputConfig{
 			Model:    "ink-whisper",
 			Language: "en",
 		},
@@ -19,7 +19,7 @@ func VoiceInput(opts ...VoiceInputOption) *VoiceConfig {
 // VoiceOutput creates a VoiceConfig with output settings for TTS.
 func VoiceOutput(voice string, opts ...VoiceOutputOption) *VoiceConfig {
 	cfg := &VoiceConfig{
-		Output: &VoiceOutputConfig{
+		Output: &types.VoiceOutputConfig{
 			Voice:  voice,
 			Speed:  1.0,
 			Volume: 1.0,
@@ -35,11 +35,11 @@ func VoiceOutput(voice string, opts ...VoiceOutputOption) *VoiceConfig {
 // VoiceFull creates a VoiceConfig with both input and output settings.
 func VoiceFull(voice string, opts ...any) *VoiceConfig {
 	cfg := &VoiceConfig{
-		Input: &VoiceInputConfig{
+		Input: &types.VoiceInputConfig{
 			Model:    "ink-whisper",
 			Language: "en",
 		},
-		Output: &VoiceOutputConfig{
+		Output: &types.VoiceOutputConfig{
 			Voice:  voice,
 			Speed:  1.0,
 			Volume: 1.0,

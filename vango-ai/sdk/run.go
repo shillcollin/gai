@@ -24,6 +24,7 @@ const (
 	RunStopMaxTokens    RunStopReason = "max_tokens"     // Hit token limit
 	RunStopTimeout      RunStopReason = "timeout"        // Hit timeout
 	RunStopCustom       RunStopReason = "custom"         // Custom stop condition
+	RunStopCancelled    RunStopReason = "cancelled"      // Cancelled by user
 	RunStopError        RunStopReason = "error"          // Error occurred
 )
 
@@ -78,6 +79,13 @@ type runConfig struct {
 	onStop        func(*RunResult)
 	parallelTools bool
 	toolTimeout   time.Duration
+
+	// Live mode configuration
+	live            bool
+	liveConfig      *LiveConfig
+	liveOptions     []LiveStreamOption
+	voiceOutput     *LiveVoiceOutput
+	interruptConfig *LiveInterrupt
 }
 
 // defaultRunConfig returns the default run configuration.
@@ -197,6 +205,103 @@ func WithParallelTools(enabled bool) RunOption {
 // Default is 30 seconds.
 func WithToolTimeout(d time.Duration) RunOption {
 	return func(c *runConfig) { c.toolTimeout = d }
+}
+
+// --- Live Mode Options ---
+
+// LiveVoiceOutput configures text-to-speech output for live mode.
+type LiveVoiceOutput struct {
+	Provider string  `json:"provider,omitempty"` // e.g., "cartesia", "elevenlabs"
+	Voice    string  `json:"voice"`
+	Speed    float64 `json:"speed,omitempty"`
+	Format   string  `json:"format,omitempty"`
+}
+
+// LiveInterrupt configures barge-in detection for live mode.
+type LiveInterrupt struct {
+	// Mode is the interrupt detection mode: "auto", "manual", or "disabled".
+	Mode string `json:"mode,omitempty"`
+
+	// EnergyThreshold for detecting potential interrupt (default: 0.05).
+	EnergyThreshold float64 `json:"energy_threshold,omitempty"`
+
+	// DebounceMs is the minimum sustained speech before check (default: 100).
+	DebounceMs int `json:"debounce_ms,omitempty"`
+
+	// SemanticCheck enables distinguishing interrupts from backchannels (default: true).
+	SemanticCheck *bool `json:"semantic_check,omitempty"`
+
+	// SemanticModel is the fast LLM for interrupt detection.
+	SemanticModel string `json:"semantic_model,omitempty"`
+
+	// SavePartial specifies how to handle partial response: "discard", "save", or "marked".
+	SavePartial string `json:"save_partial,omitempty"`
+}
+
+// InterruptConfig is an alias for LiveInterrupt for backwards compatibility.
+type InterruptConfig = LiveInterrupt
+
+// WithLive enables real-time bidirectional mode for the run stream.
+// When enabled, the RunStream connects via WebSocket and supports
+// sending/receiving audio, transcripts, and real-time events.
+//
+// Example:
+//
+//	stream, err := client.Messages.RunStream(ctx, req, vango.WithLive())
+func WithLive() RunOption {
+	return func(c *runConfig) {
+		c.live = true
+	}
+}
+
+// WithLiveConfig provides full live session configuration.
+func WithLiveConfig(cfg *LiveConfig) RunOption {
+	return func(c *runConfig) {
+		c.live = true
+		c.liveConfig = cfg
+	}
+}
+
+// WithLiveOptions adds LiveStream options when in live mode.
+func WithLiveOptions(opts ...LiveStreamOption) RunOption {
+	return func(c *runConfig) {
+		c.liveOptions = append(c.liveOptions, opts...)
+	}
+}
+
+// WithVoiceOutput configures text-to-speech output.
+// This enables audio output from the model's responses.
+//
+// Example:
+//
+//	stream, err := client.Messages.RunStream(ctx, req,
+//	    vango.WithLive(),
+//	    vango.WithVoiceOutput(vango.LiveVoiceOutput{
+//	        Provider: "cartesia",
+//	        Voice:    "a0e99841-438c-4a64-b679-ae501e7d6091",
+//	    }),
+//	)
+func WithVoiceOutput(cfg LiveVoiceOutput) RunOption {
+	return func(c *runConfig) {
+		c.voiceOutput = &cfg
+	}
+}
+
+// WithInterruptConfig configures interrupt (barge-in) detection.
+//
+// Example:
+//
+//	stream, err := client.Messages.RunStream(ctx, req,
+//	    vango.WithLive(),
+//	    vango.WithInterruptConfig(vango.LiveInterrupt{
+//	        Mode:          "auto",
+//	        SemanticCheck: ptrBool(true),
+//	    }),
+//	)
+func WithInterruptConfig(cfg LiveInterrupt) RunOption {
+	return func(c *runConfig) {
+		c.interruptConfig = &cfg
+	}
 }
 
 // --- Run Loop Implementation ---
@@ -481,6 +586,31 @@ func (s *MessagesService) executeToolCall(ctx context.Context, toolUse types.Too
 	return result
 }
 
+// systemToString converts the System field to a string.
+func systemToString(system any) string {
+	if system == nil {
+		return ""
+	}
+	switch v := system.(type) {
+	case string:
+		return v
+	case []types.ContentBlock:
+		var parts []string
+		for _, block := range v {
+			if textBlock, ok := block.(types.TextBlock); ok {
+				parts = append(parts, textBlock.Text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		// Try to convert to string
+		if s, ok := system.(fmt.Stringer); ok {
+			return s.String()
+		}
+		return fmt.Sprintf("%v", system)
+	}
+}
+
 // outputToContentBlocks converts tool output to content blocks.
 func outputToContentBlocks(output any) []types.ContentBlock {
 	switch v := output.(type) {
@@ -508,14 +638,49 @@ func outputToContentBlocks(output any) []types.ContentBlock {
 
 // --- RunStream Implementation ---
 
-// RunStream wraps a streaming tool execution loop.
+// InterruptBehavior specifies how to handle partial responses when interrupted.
+type InterruptBehavior int
+
+const (
+	// InterruptDiscard discards the partial response, don't add to history.
+	InterruptDiscard InterruptBehavior = iota
+
+	// InterruptSavePartial saves the partial response as-is to history.
+	InterruptSavePartial
+
+	// InterruptSaveMarked saves with [interrupted] marker so model knows.
+	InterruptSaveMarked
+)
+
+// interruptRequest is sent through the interrupt channel.
+type interruptRequest struct {
+	message  types.Message
+	behavior InterruptBehavior
+	result   chan error
+}
+
+// RunStream wraps a streaming tool execution loop with interrupt support.
 type RunStream struct {
+	// State protected by mutex
+	mu             sync.RWMutex
+	messages       []types.Message
+	currentStream  *Stream
+	partialContent strings.Builder
+
+	// Channels
 	events    chan RunStreamEvent
+	interrupt chan interruptRequest
+	done      chan struct{}
+
+	// Result state
 	result    *RunResult
 	err       error
 	closed    atomic.Bool
-	done      chan struct{}
 	closeOnce sync.Once
+
+	// Live mode state
+	liveMode   bool
+	liveStream *LiveStream
 }
 
 // RunStreamEvent is an event from the RunStream.
@@ -579,6 +744,76 @@ type AudioChunkEvent struct {
 
 func (e AudioChunkEvent) runStreamEventType() string { return "audio_chunk" }
 
+// InterruptedEvent signals that the stream was interrupted.
+type InterruptedEvent struct {
+	PartialText string            `json:"partial_text,omitempty"`
+	Behavior    InterruptBehavior `json:"behavior"`
+}
+
+func (e InterruptedEvent) runStreamEventType() string { return "interrupted" }
+
+// Cancel stops the current stream immediately without injecting a new message.
+// The run loop will terminate and control returns to the caller.
+// This method is safe to call from any goroutine.
+func (rs *RunStream) Cancel() error {
+	// Check if already done first to avoid blocking
+	select {
+	case <-rs.done:
+		return nil // Already done
+	default:
+	}
+
+	req := interruptRequest{
+		message:  types.Message{}, // Empty message signals termination
+		behavior: InterruptDiscard,
+		result:   make(chan error, 1),
+	}
+
+	select {
+	case rs.interrupt <- req:
+		return <-req.result
+	case <-rs.done:
+		return nil // Closed while we were waiting
+	}
+}
+
+// Interrupt stops the current stream, saves the partial response according to behavior,
+// injects a new message, and continues the conversation.
+// This is the primary mechanism for barge-in handling in Live mode.
+// This method is safe to call from any goroutine.
+func (rs *RunStream) Interrupt(msg types.Message, behavior InterruptBehavior) error {
+	// Check if already done first to avoid blocking
+	select {
+	case <-rs.done:
+		return fmt.Errorf("stream already closed")
+	default:
+	}
+
+	req := interruptRequest{
+		message:  msg,
+		behavior: behavior,
+		result:   make(chan error, 1),
+	}
+
+	select {
+	case rs.interrupt <- req:
+		return <-req.result
+	case <-rs.done:
+		return fmt.Errorf("stream already closed")
+	}
+}
+
+// InterruptWithText is a convenience method for interrupting with a text message.
+// Uses InterruptSaveMarked behavior by default.
+func (rs *RunStream) InterruptWithText(text string) error {
+	return rs.Interrupt(types.Message{
+		Role: "user",
+		Content: []types.ContentBlock{
+			types.TextBlock{Type: "text", Text: text},
+		},
+	}, InterruptSaveMarked)
+}
+
 // voiceStreamer manages text batching and TTS streaming.
 type voiceStreamer struct {
 	ttsCtx     *tts.StreamingContext
@@ -604,7 +839,7 @@ func newVoiceStreamer(ttsCtx *tts.StreamingContext, format string, sendEvents fu
 		sendEvents:   sendEvents,
 		format:       format,
 		done:         make(chan struct{}),
-		maxChars:     80,             // Send every ~80 chars
+		maxChars:     80,                     // Send every ~80 chars
 		maxDelay:     150 * time.Millisecond, // Or after 150ms
 		sentenceEnds: ".!?",
 	}
@@ -719,13 +954,107 @@ func (vs *voiceStreamer) forwardAudio() {
 
 // runStreamLoop executes the streaming tool loop.
 func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest, cfg *runConfig) *RunStream {
+	// Copy messages to avoid mutating the original
+	messages := make([]types.Message, len(req.Messages))
+	copy(messages, req.Messages)
+
 	rs := &RunStream{
-		events: make(chan RunStreamEvent, 100),
-		done:   make(chan struct{}),
+		messages:  messages,
+		events:    make(chan RunStreamEvent, 100),
+		interrupt: make(chan interruptRequest, 1),
+		done:      make(chan struct{}),
 	}
 
-	go rs.run(ctx, s, req, cfg)
+	// Check for live mode
+	if cfg.live {
+		rs.liveMode = true
+		go rs.runLive(ctx, s, req, cfg)
+	} else {
+		go rs.run(ctx, s, req, cfg)
+	}
 	return rs
+}
+
+// runLive executes the live mode run loop using WebSocket.
+func (rs *RunStream) runLive(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig) {
+	defer rs.closeOnce.Do(func() {
+		close(rs.events)
+		close(rs.done)
+	})
+
+	// Build LiveConfig from request and config
+	liveCfg := cfg.liveConfig
+	if liveCfg == nil {
+		liveCfg = &LiveConfig{
+			Model:  req.Model,
+			System: systemToString(req.System),
+		}
+	} else {
+		// Use request values if not specified in liveConfig
+		if liveCfg.Model == "" {
+			liveCfg.Model = req.Model
+		}
+		if liveCfg.System == "" {
+			liveCfg.System = systemToString(req.System)
+		}
+	}
+
+	// Apply voice output config
+	if cfg.voiceOutput != nil {
+		if liveCfg.Voice == nil {
+			liveCfg.Voice = &LiveVoiceConfig{}
+		}
+		liveCfg.Voice.Output = &LiveVoiceOutputConfig{
+			Provider: cfg.voiceOutput.Provider,
+			Voice:    cfg.voiceOutput.Voice,
+			Speed:    cfg.voiceOutput.Speed,
+			Format:   cfg.voiceOutput.Format,
+		}
+	}
+
+	// Apply interrupt config
+	if cfg.interruptConfig != nil {
+		if liveCfg.Voice == nil {
+			liveCfg.Voice = &LiveVoiceConfig{}
+		}
+		liveCfg.Voice.Interrupt = &LiveInterruptConfig{
+			Mode:            LiveInterruptMode(cfg.interruptConfig.Mode),
+			EnergyThreshold: cfg.interruptConfig.EnergyThreshold,
+			DebounceMs:      cfg.interruptConfig.DebounceMs,
+			SemanticCheck:   cfg.interruptConfig.SemanticCheck,
+			SemanticModel:   cfg.interruptConfig.SemanticModel,
+			SavePartial:     LiveSaveBehavior(cfg.interruptConfig.SavePartial),
+		}
+	}
+
+	// Copy tools from request
+	liveCfg.Tools = req.Tools
+
+	// Build options - add tool handlers
+	opts := cfg.liveOptions
+	if len(cfg.toolHandlers) > 0 {
+		for name, handler := range cfg.toolHandlers {
+			opts = append(opts, WithLiveToolHandler(name, handler))
+		}
+	}
+
+	// Create the live stream
+	liveStream, err := svc.Live(ctx, liveCfg, opts...)
+	if err != nil {
+		rs.err = err
+		return
+	}
+	rs.liveStream = liveStream
+
+	// Forward live events to the RunStream events channel
+	go func() {
+		for event := range liveStream.Events() {
+			rs.forwardLiveEvent(event)
+		}
+	}()
+
+	// Wait for the live stream to close
+	<-liveStream.Done()
 }
 
 func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig) {
@@ -737,10 +1066,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 	result := &RunResult{
 		Steps: make([]RunStep, 0),
 	}
-
-	// Create working copy of messages
-	messages := make([]types.Message, len(req.Messages))
-	copy(messages, req.Messages)
 
 	// Apply timeout
 	if cfg.timeout > 0 {
@@ -777,6 +1102,14 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 
 	stepIndex := 0
 
+	// Track tool blocks as they're being built (persists across turns for interrupt recovery)
+	type pendingTool struct {
+		id        string
+		name      string
+		inputJSON strings.Builder
+		emitted   bool
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -807,10 +1140,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		// Signal step start
 		rs.send(StepStartEvent{Index: stepIndex})
 
-		// Build request
+		// Build request using rs.messages (can be modified by interrupt)
+		rs.mu.RLock()
 		turnReq := &types.MessageRequest{
 			Model:         req.Model,
-			Messages:      messages,
+			Messages:      rs.messages,
 			MaxTokens:     req.MaxTokens,
 			System:        req.System,
 			Temperature:   req.Temperature,
@@ -826,6 +1160,7 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			Extensions:    req.Extensions,
 			Metadata:      req.Metadata,
 		}
+		rs.mu.RUnlock()
 
 		if cfg.beforeCall != nil {
 			cfg.beforeCall(turnReq)
@@ -842,94 +1177,171 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			return
 		}
 
-		// Track tool blocks as they're being built
-		type pendingTool struct {
-			id        string
-			name      string
-			inputJSON strings.Builder // Accumulate input JSON from deltas
-			emitted   bool            // Whether we've emitted the start event
-		}
-		pendingTools := make(map[int]*pendingTool) // index -> tool info
+		// Store current stream for interrupt access
+		rs.mu.Lock()
+		rs.currentStream = stream
+		rs.partialContent.Reset()
+		rs.mu.Unlock()
 
-		// Forward stream events and extract text for voice
-		for event := range stream.Events() {
-			rs.send(StreamEventWrapper{Event: event})
+		pendingTools := make(map[int]*pendingTool)
 
-			// Detect tool calls from content_block_start events
-			if startEvent, ok := event.(types.ContentBlockStartEvent); ok {
-				switch block := startEvent.ContentBlock.(type) {
-				case types.ToolUseBlock:
-					// Client-side tool use (will be executed by SDK)
-					pendingTools[startEvent.Index] = &pendingTool{
-						id:   block.ID,
-						name: block.Name,
-					}
-					// Emit start event immediately (input may be empty, will be filled via deltas)
-					rs.send(ToolCallStartEvent{ID: block.ID, Name: block.Name, Input: block.Input})
-					pendingTools[startEvent.Index].emitted = true
+		// Process stream events with cancel support using select
+	streamLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				stream.Close()
+				result.StopReason = RunStopTimeout
+				rs.result = result
+				rs.err = ctx.Err()
+				return
 
-				case types.ServerToolUseBlock:
-					// Server-side tool use (executed by Anthropic - e.g., web_search)
-					pendingTools[startEvent.Index] = &pendingTool{
-						id:   block.ID,
-						name: block.Name,
-					}
-					// Emit start event immediately for real-time feedback
-					rs.send(ToolCallStartEvent{ID: block.ID, Name: block.Name, Input: block.Input})
-					pendingTools[startEvent.Index].emitted = true
+			case intReq := <-rs.interrupt:
+				// Stop current stream immediately
+				stream.Close()
 
-				case types.WebSearchToolResultBlock:
-					// Server-side tool result - convert to content blocks for display
-					var resultContent []types.ContentBlock
-					if len(block.Content) > 0 {
-						// Create a summary of search results
-						var summary strings.Builder
-						summary.WriteString(fmt.Sprintf("Found %d results", len(block.Content)))
-						resultContent = []types.ContentBlock{
-							types.TextBlock{Type: "text", Text: summary.String()},
+				rs.mu.Lock()
+				partialText := rs.partialContent.String()
+				rs.currentStream = nil
+				rs.partialContent.Reset()
+
+				// Check if this is Cancel (empty message) or Interrupt (has message)
+				isCancel := intReq.message.Role == "" && intReq.message.Content == nil
+
+				if !isCancel {
+					// Interrupt scenario: Save partial and inject new message
+
+					// Handle partial response based on behavior
+					switch intReq.behavior {
+					case InterruptSavePartial:
+						if partialText != "" {
+							rs.messages = append(rs.messages, types.Message{
+								Role: "assistant",
+								Content: []types.ContentBlock{
+									types.TextBlock{Type: "text", Text: partialText},
+								},
+							})
 						}
-					}
-					rs.send(ToolResultEvent{
-						ID:      block.ToolUseID,
-						Name:    "web_search",
-						Content: resultContent,
-					})
-				}
-			}
-
-			// Accumulate tool input from input_json_delta events
-			if deltaEvent, ok := event.(types.ContentBlockDeltaEvent); ok {
-				if inputDelta, ok := deltaEvent.Delta.(types.InputJSONDelta); ok {
-					if pt, exists := pendingTools[deltaEvent.Index]; exists {
-						pt.inputJSON.WriteString(inputDelta.PartialJSON)
-					}
-				}
-			}
-
-			// Emit tool call start when block completes (with full input)
-			if stopEvent, ok := event.(types.ContentBlockStopEvent); ok {
-				if pt, exists := pendingTools[stopEvent.Index]; exists {
-					if !pt.emitted {
-						// Parse accumulated input JSON
-						var input map[string]any
-						if pt.inputJSON.Len() > 0 {
-							json.Unmarshal([]byte(pt.inputJSON.String()), &input)
+					case InterruptSaveMarked:
+						if partialText != "" {
+							rs.messages = append(rs.messages, types.Message{
+								Role: "assistant",
+								Content: []types.ContentBlock{
+									types.TextBlock{Type: "text", Text: partialText + " [interrupted]"},
+								},
+							})
 						}
-						rs.send(ToolCallStartEvent{ID: pt.id, Name: pt.name, Input: input})
+					case InterruptDiscard:
+						// Don't save partial response
 					}
-					delete(pendingTools, stopEvent.Index)
-				}
-			}
 
-			// Feed text deltas to voice streamer
-			if voiceStream != nil {
+					// Inject the new message
+					rs.messages = append(rs.messages, intReq.message)
+				}
+				rs.mu.Unlock()
+
+				// Notify caller
+				intReq.result <- nil
+
+				if isCancel {
+					// Cancel: Terminate the run loop
+					rs.send(InterruptedEvent{PartialText: partialText, Behavior: InterruptDiscard})
+					result.StopReason = RunStopCancelled
+					rs.result = result
+					finishVoice()
+					rs.send(RunCompleteEvent{Result: result})
+					return
+				}
+
+				// Interrupt: Continue to next turn
+				rs.send(InterruptedEvent{PartialText: partialText, Behavior: intReq.behavior})
+				finishVoice()
+				break streamLoop
+
+			case event, ok := <-stream.Events():
+				if !ok {
+					// Stream ended normally
+					break streamLoop
+				}
+
+				rs.send(StreamEventWrapper{Event: event})
+
+				// Track partial text content for potential interruption
 				if deltaEvent, ok := event.(types.ContentBlockDeltaEvent); ok {
 					if textDelta, ok := deltaEvent.Delta.(types.TextDelta); ok {
-						voiceStream.AddText(textDelta.Text)
+						rs.mu.Lock()
+						rs.partialContent.WriteString(textDelta.Text)
+						rs.mu.Unlock()
+
+						// Feed text deltas to voice streamer
+						if voiceStream != nil {
+							voiceStream.AddText(textDelta.Text)
+						}
+					}
+					// Accumulate tool input from input_json_delta events
+					if inputDelta, ok := deltaEvent.Delta.(types.InputJSONDelta); ok {
+						if pt, exists := pendingTools[deltaEvent.Index]; exists {
+							pt.inputJSON.WriteString(inputDelta.PartialJSON)
+						}
+					}
+				}
+
+				// Detect tool calls from content_block_start events
+				if startEvent, ok := event.(types.ContentBlockStartEvent); ok {
+					switch block := startEvent.ContentBlock.(type) {
+					case types.ToolUseBlock:
+						pendingTools[startEvent.Index] = &pendingTool{
+							id:   block.ID,
+							name: block.Name,
+						}
+						rs.send(ToolCallStartEvent{ID: block.ID, Name: block.Name, Input: block.Input})
+						pendingTools[startEvent.Index].emitted = true
+
+					case types.ServerToolUseBlock:
+						pendingTools[startEvent.Index] = &pendingTool{
+							id:   block.ID,
+							name: block.Name,
+						}
+						rs.send(ToolCallStartEvent{ID: block.ID, Name: block.Name, Input: block.Input})
+						pendingTools[startEvent.Index].emitted = true
+
+					case types.WebSearchToolResultBlock:
+						var resultContent []types.ContentBlock
+						if len(block.Content) > 0 {
+							var summary strings.Builder
+							summary.WriteString(fmt.Sprintf("Found %d results", len(block.Content)))
+							resultContent = []types.ContentBlock{
+								types.TextBlock{Type: "text", Text: summary.String()},
+							}
+						}
+						rs.send(ToolResultEvent{
+							ID:      block.ToolUseID,
+							Name:    "web_search",
+							Content: resultContent,
+						})
+					}
+				}
+
+				// Emit tool call start when block completes (with full input)
+				if stopEvent, ok := event.(types.ContentBlockStopEvent); ok {
+					if pt, exists := pendingTools[stopEvent.Index]; exists {
+						if !pt.emitted {
+							var input map[string]any
+							if pt.inputJSON.Len() > 0 {
+								json.Unmarshal([]byte(pt.inputJSON.String()), &input)
+							}
+							rs.send(ToolCallStartEvent{ID: pt.id, Name: pt.name, Input: input})
+						}
+						delete(pendingTools, stopEvent.Index)
 					}
 				}
 			}
 		}
+
+		// Clear current stream reference
+		rs.mu.Lock()
+		rs.currentStream = nil
+		rs.mu.Unlock()
 
 		// EOF is normal stream termination, not an error
 		if streamErr := stream.Err(); streamErr != nil && streamErr != io.EOF {
@@ -1030,7 +1442,8 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		rs.send(StepCompleteEvent{Index: stepIndex, Response: resp})
 
 		// Append messages for next turn
-		messages = append(messages, types.Message{
+		rs.mu.Lock()
+		rs.messages = append(rs.messages, types.Message{
 			Role:    "assistant",
 			Content: resp.Content,
 		})
@@ -1044,10 +1457,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 				IsError:   tr.Error != nil,
 			}
 		}
-		messages = append(messages, types.Message{
+		rs.messages = append(rs.messages, types.Message{
 			Role:    "user",
 			Content: toolResultBlocks,
 		})
+		rs.mu.Unlock()
 
 		stepIndex++
 	}
@@ -1085,10 +1499,144 @@ func (rs *RunStream) Close() error {
 	if rs.closed.Swap(true) {
 		return nil
 	}
+	// Close live stream if in live mode
+	if rs.liveStream != nil {
+		rs.liveStream.Close()
+	}
 	// Only close done channel once; the closeOnce ensures this
 	// Note: done might already be closed by run() goroutine via closeOnce
 	rs.closeOnce.Do(func() {
 		close(rs.done)
 	})
 	return nil
+}
+
+// --- Live Mode Methods ---
+
+// IsLive returns true if the stream is in live mode.
+func (rs *RunStream) IsLive() bool {
+	return rs.liveMode
+}
+
+// SendAudio sends audio data to the live session.
+// Only available when WithLive() is used.
+// Audio should be 16-bit PCM at 24kHz mono.
+func (rs *RunStream) SendAudio(data []byte) error {
+	if !rs.liveMode || rs.liveStream == nil {
+		return fmt.Errorf("SendAudio requires live mode (use WithLive())")
+	}
+	return rs.liveStream.SendAudio(data)
+}
+
+// SendText sends text input to the live session.
+// Only available when WithLive() is used.
+func (rs *RunStream) SendText(text string) error {
+	if !rs.liveMode || rs.liveStream == nil {
+		return fmt.Errorf("SendText in live mode requires WithLive()")
+	}
+	return rs.liveStream.SendText(text)
+}
+
+// Commit forces the end of the current user turn in live mode.
+// Use this for push-to-talk mode.
+func (rs *RunStream) Commit() error {
+	if !rs.liveMode || rs.liveStream == nil {
+		return fmt.Errorf("Commit requires live mode (use WithLive())")
+	}
+	return rs.liveStream.Commit()
+}
+
+// LiveInterrupt forces an interrupt in live mode, skipping semantic check.
+func (rs *RunStream) LiveInterrupt(transcript string) error {
+	if !rs.liveMode || rs.liveStream == nil {
+		return fmt.Errorf("LiveInterrupt requires live mode (use WithLive())")
+	}
+	return rs.liveStream.Interrupt(transcript)
+}
+
+// Audio returns the channel of TTS audio output in live mode.
+// Returns nil if not in live mode.
+func (rs *RunStream) Audio() <-chan []byte {
+	if !rs.liveMode || rs.liveStream == nil {
+		return nil
+	}
+	return rs.liveStream.Audio()
+}
+
+// LiveEvents returns the channel of live-specific events.
+// Returns nil if not in live mode.
+func (rs *RunStream) LiveEvents() <-chan LiveEvent {
+	if !rs.liveMode || rs.liveStream == nil {
+		return nil
+	}
+	return rs.liveStream.Events()
+}
+
+// SessionID returns the live session identifier.
+// Returns empty string if not in live mode.
+func (rs *RunStream) SessionID() string {
+	if !rs.liveMode || rs.liveStream == nil {
+		return ""
+	}
+	return rs.liveStream.SessionID()
+}
+
+// LiveEventWrapper wraps a LiveEvent as a RunStreamEvent for forwarding.
+type LiveEventWrapper struct {
+	Event LiveEvent
+}
+
+func (e LiveEventWrapper) runStreamEventType() string { return "live_event" }
+
+// forwardLiveEvent converts live events to RunStream events.
+// All events are forwarded - some are converted to specific RunStreamEvent types,
+// others are wrapped in LiveEventWrapper.
+func (rs *RunStream) forwardLiveEvent(event LiveEvent) {
+	switch e := event.(type) {
+	case LiveTextDeltaEvent:
+		// Forward as a stream event wrapper with text delta
+		rs.send(StreamEventWrapper{
+			Event: types.ContentBlockDeltaEvent{
+				Type:  "content_block_delta",
+				Index: 0,
+				Delta: types.TextDelta{
+					Type: "text_delta",
+					Text: e.Text,
+				},
+			},
+		})
+
+	case LiveToolCallEvent:
+		rs.send(ToolCallStartEvent{
+			ID:    e.ID,
+			Name:  e.Name,
+			Input: e.Input,
+		})
+
+	case LiveMessageStopEvent:
+		rs.send(StepCompleteEvent{
+			Index: 0,
+		})
+
+	case LiveErrorEvent:
+		rs.send(StreamEventWrapper{
+			Event: types.ErrorEvent{
+				Type: "error",
+				Error: types.Error{
+					Type:    e.Code,
+					Message: e.Message,
+				},
+			},
+		})
+
+	case LiveAudioEvent:
+		rs.send(AudioChunkEvent{
+			Data:   e.Data,
+			Format: e.Format,
+		})
+
+	default:
+		// Forward all other live events wrapped for type-safe access
+		rs.send(LiveEventWrapper{Event: event})
+	}
 }
