@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,15 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/vango-ai/vango/pkg/core/live"
 )
+
+func requireTCPListen(t testing.TB) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("skipping test: TCP listen not permitted in this environment: %v", err)
+	}
+	ln.Close()
+}
 
 // mockLiveServer creates a test WebSocket server for live sessions.
 type mockLiveServer struct {
@@ -27,7 +37,8 @@ type mockLiveServer struct {
 	onBinary  func(*websocket.Conn, []byte)
 }
 
-func newMockLiveServer() *mockLiveServer {
+func newMockLiveServer(t testing.TB) *mockLiveServer {
+	requireTCPListen(t)
 	m := &mockLiveServer{
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
@@ -93,7 +104,7 @@ func (m *mockLiveServer) sendBinary(conn *websocket.Conn, data []byte) error {
 
 // TestLiveStreamConnect tests basic WebSocket connection.
 func TestLiveStreamConnect(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	sessionCreated := make(chan bool, 1)
@@ -160,7 +171,7 @@ func TestLiveStreamConnect(t *testing.T) {
 
 // TestLiveStreamSendText tests sending text input.
 func TestLiveStreamSendText(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	textReceived := make(chan string, 1)
@@ -210,7 +221,7 @@ func TestLiveStreamSendText(t *testing.T) {
 
 // TestLiveStreamSendAudio tests sending audio data.
 func TestLiveStreamSendAudio(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	audioReceived := make(chan []byte, 1)
@@ -258,7 +269,7 @@ func TestLiveStreamSendAudio(t *testing.T) {
 
 // TestLiveStreamReceiveAudio tests receiving audio output.
 func TestLiveStreamReceiveAudio(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	server.onMessage = func(conn *websocket.Conn, data []byte) {
@@ -301,7 +312,7 @@ func TestLiveStreamReceiveAudio(t *testing.T) {
 
 // TestLiveStreamEvents tests event handling.
 func TestLiveStreamEvents(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	server.onMessage = func(conn *websocket.Conn, data []byte) {
@@ -417,7 +428,7 @@ eventLoop:
 
 // TestLiveStreamToolHandler tests automatic tool execution.
 func TestLiveStreamToolHandler(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	toolResultReceived := make(chan map[string]interface{}, 1)
@@ -473,7 +484,7 @@ func TestLiveStreamToolHandler(t *testing.T) {
 
 // TestLiveStreamInterrupt tests interrupt functionality.
 func TestLiveStreamInterrupt(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	interruptReceived := make(chan string, 1)
@@ -521,7 +532,7 @@ func TestLiveStreamInterrupt(t *testing.T) {
 
 // TestLiveStreamCallbacks tests connection callbacks.
 func TestLiveStreamCallbacks(t *testing.T) {
-	server := newMockLiveServer()
+	server := newMockLiveServer(t)
 	defer server.Close()
 
 	server.onMessage = func(conn *websocket.Conn, data []byte) {
@@ -655,11 +666,11 @@ func TestSplitAudioIntoChunks(t *testing.T) {
 // TestEventTypeHelpers tests event type helper functions.
 func TestEventTypeHelpers(t *testing.T) {
 	tests := []struct {
-		event    LiveEvent
-		isAudio  bool
-		isText   bool
-		isTool   bool
-		isError  bool
+		event       LiveEvent
+		isAudio     bool
+		isText      bool
+		isTool      bool
+		isError     bool
 		isInterrupt bool
 	}{
 		{LiveAudioEvent{Data: []byte{1, 2, 3}}, true, false, false, false, false},

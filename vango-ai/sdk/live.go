@@ -14,8 +14,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/vango-ai/vango/pkg/core/live"
+	liveadapters "github.com/vango-ai/vango/pkg/core/live/adapters"
 	"github.com/vango-ai/vango/pkg/core/types"
-	"github.com/vango-ai/vango/pkg/core/voice/stt"
+	"github.com/vango-ai/vango/pkg/core/voice/tts"
 )
 
 // LiveConfig configures a real-time bidirectional session.
@@ -157,10 +158,6 @@ type LiveStream struct {
 
 	// Direct mode adapter (nil for proxy mode)
 	directAdapter *directSessionAdapter
-
-	// Pending text for direct mode (accumulated via SendText, flushed on Commit)
-	pendingTextBuffer strings.Builder
-	pendingTextMu     sync.Mutex
 
 	// Callbacks
 	onError      func(error)
@@ -414,10 +411,11 @@ func convertVoiceConfig(vc *LiveVoiceConfig) *live.VoiceConfig {
 
 	if vc.Output != nil {
 		result.Output = &live.VoiceOutputConfig{
-			Provider: vc.Output.Provider,
-			Voice:    vc.Output.Voice,
-			Speed:    vc.Output.Speed,
-			Format:   vc.Output.Format,
+			Provider:   vc.Output.Provider,
+			Voice:      vc.Output.Voice,
+			Speed:      vc.Output.Speed,
+			Format:     vc.Output.Format,
+			SampleRate: vc.Output.SampleRate,
 		}
 	}
 
@@ -745,9 +743,9 @@ func (ls *LiveStream) SendAudio(data []byte) error {
 		return fmt.Errorf("stream closed")
 	}
 
-	// Direct mode: forward to STT streaming session
+	// Direct mode: feed audio into the in-process session.
 	if ls.directAdapter != nil {
-		return ls.directAdapter.sendAudio(data)
+		return ls.directAdapter.session.EnqueueAudio(data)
 	}
 
 	// Proxy mode: send via WebSocket
@@ -756,42 +754,12 @@ func (ls *LiveStream) SendAudio(data []byte) error {
 	return ls.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
-// sendAudio forwards audio to the STT session.
-func (a *directSessionAdapter) sendAudio(data []byte) error {
-	a.sttMu.Lock()
-	session := a.sttSession
-	a.sttMu.Unlock()
-
-	if session != nil {
-		// Forward to STT for real-time transcription
-		return session.SendAudio(data)
-	}
-
-	// No STT session - buffer audio (fallback for potential batch transcription)
-	a.audioMu.Lock()
-	a.audioBuffer = append(a.audioBuffer, data...)
-	// Limit buffer size to prevent memory issues (keep last ~5 seconds at 16kHz)
-	maxSize := 16000 * 2 * 5 // 16kHz * 2 bytes * 5 seconds
-	if len(a.audioBuffer) > maxSize {
-		a.audioBuffer = a.audioBuffer[len(a.audioBuffer)-maxSize:]
-	}
-	a.audioMu.Unlock()
-
-	return nil
-}
-
 // SendText sends text input to the session.
 // This can be used for testing or text-based input.
 func (ls *LiveStream) SendText(text string) error {
-	// Direct mode: accumulate text for processing on Commit
+	// Direct mode: forward to the in-process session.
 	if ls.directAdapter != nil {
-		ls.pendingTextMu.Lock()
-		if ls.pendingTextBuffer.Len() > 0 {
-			ls.pendingTextBuffer.WriteString(" ")
-		}
-		ls.pendingTextBuffer.WriteString(text)
-		ls.pendingTextMu.Unlock()
-		return nil
+		return ls.directAdapter.session.EnqueueText(text)
 	}
 
 	// Proxy mode: send via WebSocket
@@ -804,20 +772,9 @@ func (ls *LiveStream) SendText(text string) error {
 // Commit forces the end of the current user turn.
 // Use this for push-to-talk mode.
 func (ls *LiveStream) Commit() error {
-	// Direct mode: flush pending text to adapter
+	// Direct mode: force commit in the in-process session.
 	if ls.directAdapter != nil {
-		ls.pendingTextMu.Lock()
-		text := strings.TrimSpace(ls.pendingTextBuffer.String())
-		ls.pendingTextBuffer.Reset()
-		ls.pendingTextMu.Unlock()
-
-		if text != "" {
-			select {
-			case ls.directAdapter.pendingText <- text:
-			case <-ls.done:
-				return fmt.Errorf("stream closed")
-			}
-		}
+		ls.directAdapter.session.ForceCommit()
 		return nil
 	}
 
@@ -830,6 +787,10 @@ func (ls *LiveStream) Commit() error {
 // Interrupt forces an interrupt, skipping semantic check.
 // Optionally provide a transcript of what the user said.
 func (ls *LiveStream) Interrupt(transcript string) error {
+	if ls.directAdapter != nil {
+		ls.directAdapter.session.ForceInterrupt(transcript)
+		return nil
+	}
 	return ls.sendJSON(live.InputInterruptMessage{
 		Type:       live.EventTypeInputInterrupt,
 		Transcript: transcript,
@@ -838,6 +799,9 @@ func (ls *LiveStream) Interrupt(transcript string) error {
 
 // SendToolResult sends a tool execution result back to the session.
 func (ls *LiveStream) SendToolResult(toolUseID string, content []any) error {
+	if ls.directAdapter != nil {
+		return fmt.Errorf("tool results not yet supported for in-process live sessions")
+	}
 	return ls.sendJSON(live.ToolResultMessage{
 		Type:      live.EventTypeToolResult,
 		ToolUseID: toolUseID,
@@ -863,6 +827,9 @@ func (ls *LiveStream) UpdateConfig(cfg *LiveConfig) error {
 	if cfg.Voice != nil {
 		msg.Config.Voice = convertVoiceConfig(cfg.Voice)
 	}
+	if ls.directAdapter != nil {
+		return ls.directAdapter.session.UpdateConfig(msg.Config)
+	}
 	return ls.sendJSON(msg)
 }
 
@@ -873,8 +840,11 @@ func (ls *LiveStream) Close() error {
 	}
 	ls.cancel()
 
-	// Direct mode: just cancel context, adapter will clean up
+	// Direct mode: close the in-process session.
 	if ls.directAdapter != nil {
+		if ls.directAdapter.session != nil {
+			_ = ls.directAdapter.session.Close()
+		}
 		return nil
 	}
 
@@ -898,6 +868,9 @@ func (ls *LiveStream) Done() <-chan struct{} {
 func (ls *LiveStream) sendJSON(v any) error {
 	if ls.closed.Load() {
 		return fmt.Errorf("stream closed")
+	}
+	if ls.directAdapter != nil {
+		return fmt.Errorf("cannot send JSON in direct live mode")
 	}
 	ls.writeMu.Lock()
 	defer ls.writeMu.Unlock()
@@ -1036,12 +1009,8 @@ func (c *Client) buildLiveURL() (string, error) {
 // --- Direct Mode Live Session Support ---
 
 // newLiveSessionDirect creates a live session running locally (direct mode).
-// This bypasses WebSocket and runs the voice pipeline directly in-process.
+// It runs the same core live session pipeline in-process (no proxy required).
 func newLiveSessionDirect(ctx context.Context, cfg *LiveConfig, client *Client, opts ...LiveStreamOption) (*LiveStream, error) {
-	// Check that we have the necessary components
-	if client.voicePipeline == nil {
-		return nil, fmt.Errorf("voice pipeline not configured; set CARTESIA_API_KEY or use WithProviderKey")
-	}
 	if client.core == nil {
 		return nil, fmt.Errorf("core engine not configured")
 	}
@@ -1064,80 +1033,105 @@ func newLiveSessionDirect(ctx context.Context, cfg *LiveConfig, client *Client, 
 		opt(ls)
 	}
 
-	// Create the direct session adapter
-	adapter := &directSessionAdapter{
-		ls:          ls,
-		client:      client,
-		cfg:         cfg,
-		ctx:         ctx,
-		cancel:      cancel,
-		audioBuffer: make([]byte, 0, 32000), // ~1s of 16kHz audio
-		pendingText: make(chan string, 10),
-	}
+	sessionID := fmt.Sprintf("direct_%d", time.Now().UnixNano())
 
-	// Store adapter reference for SendText/SendAudio
-	ls.directAdapter = adapter
+	adapter := &directSessionAdapter{ls: ls}
 
-	// Start the direct session
-	go adapter.run()
-
-	// Mark as ready (no WebSocket handshake needed in direct mode)
-	ls.stateMu.Lock()
-	ls.state = liveStateReady
-	ls.sessionID = fmt.Sprintf("direct_%d", time.Now().UnixNano())
-	ls.stateMu.Unlock()
-
-	// Emit session created event
-	ls.emitEvent(LiveSessionCreatedEvent{
-		SessionID:  ls.sessionID,
-		Model:      cfg.Model,
-		SampleRate: 24000,
-		Channels:   1,
+	session := live.NewLiveSession(live.LiveSessionConfig{
+		Connection: nil,
+		SessionID:  sessionID,
+		RunStreamCreator: func(ctx context.Context, config *live.SessionConfig, firstMessage string) (live.RunStreamInterface, error) {
+			return liveadapters.NewEngineRunStreamAdapter(ctx, liveadapters.EngineRunStreamAdapterConfig{
+				Engine:        client.core,
+				SessionConfig: config,
+				FirstMessage:  firstMessage,
+				Logger:        client.logger,
+			})
+		},
+		STTFactory: func(ctx context.Context, config *live.VoiceInputConfig) (live.STTStream, error) {
+			if config == nil {
+				return nil, nil
+			}
+			if client.voicePipeline == nil {
+				return nil, fmt.Errorf("voice pipeline not configured; set CARTESIA_API_KEY or use WithProviderKey")
+			}
+			p := client.voicePipeline.STTProvider()
+			if p == nil {
+				return nil, fmt.Errorf("STT provider not available")
+			}
+			return liveadapters.NewStreamingSTTStream(ctx, liveadapters.StreamingSTTStreamConfig{
+				Provider: p,
+				Input:    config,
+			})
+		},
+		TTSFactory: func(ctx context.Context, config *live.VoiceOutputConfig) (*tts.StreamingContext, error) {
+			if config == nil {
+				return nil, nil
+			}
+			if client.voicePipeline == nil {
+				return nil, fmt.Errorf("voice pipeline not configured; set CARTESIA_API_KEY or use WithProviderKey")
+			}
+			p := client.voicePipeline.TTSProvider()
+			if p == nil {
+				return nil, fmt.Errorf("TTS provider not available")
+			}
+			return p.NewStreamingContext(ctx, tts.StreamingContextOptions{
+				Voice:      config.Voice,
+				Speed:      config.Speed,
+				Format:     config.Format,
+				SampleRate: config.SampleRate,
+			})
+		},
+		LLMFunc: func(ctx context.Context, req live.LLMRequest) live.LLMResponse {
+			msgReq := &types.MessageRequest{
+				Model:     req.Model,
+				MaxTokens: 100,
+				Messages: []types.Message{
+					{Role: "user", Content: req.Prompt},
+				},
+			}
+			resp, err := client.core.CreateMessage(ctx, msgReq)
+			if err != nil {
+				return live.LLMResponse{Error: err}
+			}
+			return live.LLMResponse{Text: resp.TextContent()}
+		},
 	})
 
-	if ls.onConnect != nil {
-		ls.onConnect(ls.sessionID)
+	adapter.session = session
+	ls.directAdapter = adapter
+
+	// Start processing loops first, then configure (Configure emits session.created).
+	session.Start()
+	go adapter.forwardLoop(ctx)
+
+	coreCfg := &live.SessionConfig{
+		Model:  cfg.Model,
+		System: cfg.System,
+		Tools:  nil,
+		Voice:  convertVoiceConfig(cfg.Voice),
+	}
+	if len(cfg.Tools) > 0 {
+		coreCfg.Tools = make([]any, len(cfg.Tools))
+		for i := range cfg.Tools {
+			coreCfg.Tools[i] = cfg.Tools[i]
+		}
+	}
+	if err := session.Configure(coreCfg); err != nil {
+		_ = session.Close()
+		return nil, err
 	}
 
 	return ls, nil
 }
 
-// directSessionAdapter handles direct mode live session processing.
 type directSessionAdapter struct {
-	ls     *LiveStream
-	client *Client
-	cfg    *LiveConfig
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	// Audio buffering (fallback when STT not available)
-	audioBuffer []byte
-	audioMu     sync.Mutex
-
-	// Text input queue (for text-only mode or manual commits)
-	pendingText chan string
-
-	// STT streaming session
-	sttSession *stt.StreamingSTT
-	sttMu      sync.Mutex
-
-	// Accumulated transcript from STT (reset on commit)
-	currentTranscript    strings.Builder
-	currentTranscriptMu  sync.Mutex
-	lastTranscriptTime   time.Time
-	isProcessingResponse atomic.Bool // True while LLM/TTS is generating
+	ls      *LiveStream
+	session *live.LiveSession
 }
 
-func (a *directSessionAdapter) run() {
+func (a *directSessionAdapter) forwardLoop(ctx context.Context) {
 	defer func() {
-		// Close STT session if open
-		a.sttMu.Lock()
-		if a.sttSession != nil {
-			a.sttSession.Close()
-			a.sttSession = nil
-		}
-		a.sttMu.Unlock()
-
 		a.ls.closeOnce.Do(func() {
 			close(a.ls.done)
 			close(a.ls.events)
@@ -1149,355 +1143,103 @@ func (a *directSessionAdapter) run() {
 		}
 	}()
 
-	// Initialize STT if voice input is configured
-	if a.cfg.Voice != nil && a.cfg.Voice.Input != nil {
-		if err := a.initSTT(); err != nil {
-			// STT initialization failed - fall back to text-only mode
-			a.ls.emitEvent(LiveErrorEvent{
-				Code:    "stt_init_error",
-				Message: fmt.Sprintf("STT initialization failed (text mode only): %v", err),
-			})
-		} else {
-			// Start transcript handling goroutine
-			go a.handleSTTTranscripts()
-		}
-	}
-
-	// Emit VAD listening state
-	a.ls.emitEvent(LiveVADEvent{State: "listening"})
-
-	// Main processing loop
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
-
-		case text := <-a.pendingText:
-			// Process text input through LLM and TTS
-			a.processTurn(text)
+		case <-a.session.Done():
+			return
+		case event := <-a.session.Events():
+			a.handleSessionEvent(event)
 		}
 	}
 }
 
-// initSTT initializes the streaming STT session.
-func (a *directSessionAdapter) initSTT() error {
-	// Get Cartesia API key - use the client's helper method
-	cartesiaKey := a.client.getCartesiaAPIKey()
-	if cartesiaKey == "" {
-		return fmt.Errorf("CARTESIA_API_KEY not configured")
-	}
-
-	// Strip any quotes that might have come from env file parsing
-	cartesiaKey = strings.Trim(cartesiaKey, "\"'")
-
-	// Create STT provider
-	provider := stt.NewCartesia(cartesiaKey)
-
-	// Configure STT options
-	opts := stt.TranscribeOptions{
-		Model:      "ink-whisper",
-		Language:   "en",
-		Format:     "pcm_s16le",
-		SampleRate: 16000, // Cartesia recommends 16kHz for STT
-	}
-
-	// Override with config if provided
-	if a.cfg.Voice.Input.Language != "" {
-		opts.Language = a.cfg.Voice.Input.Language
-	}
-	if a.cfg.Voice.Input.Model != "" {
-		opts.Model = a.cfg.Voice.Input.Model
-	}
-
-	// Create streaming session
-	session, err := provider.NewStreamingSTT(a.ctx, opts)
-	if err != nil {
-		return fmt.Errorf("create STT session: %w", err)
-	}
-
-	a.sttMu.Lock()
-	a.sttSession = session
-	a.sttMu.Unlock()
-
-	return nil
-}
-
-// handleSTTTranscripts processes transcripts from the STT session.
-func (a *directSessionAdapter) handleSTTTranscripts() {
-	a.sttMu.Lock()
-	session := a.sttSession
-	a.sttMu.Unlock()
-
-	if session == nil {
-		return
-	}
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-
-		case delta, ok := <-session.Transcripts():
-			if !ok {
-				// STT session closed
-				return
-			}
-
-			// Skip empty transcripts
-			if strings.TrimSpace(delta.Text) == "" {
-				continue
-			}
-
-			// If we're currently generating a response, this might be an interrupt
-			if a.isProcessingResponse.Load() {
-				// Emit interrupt detecting event
-				a.ls.emitEvent(LiveInterruptEvent{
-					State:      "detecting",
-					Transcript: delta.Text,
-				})
-				// For now, just log - full interrupt handling would cancel TTS and re-queue
-				continue
-			}
-
-			// Update transcript tracking
-			a.currentTranscriptMu.Lock()
-			if delta.IsFinal {
-				// Final transcript - append to accumulated
-				if a.currentTranscript.Len() > 0 {
-					a.currentTranscript.WriteString(" ")
-				}
-				a.currentTranscript.WriteString(delta.Text)
-			}
-			a.lastTranscriptTime = time.Now()
-			a.currentTranscriptMu.Unlock()
-
-			// Emit transcript event
-			a.ls.emitEvent(LiveTranscriptEvent{
-				Role:    "user",
-				Text:    delta.Text,
-				IsFinal: delta.IsFinal,
-			})
-
-			// If this is a final segment, the user has paused/stopped speaking
-			// Cartesia's VAD detected end of utterance - auto-commit the turn
-			if delta.IsFinal {
-				a.currentTranscriptMu.Lock()
-				fullTranscript := strings.TrimSpace(a.currentTranscript.String())
-				a.currentTranscript.Reset()
-				a.currentTranscriptMu.Unlock()
-
-				if fullTranscript != "" {
-					// Emit VAD analyzing state
-					a.ls.emitEvent(LiveVADEvent{State: "analyzing"})
-
-					// Queue for processing
-					select {
-					case a.pendingText <- fullTranscript:
-					case <-a.ctx.Done():
-						return
-					}
-				}
-			}
+func (a *directSessionAdapter) handleSessionEvent(event live.SessionEvent) {
+	switch e := event.(type) {
+	case live.SessionCreatedEvent:
+		a.ls.sessionID = e.SessionID
+		a.ls.stateMu.Lock()
+		a.ls.state = liveStateReady
+		a.ls.stateMu.Unlock()
+		a.ls.emitEvent(LiveSessionCreatedEvent{
+			SessionID:  e.SessionID,
+			Model:      e.Config.Model,
+			SampleRate: e.Config.SampleRate,
+			Channels:   e.Config.Channels,
+		})
+		if a.ls.onConnect != nil {
+			a.ls.onConnect(e.SessionID)
 		}
-	}
-}
 
-// processTurn handles a complete user turn: LLM response + TTS
-func (a *directSessionAdapter) processTurn(userText string) {
-	// Mark that we're processing a response (for interrupt detection)
-	a.isProcessingResponse.Store(true)
-	defer func() {
-		a.isProcessingResponse.Store(false)
-		// Back to listening state
+	case live.VADListeningEvent:
 		a.ls.emitEvent(LiveVADEvent{State: "listening"})
-	}()
 
-	// Emit input committed
-	a.ls.emitEvent(LiveInputCommittedEvent{Transcript: userText})
+	case live.VADAnalyzingEvent:
+		a.ls.emitEvent(LiveVADEvent{State: "analyzing"})
 
-	// Build LLM request
-	messages := []types.Message{
-		{Role: "user", Content: userText},
-	}
+	case live.VADSilenceEvent:
+		a.ls.emitEvent(LiveVADEvent{State: "silence", DurationMs: e.DurationMs})
 
-	req := &types.MessageRequest{
-		Model:    a.cfg.Model,
-		Messages: messages,
-		Stream:   true,
-	}
+	case live.InputCommittedEvent:
+		a.ls.emitEvent(LiveInputCommittedEvent{Transcript: e.Transcript})
+		a.ls.emitEvent(LiveTranscriptEvent{Role: "user", Text: e.Transcript, IsFinal: true})
 
-	if a.cfg.System != "" {
-		req.System = a.cfg.System
-	}
+	case live.TranscriptDeltaEvent:
+		a.ls.emitEvent(LiveTranscriptEvent{Role: "user", Text: e.Delta, IsFinal: false})
 
-	// Convert tools if any
-	if len(a.cfg.Tools) > 0 {
-		req.Tools = a.cfg.Tools
-	}
+	case live.ContentBlockStartEvent:
+		a.ls.emitEvent(LiveContentBlockEvent{Event: "start", Index: e.Index, ContentBlock: e.ContentBlock})
 
-	// Stream LLM response
-	stream, err := a.client.core.StreamMessage(a.ctx, req)
-	if err != nil {
-		a.ls.emitEvent(LiveErrorEvent{Code: "llm_error", Message: err.Error()})
-		return
-	}
-	defer stream.Close()
-
-	var fullText strings.Builder
-	var ttsCtx *ttsStreamContext
-
-	// Start TTS streaming if voice output is configured
-	if a.cfg.Voice != nil && a.cfg.Voice.Output != nil {
-		ttsCtx = a.startTTSStream()
-	}
-
-	// Process stream events
-	for {
-		event, err := stream.Next()
-		if err != nil {
-			if err.Error() != "EOF" {
-				a.ls.emitEvent(LiveErrorEvent{Code: "stream_error", Message: err.Error()})
-			}
-			break
-		}
-
-		// Handle content block delta for text
-		if delta, ok := event.(types.ContentBlockDeltaEvent); ok {
-			if textDelta, ok := delta.Delta.(types.TextDelta); ok {
-				text := textDelta.Text
-				fullText.WriteString(text)
+	case live.ContentBlockDeltaEvent:
+		a.ls.emitEvent(LiveContentBlockEvent{Event: "delta", Index: e.Index, Delta: e.Delta})
+		if deltaMap, ok := e.Delta.(map[string]any); ok {
+			if text, ok := deltaMap["text"].(string); ok && text != "" {
 				a.ls.emitEvent(LiveTextDeltaEvent{Text: text})
-
-				// Send to TTS
-				if ttsCtx != nil {
-					ttsCtx.AddText(text)
-				}
 			}
 		}
 
-		// Handle tool use
-		if toolUse, ok := event.(types.ContentBlockStartEvent); ok {
-			if tb, ok := toolUse.ContentBlock.(types.ToolUseBlock); ok {
-				a.ls.emitEvent(LiveToolCallEvent{
-					ID:    tb.ID,
-					Name:  tb.Name,
-					Input: tb.Input,
-				})
-			}
+	case live.ContentBlockStopEvent:
+		a.ls.emitEvent(LiveContentBlockEvent{Event: "stop", Index: e.Index})
+
+	case live.ToolUseEvent:
+		a.ls.emitEvent(LiveToolCallEvent{ID: e.ID, Name: e.Name, Input: e.Input})
+		go a.ls.executeToolIfRegistered(e.ID, e.Name, e.Input)
+
+	case live.AudioDeltaEvent:
+		sampleRate := 24000
+		if a.ls.config != nil && a.ls.config.Voice != nil && a.ls.config.Voice.Output != nil && a.ls.config.Voice.Output.SampleRate > 0 {
+			sampleRate = a.ls.config.Voice.Output.SampleRate
 		}
-	}
-
-	// Flush and close TTS
-	if ttsCtx != nil {
-		ttsCtx.Flush()
-		ttsCtx.Close()
-	}
-
-	// Emit message stop
-	a.ls.emitEvent(LiveMessageStopEvent{StopReason: "end_turn"})
-}
-
-// ttsStreamContext handles streaming TTS
-type ttsStreamContext struct {
-	adapter    *directSessionAdapter
-	textBuffer strings.Builder
-	done       chan struct{}
-}
-
-func (a *directSessionAdapter) startTTSStream() *ttsStreamContext {
-	return &ttsStreamContext{
-		adapter: a,
-		done:    make(chan struct{}),
-	}
-}
-
-func (t *ttsStreamContext) AddText(text string) {
-	t.textBuffer.WriteString(text)
-
-	// Check for sentence boundaries and synthesize
-	content := t.textBuffer.String()
-	if idx := findSentenceEnd(content); idx > 0 {
-		sentence := content[:idx]
-		t.textBuffer.Reset()
-		t.textBuffer.WriteString(content[idx:])
-
-		// Synthesize the sentence synchronously to maintain audio order
-		t.synthesize(sentence)
-	}
-}
-
-func (t *ttsStreamContext) Flush() {
-	remaining := strings.TrimSpace(t.textBuffer.String())
-	if remaining != "" {
-		t.synthesize(remaining)
-	}
-}
-
-func (t *ttsStreamContext) Close() {
-	close(t.done)
-}
-
-func (t *ttsStreamContext) synthesize(text string) {
-	if t.adapter.client.voicePipeline == nil {
-		return
-	}
-
-	// Use configured sample rate or default to 44100 Hz
-	sampleRate := 44100
-	if t.adapter.cfg.Voice != nil && t.adapter.cfg.Voice.Output != nil && t.adapter.cfg.Voice.Output.SampleRate > 0 {
-		sampleRate = t.adapter.cfg.Voice.Output.SampleRate
-	}
-
-	voiceCfg := &types.VoiceConfig{}
-	if t.adapter.cfg.Voice != nil && t.adapter.cfg.Voice.Output != nil {
-		voiceCfg.Output = &types.VoiceOutputConfig{
-			Voice:      t.adapter.cfg.Voice.Output.Voice,
-			Speed:      t.adapter.cfg.Voice.Output.Speed,
-			Format:     "pcm", // Use raw PCM for streaming
-			SampleRate: sampleRate,
-		}
-	}
-
-	audio, err := t.adapter.client.voicePipeline.SynthesizeResponse(t.adapter.ctx, text, voiceCfg)
-	if err != nil {
-		return
-	}
-
-	if len(audio) > 0 {
-		// Emit audio event and send to audio channel
-		t.adapter.ls.emitEvent(LiveAudioEvent{Data: audio, Format: "pcm", SampleRate: sampleRate, Channels: 1})
+		a.ls.emitEvent(LiveAudioEvent{Data: e.Data, Format: e.Format, SampleRate: sampleRate, Channels: 1})
 		select {
-		case t.adapter.ls.audioOut <- audio:
-		case <-t.done:
-		case <-t.adapter.ctx.Done():
+		case a.ls.audioOut <- e.Data:
+		default:
+		}
+
+	case live.InterruptDetectingEvent:
+		a.ls.emitEvent(LiveInterruptEvent{State: "detecting", Transcript: e.Transcript})
+
+	case live.InterruptDismissedEvent:
+		a.ls.emitEvent(LiveInterruptEvent{State: "dismissed", Transcript: e.Transcript, Reason: e.Reason})
+
+	case live.ResponseInterruptedEvent:
+		a.ls.emitEvent(LiveInterruptEvent{
+			State:           "confirmed",
+			Transcript:      e.InterruptTranscript,
+			PartialText:     e.PartialText,
+			AudioPositionMs: e.AudioPositionMs,
+		})
+
+	case live.MessageStopEvent:
+		a.ls.emitEvent(LiveMessageStopEvent{StopReason: e.StopReason})
+
+	case live.ErrorEvent:
+		a.ls.emitEvent(LiveErrorEvent{Code: e.Code, Message: e.Message, RetryAfter: e.RetryAfter})
+		if a.ls.onError != nil {
+			a.ls.onError(fmt.Errorf("%s: %s", e.Code, e.Message))
 		}
 	}
-}
-
-// findSentenceEnd finds the end of a sentence (., !, ?)
-func findSentenceEnd(s string) int {
-	for i, r := range s {
-		if r == '.' || r == '!' || r == '?' {
-			// Make sure it's followed by space or end
-			if i+1 >= len(s) || s[i+1] == ' ' {
-				return i + 1
-			}
-		}
-	}
-	return -1
-}
-
-// Override SendAudio for direct mode to queue audio for STT
-func (ls *LiveStream) sendAudioDirect(data []byte) error {
-	// In direct mode without full STT streaming, we just accumulate
-	// For now, direct mode works with text input; full audio requires STT streaming
-	return nil
-}
-
-// Override SendText for direct mode
-func (ls *LiveStream) sendTextDirect(text string) error {
-	// This is handled by the normal SendText -> Commit flow
-	return nil
 }
 
 // --- WebSocket URL Builder for Custom Endpoints ---

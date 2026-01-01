@@ -12,22 +12,22 @@ const (
 	EventTypeToolResult       = "tool_result"
 
 	// Server → Client events
-	EventTypeSessionCreated       = "session.created"
-	EventTypeVADListening         = "vad.listening"
-	EventTypeVADAnalyzing         = "vad.analyzing"
-	EventTypeVADSilence           = "vad.silence"
-	EventTypeInputCommitted       = "input.committed"
-	EventTypeTranscriptDelta      = "transcript.delta"
-	EventTypeContentBlockStart    = "content_block_start"
-	EventTypeContentBlockDelta    = "content_block_delta"
-	EventTypeContentBlockStop     = "content_block_stop"
-	EventTypeToolUse              = "tool_use"
-	EventTypeAudioDelta           = "audio_delta"
-	EventTypeInterruptDetecting   = "interrupt.detecting"
-	EventTypeInterruptDismissed   = "interrupt.dismissed"
-	EventTypeResponseInterrupted  = "response.interrupted"
-	EventTypeMessageStop          = "message_stop"
-	EventTypeError                = "error"
+	EventTypeSessionCreated      = "session.created"
+	EventTypeVADListening        = "vad.listening"
+	EventTypeVADAnalyzing        = "vad.analyzing"
+	EventTypeVADSilence          = "vad.silence"
+	EventTypeInputCommitted      = "input.committed"
+	EventTypeTranscriptDelta     = "transcript.delta"
+	EventTypeContentBlockStart   = "content_block_start"
+	EventTypeContentBlockDelta   = "content_block_delta"
+	EventTypeContentBlockStop    = "content_block_stop"
+	EventTypeToolUse             = "tool_use"
+	EventTypeAudioDelta          = "audio_delta"
+	EventTypeInterruptDetecting  = "interrupt.detecting"
+	EventTypeInterruptDismissed  = "interrupt.dismissed"
+	EventTypeResponseInterrupted = "response.interrupted"
+	EventTypeMessageStop         = "message_stop"
+	EventTypeError               = "error"
 )
 
 // SessionConfig defines the full agent configuration for a live session.
@@ -59,6 +59,8 @@ type VoiceOutputConfig struct {
 	Voice    string  `json:"voice"`
 	Speed    float64 `json:"speed,omitempty"`
 	Format   string  `json:"format,omitempty"`
+	// SampleRate is the output audio sample rate in Hz (default: 24000).
+	SampleRate int `json:"sample_rate,omitempty"`
 }
 
 // VADConfig controls the hybrid voice activity detection.
@@ -277,6 +279,14 @@ func DefaultInterruptConfig() *InterruptConfig {
 func (c *SessionConfig) ApplyDefaults() {
 	if c.Voice == nil {
 		c.Voice = &VoiceConfig{}
+	}
+	if c.Voice.Output != nil {
+		if c.Voice.Output.Format == "" {
+			c.Voice.Output.Format = "pcm"
+		}
+		if c.Voice.Output.SampleRate == 0 {
+			c.Voice.Output.SampleRate = 24000
+		}
 	}
 	if c.Voice.VAD == nil {
 		c.Voice.VAD = DefaultVADConfig()

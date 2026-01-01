@@ -3,6 +3,7 @@ package vango
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -11,7 +12,17 @@ import (
 	"github.com/vango-ai/vango/pkg/core/types"
 )
 
+func requireTCPListenSDK(t testing.TB) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("skipping test: TCP listen not permitted in this environment: %v", err)
+	}
+	ln.Close()
+}
+
 func TestSDK_CreateMessage_DirectMode(t *testing.T) {
+	requireTCPListenSDK(t)
 	// Create a mock Anthropic server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify request basics
@@ -73,6 +84,7 @@ func TestSDK_CreateMessage_DirectMode(t *testing.T) {
 }
 
 func TestSDK_StreamMessage_DirectMode(t *testing.T) {
+	requireTCPListenSDK(t)
 	// Create a mock Anthropic SSE server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Return SSE stream

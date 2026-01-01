@@ -4,12 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/vango-ai/vango/pkg/core/types"
 )
+
+func requireTCPListen(t testing.TB) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("skipping test: TCP listen not permitted in this environment: %v", err)
+	}
+	ln.Close()
+}
 
 func TestProvider_Name(t *testing.T) {
 	p := New("test-key")
@@ -52,6 +62,7 @@ func TestProvider_Capabilities(t *testing.T) {
 }
 
 func TestProvider_CreateMessage(t *testing.T) {
+	requireTCPListen(t)
 	// Create a mock server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify request
@@ -147,6 +158,7 @@ func TestProvider_CreateMessage(t *testing.T) {
 }
 
 func TestProvider_CreateMessage_WithTools(t *testing.T) {
+	requireTCPListen(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var reqBody anthropicRequest
 		json.NewDecoder(r.Body).Decode(&reqBody)
@@ -228,6 +240,7 @@ func TestProvider_CreateMessage_WithTools(t *testing.T) {
 }
 
 func TestProvider_CreateMessage_Error(t *testing.T) {
+	requireTCPListen(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		resp := map[string]any{
@@ -269,6 +282,7 @@ func TestProvider_CreateMessage_Error(t *testing.T) {
 }
 
 func TestProvider_StreamMessage(t *testing.T) {
+	requireTCPListen(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept") != "text/event-stream" {
 			t.Errorf("expected Accept: text/event-stream")

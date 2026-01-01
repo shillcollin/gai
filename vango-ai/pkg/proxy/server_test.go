@@ -3,12 +3,22 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func requireTCPListenServer(t testing.TB) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("skipping test: TCP listen not permitted in this environment: %v", err)
+	}
+	ln.Close()
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
@@ -326,6 +336,7 @@ func TestMetrics(t *testing.T) {
 }
 
 func TestServer_Health(t *testing.T) {
+	requireTCPListenServer(t)
 	// Create server with minimal config
 	server, err := NewServer(
 		WithAPIKey("test-key", "test", "user1", 100),

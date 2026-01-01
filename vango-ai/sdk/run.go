@@ -211,10 +211,11 @@ func WithToolTimeout(d time.Duration) RunOption {
 
 // LiveVoiceOutput configures text-to-speech output for live mode.
 type LiveVoiceOutput struct {
-	Provider string  `json:"provider,omitempty"` // e.g., "cartesia", "elevenlabs"
-	Voice    string  `json:"voice"`
-	Speed    float64 `json:"speed,omitempty"`
-	Format   string  `json:"format,omitempty"`
+	Provider   string  `json:"provider,omitempty"` // e.g., "cartesia", "elevenlabs"
+	Voice      string  `json:"voice"`
+	Speed      float64 `json:"speed,omitempty"`
+	Format     string  `json:"format,omitempty"`
+	SampleRate int     `json:"sample_rate,omitempty"`
 }
 
 // LiveInterrupt configures barge-in detection for live mode.
@@ -1005,10 +1006,11 @@ func (rs *RunStream) runLive(ctx context.Context, svc *MessagesService, req *Mes
 			liveCfg.Voice = &LiveVoiceConfig{}
 		}
 		liveCfg.Voice.Output = &LiveVoiceOutputConfig{
-			Provider: cfg.voiceOutput.Provider,
-			Voice:    cfg.voiceOutput.Voice,
-			Speed:    cfg.voiceOutput.Speed,
-			Format:   cfg.voiceOutput.Format,
+			Provider:   cfg.voiceOutput.Provider,
+			Voice:      cfg.voiceOutput.Voice,
+			Speed:      cfg.voiceOutput.Speed,
+			Format:     cfg.voiceOutput.Format,
+			SampleRate: cfg.voiceOutput.SampleRate,
 		}
 	}
 

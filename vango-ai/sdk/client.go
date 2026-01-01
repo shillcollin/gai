@@ -30,6 +30,9 @@ import (
 
 	"github.com/vango-ai/vango/pkg/core"
 	"github.com/vango-ai/vango/pkg/core/providers/anthropic"
+	"github.com/vango-ai/vango/pkg/core/providers/cerebras"
+	"github.com/vango-ai/vango/pkg/core/providers/groq"
+	"github.com/vango-ai/vango/pkg/core/providers/openai"
 	"github.com/vango-ai/vango/pkg/core/voice"
 	"github.com/vango-ai/vango/pkg/core/voice/stt"
 	"github.com/vango-ai/vango/pkg/core/voice/tts"
@@ -107,10 +110,23 @@ func (c *Client) initProviders() {
 		c.core.RegisterProvider(newAnthropicAdapter(anthropic.New(anthropicKey)))
 	}
 
-	// Other providers will be added in later phases:
-	// - OpenAI (Phase 5)
-	// - Gemini (Phase 6)
-	// - Groq (Phase 7)
+	// Register OpenAI if API key is available
+	openaiKey := c.core.GetAPIKey("openai")
+	if openaiKey != "" {
+		c.core.RegisterProvider(newOpenAIAdapter(openai.New(openaiKey)))
+	}
+
+	// Register Groq if API key is available
+	groqKey := c.core.GetAPIKey("groq")
+	if groqKey != "" {
+		c.core.RegisterProvider(newGroqAdapter(groq.New(groqKey)))
+	}
+
+	// Register Cerebras if API key is available
+	cerebrasKey := c.core.GetAPIKey("cerebras")
+	if cerebrasKey != "" {
+		c.core.RegisterProvider(newCerebrasAdapter(cerebras.New(cerebrasKey)))
+	}
 }
 
 // initVoicePipeline initializes the voice pipeline if Cartesia API key is available.

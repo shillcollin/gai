@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,6 +36,15 @@ func main() {
 }
 
 func run() error {
+	debug := os.Getenv("VANGO_LIVE_DEBUG") != ""
+	logger := log.New(os.Stderr, "[live-demo] ", log.LstdFlags|log.Lmicroseconds)
+	debugf := func(format string, args ...any) {
+		if !debug {
+			return
+		}
+		logger.Printf("DEBUG "+format, args...)
+	}
+
 	// Load .env file
 	loadEnvFile()
 
@@ -68,6 +78,7 @@ func run() error {
 		vango.WithProviderKey("anthropic", anthropicKey),
 		vango.WithProviderKey("cartesia", cartesiaKey),
 	)
+	debugf("client initialized (direct mode)")
 
 	// Create live session configuration using RunStream with WithLiveConfig
 	// This demonstrates the unified API where live mode is accessed via RunStream
@@ -100,6 +111,7 @@ func run() error {
 	}
 
 	fmt.Println("Connecting to live session...")
+	debugf("connecting to live session")
 
 	// Connect via RunStream with WithLiveConfig - the unified streaming API
 	stream, err := client.Messages.RunStream(ctx, &vango.MessageRequest{},
@@ -109,41 +121,61 @@ func run() error {
 		return fmt.Errorf("connect to live session: %w", err)
 	}
 	defer stream.Close()
+	debugf("RunStream created")
 
-	// Wait for session to be ready by watching for LiveSessionCreatedEvent in Events()
-	sessionReady := make(chan string, 1)
-	go func() {
-		for event := range stream.Events() {
+	// Wait for session.created before starting audio I/O, but keep a single reader of stream.Events().
+	type sessionInfo struct {
+		ID         string
+		SampleRate int
+		Channels   int
+	}
+	var info sessionInfo
+	createdDeadline := time.NewTimer(10 * time.Second)
+	defer createdDeadline.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-createdDeadline.C:
+			return fmt.Errorf("timeout waiting for session")
+		case event, ok := <-stream.Events():
+			if !ok {
+				return fmt.Errorf("stream closed before session.created")
+			}
+
+			if debug {
+				debugf("pre-ready event type=%T", event)
+			}
+
 			if wrapper, ok := event.(vango.LiveEventWrapper); ok {
-				if e, ok := wrapper.Event.(vango.LiveSessionCreatedEvent); ok {
-					sessionReady <- e.SessionID
-					return
+				switch e := wrapper.Event.(type) {
+				case vango.LiveSessionCreatedEvent:
+					info = sessionInfo{ID: e.SessionID, SampleRate: e.SampleRate, Channels: e.Channels}
+					debugf("session.created session_id=%s sample_rate=%d channels=%d", e.SessionID, e.SampleRate, e.Channels)
+					goto ready
+				case vango.LiveErrorEvent:
+					debugf("error before session.created code=%s message=%s", e.Code, e.Message)
 				}
 			}
 		}
-	}()
-
-	select {
-	case sessionID := <-sessionReady:
-		fmt.Printf("\n✓ Connected! Session: %s\n", sessionID)
-		fmt.Println("\nSpeak into your microphone. Press Ctrl+C to exit.")
-		fmt.Println(strings.Repeat("─", 60))
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("timeout waiting for session")
 	}
 
-	// Start audio player for TTS output
-	player := newAudioPlayer(ctx)
+ready:
+	fmt.Printf("\n✓ Connected! Session: %s\n", info.ID)
+	fmt.Println("\nSpeak into your microphone. Press Ctrl+C to exit.")
+	fmt.Println(strings.Repeat("─", 60))
+
+	// Start audio player for TTS output (match server-provided format).
+	player := newAudioPlayer(ctx, info.SampleRate, debugf)
 	defer player.Close()
 
 	// Start microphone capture
-	mic, err := newMicrophoneCapture(ctx)
+	mic, err := newMicrophoneCapture(ctx, debugf)
 	if err != nil {
 		fmt.Printf("Warning: Could not start microphone: %v\n", err)
 		fmt.Println("Falling back to text-only mode. Type your messages below.")
-		return runTextMode(ctx, stream, player)
+		return runTextMode(ctx, stream, player, debugf)
 	}
 	defer mic.Close()
 
@@ -154,6 +186,10 @@ func run() error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		var chunks int
+		var bytes int
+		lastLog := time.Now()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -163,29 +199,41 @@ func run() error {
 					return
 				}
 				if err := stream.SendAudio(chunk); err != nil {
+					debugf("SendAudio error: %v", err)
 					return
+				}
+
+				chunks++
+				bytes += len(chunk)
+				if debug && time.Since(lastLog) >= 1*time.Second {
+					debugf("mic -> stream audio chunks=%d bytes=%d (last 1s)", chunks, bytes)
+					chunks = 0
+					bytes = 0
+					lastLog = time.Now()
 				}
 			}
 		}
 	}()
 
-	// Goroutine: Handle events from session
+	// Goroutine: Handle events from session (single reader for the remainder of the session)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		handleEvents(ctx, stream, player)
+		handleEvents(ctx, stream, player, debugf)
 	}()
 
 	// Wait for context cancellation
 	<-ctx.Done()
 	wg.Wait()
-
 	return nil
 }
 
 // handleEvents processes events from the live stream via RunStream.Events()
-func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPlayer) {
+func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPlayer, debugf func(string, ...any)) {
 	var currentText strings.Builder
+
+	var audioChunks int
+	var lastAudioLog = time.Now()
 
 	for {
 		select {
@@ -205,13 +253,25 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 			// Handle audio chunks (converted from LiveAudioEvent)
 			if audio, ok := event.(vango.AudioChunkEvent); ok {
 				player.Write(audio.Data)
+				audioChunks++
+				if time.Since(lastAudioLog) >= 1*time.Second {
+					debugf("audio <- stream chunks=%d format=%s", audioChunks, audio.Format)
+					audioChunks = 0
+					lastAudioLog = time.Now()
+				}
 				continue
+			}
+
+			debugf("event type=%T", event)
+			if liveEvent != nil {
+				debugf("live event type=%T", liveEvent)
 			}
 
 			// Handle text deltas (converted from LiveTextDeltaEvent)
 			if wrapper, ok := event.(vango.StreamEventWrapper); ok {
 				if delta, ok := wrapper.Event.(types.ContentBlockDeltaEvent); ok {
 					if textDelta, ok := delta.Delta.(types.TextDelta); ok {
+						debugf("text_delta len=%d", len(textDelta.Text))
 						currentText.WriteString(textDelta.Text)
 						fmt.Print(textDelta.Text)
 					}
@@ -220,7 +280,12 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 			}
 
 			// Handle step complete (converted from LiveMessageStopEvent)
-			if _, ok := event.(vango.StepCompleteEvent); ok {
+			if e, ok := event.(vango.StepCompleteEvent); ok {
+				if e.Response != nil {
+					debugf("step_complete index=%d stop_reason=%s", e.Index, e.Response.StopReason)
+				} else {
+					debugf("step_complete index=%d (nil response)", e.Index)
+				}
 				fmt.Println()
 				fmt.Println(strings.Repeat("─", 60))
 				continue
@@ -233,6 +298,7 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 
 			switch e := liveEvent.(type) {
 			case vango.LiveVADEvent:
+				debugf("vad state=%s duration_ms=%d", e.State, e.DurationMs)
 				switch e.State {
 				case "listening":
 					fmt.Print("\r🎤 Listening...                    ")
@@ -243,6 +309,7 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 				}
 
 			case vango.LiveTranscriptEvent:
+				debugf("transcript role=%s is_final=%v len=%d", e.Role, e.IsFinal, len(e.Text))
 				if e.Role == "user" {
 					if e.IsFinal {
 						fmt.Printf("\r\033[K👤 You: %s\n", e.Text)
@@ -252,6 +319,7 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 				}
 
 			case vango.LiveInputCommittedEvent:
+				debugf("input.committed len=%d", len(e.Transcript))
 				fmt.Printf("\r\033[K👤 You: %s\n", e.Transcript)
 				fmt.Print("🤖 Claude: ")
 				currentText.Reset()
@@ -260,6 +328,7 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 			// are converted to RunStreamEvents and handled above
 
 			case vango.LiveInterruptEvent:
+				debugf("interrupt state=%s reason=%s transcript_len=%d partial_len=%d", e.State, e.Reason, len(e.Transcript), len(e.PartialText))
 				switch e.State {
 				case "detecting":
 					fmt.Print("\n[Checking for interrupt...]")
@@ -271,9 +340,11 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 				}
 
 			case vango.LiveToolCallEvent:
+				debugf("tool_call name=%s id=%s", e.Name, e.ID)
 				fmt.Printf("\n[Tool: %s]\n", e.Name)
 
 			case vango.LiveErrorEvent:
+				debugf("error code=%s message=%s", e.Code, e.Message)
 				fmt.Printf("\n[Error: %s - %s]\n", e.Code, e.Message)
 			}
 		}
@@ -281,9 +352,9 @@ func handleEvents(ctx context.Context, stream *vango.RunStream, player *audioPla
 }
 
 // runTextMode provides a fallback text-only mode when microphone isn't available
-func runTextMode(ctx context.Context, stream *vango.RunStream, player *audioPlayer) error {
+func runTextMode(ctx context.Context, stream *vango.RunStream, player *audioPlayer, debugf func(string, ...any)) error {
 	// Start event handler
-	go handleEvents(ctx, stream, player)
+	go handleEvents(ctx, stream, player, debugf)
 
 	// Read text input
 	fmt.Print("\nYou: ")
@@ -315,9 +386,11 @@ func runTextMode(ctx context.Context, stream *vango.RunStream, player *audioPlay
 		if err := stream.SendText(input); err != nil {
 			return err
 		}
+		debugf("SendText len=%d", len(input))
 		if err := stream.Commit(); err != nil {
 			return err
 		}
+		debugf("Commit sent")
 
 		// Wait a bit for response
 		time.Sleep(100 * time.Millisecond)
@@ -335,7 +408,7 @@ type microphoneCapture struct {
 	done   chan struct{}
 }
 
-func newMicrophoneCapture(parentCtx context.Context) (*microphoneCapture, error) {
+func newMicrophoneCapture(parentCtx context.Context, debugf func(string, ...any)) (*microphoneCapture, error) {
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	// Try different audio capture methods
@@ -353,6 +426,7 @@ func newMicrophoneCapture(parentCtx context.Context) (*microphoneCapture, error)
 			"-c", "1", // mono
 			"-", // output to stdout
 		)
+		debugf("mic capture: using `rec` (sox)")
 	} else if _, err := exec.LookPath("ffmpeg"); err == nil {
 		// ffmpeg: capture from default audio input
 		cmd = exec.CommandContext(ctx, "ffmpeg",
@@ -364,6 +438,7 @@ func newMicrophoneCapture(parentCtx context.Context) (*microphoneCapture, error)
 			"-loglevel", "quiet",
 			"-",
 		)
+		debugf("mic capture: using `ffmpeg` (avfoundation)")
 	} else if _, err := exec.LookPath("arecord"); err == nil {
 		// arecord: Linux ALSA capture
 		cmd = exec.CommandContext(ctx, "arecord",
@@ -374,6 +449,7 @@ func newMicrophoneCapture(parentCtx context.Context) (*microphoneCapture, error)
 			"-t", "raw",
 			"-",
 		)
+		debugf("mic capture: using `arecord` (alsa)")
 	} else {
 		cancel()
 		return nil, fmt.Errorf("no audio capture tool found (need sox, ffmpeg, or arecord)")
@@ -389,6 +465,7 @@ func newMicrophoneCapture(parentCtx context.Context) (*microphoneCapture, error)
 		cancel()
 		return nil, fmt.Errorf("start audio capture: %w", err)
 	}
+	debugf("mic capture: process started")
 
 	mc := &microphoneCapture{
 		ctx:    ctx,
@@ -405,6 +482,7 @@ func newMicrophoneCapture(parentCtx context.Context) (*microphoneCapture, error)
 
 		// Read in ~100ms chunks at 16kHz 16-bit mono = 3200 bytes
 		buf := make([]byte, 3200)
+		debugf("mic capture: read loop started (chunk_bytes=%d)", len(buf))
 		for {
 			select {
 			case <-ctx.Done():
@@ -414,6 +492,7 @@ func newMicrophoneCapture(parentCtx context.Context) (*microphoneCapture, error)
 
 			n, err := stdout.Read(buf)
 			if err != nil {
+				debugf("mic capture: read error: %v", err)
 				return
 			}
 			if n > 0 {
@@ -436,6 +515,9 @@ func (mc *microphoneCapture) Audio() <-chan []byte {
 }
 
 func (mc *microphoneCapture) Close() error {
+	if mc == nil {
+		return nil
+	}
 	mc.cancel()
 	if mc.cmd.Process != nil {
 		mc.cmd.Process.Kill()
@@ -448,11 +530,8 @@ func (mc *microphoneCapture) Close() error {
 
 // Audio format constants matching TTS output
 const (
-	audioSampleRate   = 44100 // 44.1kHz
-	audioChannels     = 1     // Mono
-	audioBitDepth     = 16    // 16-bit
-	audioBytesPerSec  = audioSampleRate * audioChannels * (audioBitDepth / 8)
-	audioBufferSizeMs = 100 // Buffer size in milliseconds
+	audioChannels = 1  // Mono
+	audioBitDepth = 16 // 16-bit
 )
 
 // audioStreamReader adapts a channel of audio chunks to an io.Reader for oto.
@@ -501,10 +580,15 @@ type audioPlayer struct {
 	mu        sync.Mutex
 }
 
-func newAudioPlayer(parentCtx context.Context) *audioPlayer {
+func newAudioPlayer(parentCtx context.Context, sampleRate int, debugf func(string, ...any)) *audioPlayer {
 	ctx, cancel := context.WithCancel(parentCtx)
 	done := make(chan struct{})
 	chunks := make(chan []byte, 100)
+
+	if sampleRate <= 0 {
+		sampleRate = 24000
+	}
+	debugf("audio player: init sample_rate=%d channels=%d format=s16le", sampleRate, audioChannels)
 
 	// Create the stream reader that adapts channel to io.Reader
 	reader := &audioStreamReader{
@@ -514,12 +598,13 @@ func newAudioPlayer(parentCtx context.Context) *audioPlayer {
 
 	// Initialize oto context
 	otoCtx, ready, err := oto.NewContext(&oto.NewContextOptions{
-		SampleRate:   audioSampleRate,
+		SampleRate:   sampleRate,
 		ChannelCount: audioChannels,
 		Format:       oto.FormatSignedInt16LE,
 	})
 	if err != nil {
 		fmt.Printf("Warning: Failed to initialize audio: %v\n", err)
+		debugf("audio player: failed to initialize oto context: %v", err)
 		cancel()
 		return &audioPlayer{
 			ctx:    ctx,
@@ -531,6 +616,7 @@ func newAudioPlayer(parentCtx context.Context) *audioPlayer {
 
 	// Wait for audio hardware to be ready
 	<-ready
+	debugf("audio player: oto ready")
 
 	// Create player from the stream reader
 	player := otoCtx.NewPlayer(reader)
@@ -547,6 +633,7 @@ func newAudioPlayer(parentCtx context.Context) *audioPlayer {
 
 	// Start playback - oto will continuously read from our reader
 	player.Play()
+	debugf("audio player: playback started")
 
 	return p
 }
@@ -600,6 +687,9 @@ drainLoop:
 }
 
 func (p *audioPlayer) Close() {
+	if p == nil {
+		return
+	}
 	p.mu.Lock()
 	p.cancelled = true
 	close(p.done)

@@ -85,8 +85,9 @@ func NewTTSPipeline(config TTSPipelineConfig) *TTSPipeline {
 // This should be called when starting a new TTS generation.
 func (p *TTSPipeline) SetTTSContext(ctx *tts.StreamingContext) {
 	p.mu.Lock()
+	paused := p.paused
 	p.ttsCtx = ctx
-	p.paused = false
+	p.paused = paused
 	p.cancelled.Store(false)
 	p.pausePoint = 0
 	p.audioPosition = 0

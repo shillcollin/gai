@@ -9,8 +9,8 @@ type SessionEvent interface {
 
 // SessionCreatedEvent signals session initialization.
 type SessionCreatedEvent struct {
-	SessionID string `json:"session_id"`
-	Model     string `json:"model"`
+	SessionID string            `json:"session_id"`
+	Config    SessionInfoConfig `json:"config"`
 }
 
 func (e SessionCreatedEvent) sessionEventType() string { return EventTypeSessionCreated }

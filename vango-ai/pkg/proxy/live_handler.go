@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/vango-ai/vango/pkg/core"
 	"github.com/vango-ai/vango/pkg/core/live"
+	liveadapters "github.com/vango-ai/vango/pkg/core/live/adapters"
 	"github.com/vango-ai/vango/pkg/core/types"
-	"github.com/vango-ai/vango/pkg/core/voice/stt"
+	"github.com/vango-ai/vango/pkg/core/voice/tts"
 )
 
 // handleLive handles the /v1/messages/live WebSocket endpoint.
@@ -85,6 +85,7 @@ func (h *liveSessionHandler) run(ctx context.Context) {
 		Connection:       h.conn,
 		RunStreamCreator: h.createRunStreamCreator(),
 		STTFactory:       h.createSTTFactory(),
+		TTSFactory:       h.createTTSFactory(),
 		LLMFunc:          h.createLLMFunc(),
 	}
 
@@ -157,7 +158,12 @@ func (h *liveSessionHandler) createRunStreamCreator() live.RunStreamCreator {
 		h.model = model
 
 		// Create the run stream adapter
-		return newLiveRunStreamAdapter(ctx, h.server.engine, config, firstMessage, h.logger)
+		return liveadapters.NewEngineRunStreamAdapter(ctx, liveadapters.EngineRunStreamAdapterConfig{
+			Engine:        h.server.engine,
+			SessionConfig: config,
+			FirstMessage:  firstMessage,
+			Logger:        h.logger,
+		})
 	}
 }
 
@@ -175,7 +181,30 @@ func (h *liveSessionHandler) createSTTFactory() live.STTStreamFactory {
 		}
 
 		// Create streaming STT session
-		return newSTTStreamAdapter(ctx, sttProvider, config, h.logger)
+		return liveadapters.NewStreamingSTTStream(ctx, liveadapters.StreamingSTTStreamConfig{
+			Provider: sttProvider,
+			Input:    config,
+		})
+	}
+}
+
+func (h *liveSessionHandler) createTTSFactory() live.TTSFactory {
+	return func(ctx context.Context, config *live.VoiceOutputConfig) (*tts.StreamingContext, error) {
+		if h.server.voicePipeline == nil {
+			return nil, fmt.Errorf("voice pipeline not configured")
+		}
+		ttsProvider := h.server.voicePipeline.TTSProvider()
+		if ttsProvider == nil {
+			return nil, fmt.Errorf("TTS provider not available")
+		}
+
+		opts := tts.StreamingContextOptions{
+			Voice:      config.Voice,
+			Speed:      config.Speed,
+			Format:     config.Format,
+			SampleRate: config.SampleRate,
+		}
+		return ttsProvider.NewStreamingContext(ctx, opts)
 	}
 }
 
@@ -201,281 +230,3 @@ func (h *liveSessionHandler) createLLMFunc() live.LLMFunc {
 		}
 	}
 }
-
-// liveRunStreamAdapter adapts the SDK's RunStream to the live.RunStreamInterface.
-type liveRunStreamAdapter struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	engine      *core.Engine
-	config      *live.SessionConfig
-	messages    []types.Message
-	events      chan live.RunStreamEvent
-	done        chan struct{}
-	logger      *slog.Logger
-	interrupted bool
-}
-
-// newLiveRunStreamAdapter creates a new run stream adapter.
-func newLiveRunStreamAdapter(
-	ctx context.Context,
-	engine *core.Engine,
-	config *live.SessionConfig,
-	firstMessage string,
-	logger *slog.Logger,
-) (*liveRunStreamAdapter, error) {
-	ctx, cancel := context.WithCancel(ctx)
-
-	adapter := &liveRunStreamAdapter{
-		ctx:    ctx,
-		cancel: cancel,
-		engine: engine,
-		config: config,
-		messages: []types.Message{
-			{Role: "user", Content: firstMessage},
-		},
-		events: make(chan live.RunStreamEvent, 100),
-		done:   make(chan struct{}),
-		logger: logger,
-	}
-
-	// Start the streaming loop
-	go adapter.streamLoop()
-
-	return adapter, nil
-}
-
-func (a *liveRunStreamAdapter) Events() <-chan live.RunStreamEvent {
-	return a.events
-}
-
-func (a *liveRunStreamAdapter) Interrupt(msg live.UserMessage, behavior live.InterruptBehavior) error {
-	a.interrupted = true
-
-	// Add the new user message
-	a.messages = append(a.messages, types.Message{
-		Role:    msg.Role,
-		Content: msg.Content,
-	})
-
-	// Send interrupt event
-	select {
-	case a.events <- &live.InterruptedEvent{}:
-	default:
-	}
-
-	// Restart streaming with new message
-	go a.streamLoop()
-
-	return nil
-}
-
-func (a *liveRunStreamAdapter) InterruptWithText(text string) error {
-	return a.Interrupt(live.UserMessage{Role: "user", Content: text}, live.InterruptDiscard)
-}
-
-func (a *liveRunStreamAdapter) Cancel() error {
-	a.cancel()
-	return nil
-}
-
-func (a *liveRunStreamAdapter) Close() error {
-	a.cancel()
-	close(a.done)
-	return nil
-}
-
-func (a *liveRunStreamAdapter) streamLoop() {
-	a.interrupted = false
-
-	// Build request
-	req := &types.MessageRequest{
-		Model:    a.config.Model,
-		System:   a.config.System,
-		Messages: a.messages,
-		Stream:   true,
-	}
-
-	// Add tools if configured
-	if len(a.config.Tools) > 0 {
-		for _, tool := range a.config.Tools {
-			if t, ok := tool.(types.Tool); ok {
-				req.Tools = append(req.Tools, t)
-			}
-		}
-	}
-
-	// Start streaming
-	stream, err := a.engine.StreamMessage(a.ctx, req)
-	if err != nil {
-		a.logger.Error("stream creation failed", "error", err)
-		a.emitEvent(&live.RunErrorEvent{Err: err})
-		return
-	}
-	defer stream.Close()
-
-	// Send step start
-	a.emitEvent(&live.StepStartEvent{})
-
-	// Track response building
-	var responseContent []types.ContentBlock
-	var stopReason types.StopReason
-
-	// Process stream events using Next()
-	for {
-		if a.interrupted {
-			return
-		}
-
-		select {
-		case <-a.ctx.Done():
-			return
-		default:
-		}
-
-		event, err := stream.Next()
-		if err != nil {
-			// io.EOF means normal end
-			if err.Error() != "EOF" {
-				a.emitEvent(&live.RunErrorEvent{Err: err})
-			}
-			break
-		}
-		if event == nil {
-			break
-		}
-
-		// Wrap and forward the event
-		a.emitEvent(&live.StreamEventWrapper{Evt: event})
-
-		// Track response building
-		switch e := event.(type) {
-		case types.ContentBlockStartEvent:
-			for len(responseContent) <= e.Index {
-				responseContent = append(responseContent, nil)
-			}
-			responseContent[e.Index] = e.ContentBlock
-		case types.ContentBlockDeltaEvent:
-			// Apply delta
-			if e.Index < len(responseContent) {
-				responseContent[e.Index] = applyDelta(responseContent[e.Index], e.Delta)
-			}
-		case types.MessageDeltaEvent:
-			stopReason = e.Delta.StopReason
-		}
-	}
-
-	// Build final response
-	if len(responseContent) > 0 {
-		// Add assistant message to conversation
-		a.messages = append(a.messages, types.Message{
-			Role:    "assistant",
-			Content: responseContent,
-		})
-
-		// Check for tool use
-		if stopReason == "tool_use" {
-			// Handle tool calls
-			for _, block := range responseContent {
-				if toolUse, ok := block.(types.ToolUseBlock); ok {
-					a.emitEvent(&live.ToolCallStartEvent{
-						ID:       toolUse.ID,
-						Name:     toolUse.Name,
-						InputMap: toolUse.Input,
-					})
-				}
-			}
-		}
-	}
-
-	// Send step complete
-	a.emitEvent(&live.StepCompleteEvent{})
-}
-
-// applyDelta applies a delta to a content block.
-func applyDelta(block types.ContentBlock, delta types.Delta) types.ContentBlock {
-	switch d := delta.(type) {
-	case types.TextDelta:
-		if tb, ok := block.(types.TextBlock); ok {
-			tb.Text += d.Text
-			return tb
-		}
-	case types.InputJSONDelta:
-		// For tool use blocks, accumulate the partial JSON
-		if tu, ok := block.(types.ToolUseBlock); ok {
-			_ = tu
-			_ = d.PartialJSON
-		}
-	case types.ThinkingDelta:
-		if tb, ok := block.(types.ThinkingBlock); ok {
-			tb.Thinking += d.Thinking
-			return tb
-		}
-	}
-	return block
-}
-
-func (a *liveRunStreamAdapter) emitEvent(event live.RunStreamEvent) {
-	select {
-	case a.events <- event:
-	case <-a.ctx.Done():
-	default:
-	}
-}
-
-// STT stream adapter
-
-type sttStreamAdapter struct {
-	ctx        context.Context
-	provider   stt.Provider
-	config     *live.VoiceInputConfig
-	logger     *slog.Logger
-	transcript strings.Builder
-	lastDelta  string
-}
-
-func newSTTStreamAdapter(
-	ctx context.Context,
-	provider stt.Provider,
-	config *live.VoiceInputConfig,
-	logger *slog.Logger,
-) (*sttStreamAdapter, error) {
-	return &sttStreamAdapter{
-		ctx:      ctx,
-		provider: provider,
-		config:   config,
-		logger:   logger,
-	}, nil
-}
-
-func (s *sttStreamAdapter) Write(audio []byte) error {
-	// In a real implementation, this would stream audio to the STT provider
-	// and receive incremental transcripts back.
-	// For now, we'll just accumulate audio and transcribe in batches.
-
-	// TODO: Implement streaming STT when Cartesia streaming API is available
-	// For now, this is a placeholder that will be enhanced with actual STT streaming
-	return nil
-}
-
-func (s *sttStreamAdapter) Transcript() string {
-	return s.transcript.String()
-}
-
-func (s *sttStreamAdapter) TranscriptDelta() string {
-	delta := s.lastDelta
-	s.lastDelta = ""
-	return delta
-}
-
-func (s *sttStreamAdapter) Reset() {
-	s.transcript.Reset()
-	s.lastDelta = ""
-}
-
-func (s *sttStreamAdapter) Close() error {
-	return nil
-}
-
-// Ensure interfaces are implemented
-var _ live.STTStream = (*sttStreamAdapter)(nil)
-var _ live.RunStreamInterface = (*liveRunStreamAdapter)(nil)

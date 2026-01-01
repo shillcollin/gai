@@ -3,15 +3,11 @@ package live
 import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 // --- Mock implementations ---
@@ -94,6 +90,7 @@ type mockRunStream struct {
 	events       chan RunStreamEvent
 	closed       atomic.Bool
 	interrupted  atomic.Bool
+	stopped      atomic.Bool
 	interruptMsg string
 	mu           sync.Mutex
 }
@@ -113,6 +110,11 @@ func (m *mockRunStream) Interrupt(msg UserMessage, behavior InterruptBehavior) e
 	m.interruptMsg = msg.Content
 	m.mu.Unlock()
 	m.interrupted.Store(true)
+	return nil
+}
+
+func (m *mockRunStream) StopResponse(partialText string, behavior InterruptBehavior) error {
+	m.stopped.Store(true)
 	return nil
 }
 
@@ -147,37 +149,6 @@ func (m *mockRunStream) SendTextDelta(text string) {
 
 // --- Test helpers ---
 
-func setupTestWebSocket(t *testing.T) (*websocket.Conn, *websocket.Conn, func()) {
-	upgrader := websocket.Upgrader{}
-
-	var serverConn *websocket.Conn
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		serverConn, err = upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Fatalf("upgrade error: %v", err)
-		}
-	}))
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial error: %v", err)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-
-	cleanup := func() {
-		clientConn.Close()
-		if serverConn != nil {
-			serverConn.Close()
-		}
-		server.Close()
-	}
-
-	return clientConn, serverConn, cleanup
-}
-
 // --- Tests ---
 
 func TestSessionState_String(t *testing.T) {
@@ -202,12 +173,8 @@ func TestSessionState_String(t *testing.T) {
 }
 
 func TestNewLiveSession(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 
 	if session == nil {
@@ -226,12 +193,8 @@ func TestNewLiveSession(t *testing.T) {
 }
 
 func TestNewLiveSession_CustomID(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		SessionID:  "custom-session-123",
 	})
 	defer session.Close()
@@ -242,14 +205,10 @@ func TestNewLiveSession_CustomID(t *testing.T) {
 }
 
 func TestLiveSession_Configure(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	mockLLM := MockLLMFunc(nil, "YES", 0)
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		LLMFunc:    mockLLM,
 		STTFactory: func(ctx context.Context, config *VoiceInputConfig) (STTStream, error) {
 			return newMockSTTStream(), nil
@@ -273,12 +232,8 @@ func TestLiveSession_Configure(t *testing.T) {
 }
 
 func TestLiveSession_Configure_AppliesDefaults(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 	defer session.Close()
 
@@ -303,12 +258,8 @@ func TestLiveSession_Configure_AppliesDefaults(t *testing.T) {
 }
 
 func TestLiveSession_Configure_InvalidState(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 	defer session.Close()
 
@@ -322,12 +273,8 @@ func TestLiveSession_Configure_InvalidState(t *testing.T) {
 }
 
 func TestLiveSession_UpdateConfig(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 	defer session.Close()
 
@@ -355,12 +302,8 @@ func TestLiveSession_UpdateConfig(t *testing.T) {
 }
 
 func TestLiveSession_UpdateConfig_NotConfigured(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 	defer session.Close()
 
@@ -371,12 +314,8 @@ func TestLiveSession_UpdateConfig_NotConfigured(t *testing.T) {
 }
 
 func TestLiveSession_Close(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 
 	session.Configure(&SessionConfig{Model: "test"})
@@ -394,12 +333,8 @@ func TestLiveSession_Close(t *testing.T) {
 }
 
 func TestLiveSession_Done(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 
 	done := session.Done()
@@ -413,14 +348,10 @@ func TestLiveSession_Done(t *testing.T) {
 }
 
 func TestLiveSession_HandleAudioInput_VAD(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	mockSTT := newMockSTTStream()
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		STTFactory: func(ctx context.Context, config *VoiceInputConfig) (STTStream, error) {
 			return mockSTT, nil
 		},
@@ -445,15 +376,11 @@ func TestLiveSession_HandleAudioInput_VAD(t *testing.T) {
 }
 
 func TestLiveSession_HandleTextInput(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	var runStreamCreated atomic.Bool
 	mockStream := newMockRunStream()
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
 			runStreamCreated.Store(true)
 			return mockStream, nil
@@ -464,9 +391,7 @@ func TestLiveSession_HandleTextInput(t *testing.T) {
 	session.Configure(&SessionConfig{Model: "test"})
 	session.Start()
 
-	time.Sleep(50 * time.Millisecond)
-
-	session.incomingText <- "Hello, world!"
+	_ = session.EnqueueText("Hello, world!")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -477,16 +402,117 @@ func TestLiveSession_HandleTextInput(t *testing.T) {
 	mockStream.Close()
 }
 
-func TestLiveSession_JSONMessageHandling(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
+func TestLiveSession_GracePeriodCancelsResponse(t *testing.T) {
+	mockSTT := newMockSTTStream()
+	mockStream := newMockRunStream()
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
+		STTFactory: func(ctx context.Context, config *VoiceInputConfig) (STTStream, error) {
+			return mockSTT, nil
+		},
+		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
+			return mockStream, nil
+		},
 	})
 	defer session.Close()
 
+	semantic := false
+	err := session.Configure(&SessionConfig{
+		Model: "test-model",
+		Voice: &VoiceConfig{
+			VAD: &VADConfig{
+				EnergyThreshold: 0.01,
+				SemanticCheck:   &semantic,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Configure failed: %v", err)
+	}
 	session.Start()
+
+	speech := make([]byte, 4800)
+	for i := 0; i < len(speech); i += 2 {
+		speech[i] = 0x00
+		speech[i+1] = 0x40
+	}
+	silence := make([]byte, len(speech))
+
+	// Prime lastUserSpeechAt by simulating speech before commit.
+	mockSTT.AddTranscript("hello")
+	session.handleAudioInput(speech)
+
+	// Commit a turn to activate grace window.
+	session.vad.AddTranscript("hello")
+	session.commitTurn()
+	time.Sleep(25 * time.Millisecond)
+
+	if session.State() != StateProcessing {
+		t.Fatalf("expected StateProcessing after commit, got %v", session.State())
+	}
+
+	// Ensure we observe a transition to "not speaking".
+	session.handleAudioInput(silence)
+
+	// User starts speaking again within grace window -> cancel response and resume listening.
+	mockSTT.AddTranscript("again")
+	session.handleAudioInput(speech)
+
+	if !mockStream.stopped.Load() {
+		t.Error("expected StopResponse to be called on grace cancellation")
+	}
+	if session.State() != StateListening {
+		t.Fatalf("expected StateListening after grace cancellation, got %v", session.State())
+	}
+	if got := session.vad.GetTranscript(); !strings.Contains(got, "hello") {
+		t.Fatalf("expected transcript to preserve committed prefix, got %q", got)
+	}
+}
+
+func TestLiveSession_ConfirmAudioInterrupt_SeedsVAD(t *testing.T) {
+	mockStream := newMockRunStream()
+
+	session := NewLiveSession(LiveSessionConfig{
+		Connection: nil,
+		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
+			return mockStream, nil
+		},
+	})
+	defer session.Close()
+
+	if err := session.Configure(&SessionConfig{Model: "test"}); err != nil {
+		t.Fatalf("Configure failed: %v", err)
+	}
+	session.Start()
+
+	session.runStreamMu.Lock()
+	session.runStream = mockStream
+	session.runStreamMu.Unlock()
+
+	session.setState(StateSpeaking)
+
+	session.confirmAudioInterrupt("actually wait", "partial response", 123)
+
+	if !mockStream.stopped.Load() {
+		t.Fatal("expected StopResponse to be called")
+	}
+	if mockStream.interrupted.Load() {
+		t.Fatal("did not expect Interrupt() to be called (should wait for VAD commit)")
+	}
+	if session.State() != StateListening {
+		t.Fatalf("expected StateListening, got %v", session.State())
+	}
+	if got := session.vad.GetTranscript(); !strings.Contains(got, "actually wait") {
+		t.Fatalf("expected VAD transcript to be seeded, got %q", got)
+	}
+}
+
+func TestLiveSession_JSONMessageHandling(t *testing.T) {
+	session := NewLiveSession(LiveSessionConfig{
+		Connection: nil,
+	})
+	defer session.Close()
 
 	configMsg := map[string]any{
 		"type": "session.configure",
@@ -495,9 +521,8 @@ func TestLiveSession_JSONMessageHandling(t *testing.T) {
 			"system": "Test system",
 		},
 	}
-	if err := clientConn.WriteJSON(configMsg); err != nil {
-		t.Fatalf("write error: %v", err)
-	}
+	data, _ := json.Marshal(configMsg)
+	session.handleJSONMessage(data)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -507,60 +532,38 @@ func TestLiveSession_JSONMessageHandling(t *testing.T) {
 }
 
 func TestLiveSession_SendEvent(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 	defer session.Close()
 
 	session.Configure(&SessionConfig{Model: "test"})
-	session.Start()
-
-	time.Sleep(50 * time.Millisecond)
-
-	// Read the session.created event first
-	clientConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-	_, data, err := clientConn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read first event error: %v", err)
-	}
-
-	var firstMsg map[string]any
-	if err := json.Unmarshal(data, &firstMsg); err != nil {
-		t.Fatalf("unmarshal first event error: %v", err)
-	}
-	if firstMsg["type"] != "session.created" {
-		t.Errorf("expected first event type 'session.created', got %v", firstMsg["type"])
+	select {
+	case evt := <-session.Events():
+		if _, ok := evt.(SessionCreatedEvent); !ok {
+			t.Fatalf("expected SessionCreatedEvent, got %T", evt)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for SessionCreatedEvent")
 	}
 
 	session.sendEvent(VADListeningEvent{})
 
-	_, data, err = clientConn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read error: %v", err)
-	}
-
-	var msg map[string]any
-	if err := json.Unmarshal(data, &msg); err != nil {
-		t.Fatalf("unmarshal error: %v", err)
-	}
-
-	if msg["type"] != "vad.listening" {
-		t.Errorf("expected type 'vad.listening', got %v", msg["type"])
+	select {
+	case evt := <-session.Events():
+		if _, ok := evt.(VADListeningEvent); !ok {
+			t.Fatalf("expected VADListeningEvent, got %T", evt)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for VADListeningEvent")
 	}
 }
 
 func TestLiveSession_ForceInterrupt(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	mockStream := newMockRunStream()
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
 			return mockStream, nil
 		},
@@ -568,6 +571,7 @@ func TestLiveSession_ForceInterrupt(t *testing.T) {
 	defer session.Close()
 
 	session.Configure(&SessionConfig{Model: "test"})
+	session.Start()
 
 	session.runStreamMu.Lock()
 	session.runStream = mockStream
@@ -575,7 +579,13 @@ func TestLiveSession_ForceInterrupt(t *testing.T) {
 
 	session.setState(StateSpeaking)
 
-	session.forceInterrupt("stop now")
+	session.ForceInterrupt("stop now")
+
+	time.Sleep(50 * time.Millisecond)
+
+	if !mockStream.stopped.Load() {
+		t.Error("expected StopResponse to be called on force interrupt")
+	}
 
 	if !mockStream.interrupted.Load() {
 		t.Error("expected RunStream to be interrupted")
@@ -589,21 +599,17 @@ func TestLiveSession_ForceInterrupt(t *testing.T) {
 		t.Errorf("expected interrupt message 'stop now', got %q", msg)
 	}
 
-	if session.State() != StateListening {
-		t.Errorf("expected state Listening after force interrupt, got %v", session.State())
+	if session.State() == StateClosed {
+		t.Errorf("expected session to remain open after force interrupt")
 	}
 }
 
 func TestLiveSession_CommitTurn(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	var capturedMessage string
 	mockStream := newMockRunStream()
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
 			capturedMessage = firstMessage
 			return mockStream, nil
@@ -628,14 +634,10 @@ func TestLiveSession_CommitTurn(t *testing.T) {
 }
 
 func TestLiveSession_CommitTurn_EmptyTranscript(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	var runStreamCreated atomic.Bool
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
 			runStreamCreated.Store(true)
 			return newMockRunStream(), nil
@@ -659,14 +661,10 @@ func TestLiveSession_CommitTurn_EmptyTranscript(t *testing.T) {
 }
 
 func TestLiveSession_ProcessRunStreamEvents(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	mockStream := newMockRunStream()
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
 			go func() {
 				time.Sleep(20 * time.Millisecond)
@@ -696,15 +694,11 @@ func TestLiveSession_ProcessRunStreamEvents(t *testing.T) {
 }
 
 func TestLiveSession_SubsequentTurns_UseInterrupt(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	mockStream := newMockRunStream()
 	createCount := 0
 
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 		RunStreamCreator: func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error) {
 			createCount++
 			return mockStream, nil
@@ -749,12 +743,8 @@ func TestLiveSession_SubsequentTurns_UseInterrupt(t *testing.T) {
 }
 
 func TestLiveSession_ConcurrentAccess(t *testing.T) {
-	clientConn, serverConn, cleanup := setupTestWebSocket(t)
-	defer cleanup()
-	_ = clientConn
-
 	session := NewLiveSession(LiveSessionConfig{
-		Connection: serverConn,
+		Connection: nil,
 	})
 	defer session.Close()
 
