@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	coretypes "github.com/vango-ai/vango/pkg/core/types"
 	"github.com/vango-ai/vango/pkg/core/voice/tts"
 )
 
@@ -1287,27 +1288,50 @@ func (s *LiveSession) startTTSTurn() {
 
 // processStreamEvent handles underlying stream events (text deltas, etc.)
 func (s *LiveSession) processStreamEvent(event any) {
-	// Check for content block delta with text
-	if delta, ok := event.(interface{ TextDelta() (string, bool) }); ok {
-		if text, hasText := delta.TextDelta(); hasText && text != "" {
-			s.partialTextMu.Lock()
-			s.partialText.WriteString(text)
-			s.partialTextMu.Unlock()
+	text := ""
 
-			if s.State() == StateProcessing {
-				s.setState(StateSpeaking)
+	// Primary path: RunStream emits core streaming events.
+	switch e := event.(type) {
+	case coretypes.ContentBlockDeltaEvent:
+		switch d := e.Delta.(type) {
+		case coretypes.TextDelta:
+			text = d.Text
+		case *coretypes.TextDelta:
+			if d != nil {
+				text = d.Text
 			}
-
-			if s.tts != nil {
-				s.tts.SendText(text)
-			}
-
-			s.sendAssistantEvent(ContentBlockDeltaEvent{
-				Index: 0,
-				Delta: map[string]string{"type": "text_delta", "text": text},
-			})
 		}
 	}
+
+	// Compatibility path: adapters may emit a lightweight interface.
+	if text == "" {
+		if delta, ok := event.(interface{ TextDelta() (string, bool) }); ok {
+			if t, hasText := delta.TextDelta(); hasText {
+				text = t
+			}
+		}
+	}
+
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+
+	s.partialTextMu.Lock()
+	s.partialText.WriteString(text)
+	s.partialTextMu.Unlock()
+
+	if s.State() == StateProcessing {
+		s.setState(StateSpeaking)
+	}
+
+	if s.tts != nil {
+		s.tts.SendText(text)
+	}
+
+	s.sendAssistantEvent(ContentBlockDeltaEvent{
+		Index: 0,
+		Delta: map[string]any{"type": "text_delta", "text": text},
+	})
 }
 
 // ttsForwardLoop forwards TTS audio to the client.

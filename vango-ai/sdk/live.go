@@ -1193,8 +1193,13 @@ func (a *directSessionAdapter) handleSessionEvent(event live.SessionEvent) {
 
 	case live.ContentBlockDeltaEvent:
 		a.ls.emitEvent(LiveContentBlockEvent{Event: "delta", Index: e.Index, Delta: e.Delta})
-		if deltaMap, ok := e.Delta.(map[string]any); ok {
-			if text, ok := deltaMap["text"].(string); ok && text != "" {
+		switch delta := e.Delta.(type) {
+		case map[string]any:
+			if text, ok := delta["text"].(string); ok && text != "" {
+				a.ls.emitEvent(LiveTextDeltaEvent{Text: text})
+			}
+		case map[string]string:
+			if text := delta["text"]; text != "" {
 				a.ls.emitEvent(LiveTextDeltaEvent{Text: text})
 			}
 		}
