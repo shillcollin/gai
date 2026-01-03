@@ -11,6 +11,11 @@ import (
 const (
 	sampleRate = 24000
 	channels   = 1
+
+	// minBufferBeforePlay is the minimum bytes to buffer before starting playback.
+	// This prevents audio glitches when the first TTS chunk is small.
+	// At 24kHz 16-bit mono: 2400 bytes = 50ms of audio.
+	minBufferBeforePlay = 2400
 )
 
 // initAudio sets up microphone input and speaker output.
@@ -144,8 +149,9 @@ func (s *speakerWriter) Write(data []byte) {
 
 	s.buf = append(s.buf, data...)
 
-	// Start playing on first write
-	if !s.playing && !s.closed {
+	// Start playing once we have enough buffered to avoid underruns.
+	// This adds ~50ms latency but prevents glitchy audio on short first chunks.
+	if !s.playing && !s.closed && len(s.buf) >= minBufferBeforePlay {
 		s.playing = true
 		s.player = s.otoCtx.NewPlayer(s)
 		s.player.Play()
