@@ -81,9 +81,6 @@ type runConfig struct {
 	toolTimeout   time.Duration
 
 	// Live mode configuration
-	live            bool
-	liveConfig      *LiveConfig
-	liveOptions     []LiveStreamOption
 	voiceOutput     *LiveVoiceOutput
 	interruptConfig *LiveInterrupt
 }
@@ -241,34 +238,6 @@ type LiveInterrupt struct {
 
 // InterruptConfig is an alias for LiveInterrupt for backwards compatibility.
 type InterruptConfig = LiveInterrupt
-
-// WithLive enables real-time bidirectional mode for the run stream.
-// When enabled, the RunStream connects via WebSocket and supports
-// sending/receiving audio, transcripts, and real-time events.
-//
-// Example:
-//
-//	stream, err := client.Messages.RunStream(ctx, req, vango.WithLive())
-func WithLive() RunOption {
-	return func(c *runConfig) {
-		c.live = true
-	}
-}
-
-// WithLiveConfig provides full live session configuration.
-func WithLiveConfig(cfg *LiveConfig) RunOption {
-	return func(c *runConfig) {
-		c.live = true
-		c.liveConfig = cfg
-	}
-}
-
-// WithLiveOptions adds LiveStream options when in live mode.
-func WithLiveOptions(opts ...LiveStreamOption) RunOption {
-	return func(c *runConfig) {
-		c.liveOptions = append(c.liveOptions, opts...)
-	}
-}
 
 // WithVoiceOutput configures text-to-speech output.
 // This enables audio output from the model's responses.
@@ -678,10 +647,6 @@ type RunStream struct {
 	err       error
 	closed    atomic.Bool
 	closeOnce sync.Once
-
-	// Live mode state
-	liveMode   bool
-	liveStream *LiveStream
 }
 
 // RunStreamEvent is an event from the RunStream.
@@ -966,97 +931,8 @@ func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest
 		done:      make(chan struct{}),
 	}
 
-	// Check for live mode
-	if cfg.live {
-		rs.liveMode = true
-		go rs.runLive(ctx, s, req, cfg)
-	} else {
-		go rs.run(ctx, s, req, cfg)
-	}
+	go rs.run(ctx, s, req, cfg)
 	return rs
-}
-
-// runLive executes the live mode run loop using WebSocket.
-func (rs *RunStream) runLive(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig) {
-	defer rs.closeOnce.Do(func() {
-		close(rs.events)
-		close(rs.done)
-	})
-
-	// Build LiveConfig from request and config
-	liveCfg := cfg.liveConfig
-	if liveCfg == nil {
-		liveCfg = &LiveConfig{
-			Model:  req.Model,
-			System: systemToString(req.System),
-		}
-	} else {
-		// Use request values if not specified in liveConfig
-		if liveCfg.Model == "" {
-			liveCfg.Model = req.Model
-		}
-		if liveCfg.System == "" {
-			liveCfg.System = systemToString(req.System)
-		}
-	}
-
-	// Apply voice output config
-	if cfg.voiceOutput != nil {
-		if liveCfg.Voice == nil {
-			liveCfg.Voice = &LiveVoiceConfig{}
-		}
-		liveCfg.Voice.Output = &LiveVoiceOutputConfig{
-			Provider:   cfg.voiceOutput.Provider,
-			Voice:      cfg.voiceOutput.Voice,
-			Speed:      cfg.voiceOutput.Speed,
-			Format:     cfg.voiceOutput.Format,
-			SampleRate: cfg.voiceOutput.SampleRate,
-		}
-	}
-
-	// Apply interrupt config
-	if cfg.interruptConfig != nil {
-		if liveCfg.Voice == nil {
-			liveCfg.Voice = &LiveVoiceConfig{}
-		}
-		liveCfg.Voice.Interrupt = &LiveInterruptConfig{
-			Mode:            LiveInterruptMode(cfg.interruptConfig.Mode),
-			EnergyThreshold: cfg.interruptConfig.EnergyThreshold,
-			DebounceMs:      cfg.interruptConfig.DebounceMs,
-			SemanticCheck:   cfg.interruptConfig.SemanticCheck,
-			SemanticModel:   cfg.interruptConfig.SemanticModel,
-			SavePartial:     LiveSaveBehavior(cfg.interruptConfig.SavePartial),
-		}
-	}
-
-	// Copy tools from request
-	liveCfg.Tools = req.Tools
-
-	// Build options - add tool handlers
-	opts := cfg.liveOptions
-	if len(cfg.toolHandlers) > 0 {
-		for name, handler := range cfg.toolHandlers {
-			opts = append(opts, WithLiveToolHandler(name, handler))
-		}
-	}
-
-	// Create the live stream
-	liveStream, err := svc.Live(ctx, liveCfg, opts...)
-	if err != nil {
-		rs.err = err
-		return
-	}
-	rs.liveStream = liveStream
-
-	// Forward live events to the RunStream events channel
-	go func() {
-		for event := range liveStream.Events() {
-			rs.forwardLiveEvent(event)
-		}
-	}()
-
-	// Wait for the live stream to close
-	<-liveStream.Done()
 }
 
 func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig) {
@@ -1501,144 +1377,10 @@ func (rs *RunStream) Close() error {
 	if rs.closed.Swap(true) {
 		return nil
 	}
-	// Close live stream if in live mode
-	if rs.liveStream != nil {
-		rs.liveStream.Close()
-	}
 	// Only close done channel once; the closeOnce ensures this
 	// Note: done might already be closed by run() goroutine via closeOnce
 	rs.closeOnce.Do(func() {
 		close(rs.done)
 	})
 	return nil
-}
-
-// --- Live Mode Methods ---
-
-// IsLive returns true if the stream is in live mode.
-func (rs *RunStream) IsLive() bool {
-	return rs.liveMode
-}
-
-// SendAudio sends audio data to the live session.
-// Only available when WithLive() is used.
-// Audio should be 16-bit PCM at 24kHz mono.
-func (rs *RunStream) SendAudio(data []byte) error {
-	if !rs.liveMode || rs.liveStream == nil {
-		return fmt.Errorf("SendAudio requires live mode (use WithLive())")
-	}
-	return rs.liveStream.SendAudio(data)
-}
-
-// SendText sends text input to the live session.
-// Only available when WithLive() is used.
-func (rs *RunStream) SendText(text string) error {
-	if !rs.liveMode || rs.liveStream == nil {
-		return fmt.Errorf("SendText in live mode requires WithLive()")
-	}
-	return rs.liveStream.SendText(text)
-}
-
-// Commit forces the end of the current user turn in live mode.
-// Use this for push-to-talk mode.
-func (rs *RunStream) Commit() error {
-	if !rs.liveMode || rs.liveStream == nil {
-		return fmt.Errorf("Commit requires live mode (use WithLive())")
-	}
-	return rs.liveStream.Commit()
-}
-
-// LiveInterrupt forces an interrupt in live mode, skipping semantic check.
-func (rs *RunStream) LiveInterrupt(transcript string) error {
-	if !rs.liveMode || rs.liveStream == nil {
-		return fmt.Errorf("LiveInterrupt requires live mode (use WithLive())")
-	}
-	return rs.liveStream.Interrupt(transcript)
-}
-
-// Audio returns the channel of TTS audio output in live mode.
-// Returns nil if not in live mode.
-func (rs *RunStream) Audio() <-chan []byte {
-	if !rs.liveMode || rs.liveStream == nil {
-		return nil
-	}
-	return rs.liveStream.Audio()
-}
-
-// LiveEvents returns the channel of live-specific events.
-// Returns nil if not in live mode.
-func (rs *RunStream) LiveEvents() <-chan LiveEvent {
-	if !rs.liveMode || rs.liveStream == nil {
-		return nil
-	}
-	return rs.liveStream.Events()
-}
-
-// SessionID returns the live session identifier.
-// Returns empty string if not in live mode.
-func (rs *RunStream) SessionID() string {
-	if !rs.liveMode || rs.liveStream == nil {
-		return ""
-	}
-	return rs.liveStream.SessionID()
-}
-
-// LiveEventWrapper wraps a LiveEvent as a RunStreamEvent for forwarding.
-type LiveEventWrapper struct {
-	Event LiveEvent
-}
-
-func (e LiveEventWrapper) runStreamEventType() string { return "live_event" }
-
-// forwardLiveEvent converts live events to RunStream events.
-// All events are forwarded - some are converted to specific RunStreamEvent types,
-// others are wrapped in LiveEventWrapper.
-func (rs *RunStream) forwardLiveEvent(event LiveEvent) {
-	switch e := event.(type) {
-	case LiveTextDeltaEvent:
-		// Forward as a stream event wrapper with text delta
-		rs.send(StreamEventWrapper{
-			Event: types.ContentBlockDeltaEvent{
-				Type:  "content_block_delta",
-				Index: 0,
-				Delta: types.TextDelta{
-					Type: "text_delta",
-					Text: e.Text,
-				},
-			},
-		})
-
-	case LiveToolCallEvent:
-		rs.send(ToolCallStartEvent{
-			ID:    e.ID,
-			Name:  e.Name,
-			Input: e.Input,
-		})
-
-	case LiveMessageStopEvent:
-		rs.send(StepCompleteEvent{
-			Index: 0,
-		})
-
-	case LiveErrorEvent:
-		rs.send(StreamEventWrapper{
-			Event: types.ErrorEvent{
-				Type: "error",
-				Error: types.Error{
-					Type:    e.Code,
-					Message: e.Message,
-				},
-			},
-		})
-
-	case LiveAudioEvent:
-		rs.send(AudioChunkEvent{
-			Data:   e.Data,
-			Format: e.Format,
-		})
-
-	default:
-		// Forward all other live events wrapped for type-safe access
-		rs.send(LiveEventWrapper{Event: event})
-	}
 }

@@ -1,1456 +1,1160 @@
-// Package live provides real-time bidirectional voice session functionality.
 package live
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
-	coretypes "github.com/vango-ai/vango/pkg/core/types"
+	"github.com/vango-ai/vango/pkg/core/types"
+	"github.com/vango-ai/vango/pkg/core/voice/stt"
 	"github.com/vango-ai/vango/pkg/core/voice/tts"
 )
 
-const (
-	userGracePeriod = 5 * time.Second
-)
+// LLMClient is the interface for making LLM requests.
+type LLMClient interface {
+	// CreateMessage sends a non-streaming message request.
+	CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error)
 
-// SessionState represents the current state of the live session.
-type SessionState int
-
-const (
-	// StateConfiguring is the initial state before configuration is received.
-	StateConfiguring SessionState = iota
-
-	// StateListening indicates the session is listening for user input.
-	StateListening
-
-	// StateProcessing indicates the session is processing user input (agent turn).
-	StateProcessing
-
-	// StateSpeaking indicates the session is generating and sending TTS output.
-	StateSpeaking
-
-	// StateInterruptCheck indicates TTS is paused while checking if speech is an interrupt.
-	StateInterruptCheck
-
-	// StateClosed indicates the session has been closed.
-	StateClosed
-)
-
-// String returns a string representation of the session state.
-func (s SessionState) String() string {
-	switch s {
-	case StateConfiguring:
-		return "configuring"
-	case StateListening:
-		return "listening"
-	case StateProcessing:
-		return "processing"
-	case StateSpeaking:
-		return "speaking"
-	case StateInterruptCheck:
-		return "interrupt_check"
-	case StateClosed:
-		return "closed"
-	default:
-		return "unknown"
-	}
+	// StreamMessage sends a streaming message request.
+	// Returns an EventStream that yields streaming events.
+	StreamMessage(ctx context.Context, req *types.MessageRequest) (EventStream, error)
 }
 
-// STTStream is the interface for speech-to-text streaming.
-type STTStream interface {
-	Write(audio []byte) error
-	Transcript() string
-	TranscriptDelta() string
-	Reset()
+// EventStream is an iterator over streaming events from LLM.
+type EventStream interface {
+	// Next returns the next event. Returns nil, io.EOF when done.
+	Next() (types.StreamEvent, error)
+
+	// Close releases resources.
 	Close() error
 }
 
-// InterruptBehavior specifies how to handle partial responses when interrupted.
-type InterruptBehavior int
-
-const (
-	InterruptDiscard     InterruptBehavior = iota // Discard partial response
-	InterruptSavePartial                          // Save partial response as-is
-	InterruptSaveMarked                           // Save with [interrupted] marker
-)
-
-// RunStreamEvent is an event from the RunStream.
-type RunStreamEvent interface {
-	runStreamEventType() string
+// TTSClient is the interface for text-to-speech synthesis.
+type TTSClient interface {
+	// NewStreamingContext creates a new streaming TTS context.
+	NewStreamingContext(ctx context.Context, opts tts.StreamingContextOptions) (*tts.StreamingContext, error)
 }
 
-// --- RunStream Event Types ---
-
-// StreamEventWrapper wraps an underlying streaming event.
-type StreamEventWrapper struct {
-	Evt any
+// STTClient is the interface for speech-to-text transcription.
+type STTClient interface {
+	// NewStreamingSTT creates a new streaming STT session.
+	NewStreamingSTT(ctx context.Context, opts stt.TranscribeOptions) (*stt.StreamingSTT, error)
 }
 
-func (e *StreamEventWrapper) runStreamEventType() string { return "stream_event" }
+// Session is the main orchestrator for a live voice conversation.
+// It coordinates STT, VAD, grace period, LLM, TTS, and interrupt detection.
+type Session struct {
+	config      SessionConfig
+	audioConfig AudioConfig
 
-// Event returns the underlying event.
-func (e *StreamEventWrapper) Event() any { return e.Evt }
+	// Clients
+	llmClient LLMClient
+	ttsClient TTSClient
+	sttClient STTClient
 
-// StepStartEvent signals the start of an agent step.
-type StepStartEvent struct{}
-
-func (e *StepStartEvent) runStreamEventType() string { return "step_start" }
-
-// StepCompleteEvent signals the completion of an agent step.
-type StepCompleteEvent struct{}
-
-func (e *StepCompleteEvent) runStreamEventType() string { return "step_complete" }
-
-// ToolCallStartEvent signals a tool call is starting.
-type ToolCallStartEvent struct {
-	ID       string
-	Name     string
-	InputMap map[string]any
-}
-
-func (e *ToolCallStartEvent) runStreamEventType() string { return "tool_call_start" }
-func (e *ToolCallStartEvent) ToolID() string             { return e.ID }
-func (e *ToolCallStartEvent) ToolName() string           { return e.Name }
-func (e *ToolCallStartEvent) ToolInput() map[string]any  { return e.InputMap }
-
-// InterruptedEvent signals that the stream was interrupted.
-type InterruptedEvent struct{}
-
-func (e *InterruptedEvent) runStreamEventType() string { return "interrupted" }
-
-// RunCompleteEvent signals that the run is complete.
-type RunCompleteEvent struct{}
-
-func (e *RunCompleteEvent) runStreamEventType() string { return "run_complete" }
-
-// RunErrorEvent signals an error occurred during the run.
-type RunErrorEvent struct {
-	Err error
-}
-
-func (e *RunErrorEvent) runStreamEventType() string { return "error" }
-func (e *RunErrorEvent) Error() error               { return e.Err }
-
-// TextDeltaAdapter adapts text deltas for the forwardRunStreamEvent handler.
-type TextDeltaAdapter struct {
-	Text string
-}
-
-func (e *TextDeltaAdapter) TextDelta() (string, bool) { return e.Text, true }
-
-// RunStreamInterface abstracts the RunStream for dependency injection.
-type RunStreamInterface interface {
-	// Events returns the channel of run stream events.
-	Events() <-chan RunStreamEvent
-
-	// StopResponse stops the current response without injecting a message.
-	// Implementations may optionally persist partial assistant output based on behavior.
-	StopResponse(partialText string, behavior InterruptBehavior) error
-
-	// Interrupt stops the current stream, saves partial per behavior,
-	// injects a new message, and continues the conversation.
-	Interrupt(msg UserMessage, behavior InterruptBehavior) error
-
-	// InterruptWithText is a convenience for text interrupts.
-	InterruptWithText(text string) error
-
-	// Cancel stops the stream without injecting a message.
-	Cancel() error
-
-	// Close closes the stream completely.
-	Close() error
-}
-
-// UserMessage represents a user message to inject.
-type UserMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// RunStreamCreator creates the initial RunStream for a session.
-// It receives the config and the first user message.
-type RunStreamCreator func(ctx context.Context, config *SessionConfig, firstMessage string) (RunStreamInterface, error)
-
-// STTStreamFactory creates a new STT stream.
-type STTStreamFactory func(ctx context.Context, config *VoiceInputConfig) (STTStream, error)
-
-// TTSFactory creates a new streaming TTS context for a single assistant response.
-type TTSFactory func(ctx context.Context, config *VoiceOutputConfig) (*tts.StreamingContext, error)
-
-// LiveSession manages a real-time bidirectional voice session.
-type LiveSession struct {
-	id   string
-	conn *websocket.Conn
-
-	// Configuration
-	config   *SessionConfig
-	configMu sync.RWMutex
-
-	// Dependency injection
-	runStreamCreator RunStreamCreator
-	sttFactory       STTStreamFactory
-	ttsFactory       TTSFactory
-	llmFunc          LLMFunc
-
-	// Active components
-	runStream         RunStreamInterface
-	runStreamMu       sync.Mutex
-	stt               STTStream
-	sttMu             sync.Mutex
-	vad               *HybridVAD
-	tts               *TTSPipeline
-	interruptDetector *InterruptDetector
-	audioBuffer       *AudioBuffer
+	// Components
+	vad         *HybridVAD
+	gracePeriod *GracePeriodManager
+	interrupt   *InterruptDetector
 
 	// State
-	state   SessionState
-	stateMu sync.RWMutex
+	mu                sync.RWMutex
+	state             SessionState
+	sessionID         string
+	messages          []types.Message
+	currentTranscript string
+	partialResponse   string
 
-	// Partial text tracking for interrupts
-	partialText   strings.Builder
-	partialTextMu sync.Mutex
+	// STT session
+	sttSession *stt.StreamingSTT
+	sttMu      sync.Mutex
 
-	// User grace period handling (Phase 7 live mode)
-	graceMu                  sync.Mutex
-	graceActive              bool
-	graceDeadline            time.Time
-	graceCommittedTranscript string
-
-	// Speech tracking for grace window (based on VAD energy threshold)
-	speechMu         sync.Mutex
-	lastUserSpeechAt time.Time
-	userWasSpeaking  bool
-
-	// Assistant output gating (used during interrupt checks to pause text delivery).
-	outputMu     sync.Mutex
-	outputPaused bool
-	outputBuffer []SessionEvent
-
-	// Per-turn stop reason override (set when we cancel a response).
-	stopMu         sync.Mutex
-	nextStopReason string
-
-	// Interrupt check state (600ms capture + semantic classify).
-	interruptMu             sync.Mutex
-	interruptCheckID        uint64
-	interruptPrevState      SessionState
-	interruptAudioPosMs     int64
-	interruptPartialAtPause string
-
-	// Turn coordination
-	turnReady chan string // Signals a new turn is ready with transcript
+	// TTS context
+	ttsContext  *tts.StreamingContext
+	ttsMu       sync.Mutex
+	ttsPaused   bool
+	ttsPosition int
 
 	// Channels
-	incomingAudio  chan []byte
-	incomingText   chan string
-	outgoingEvents chan SessionEvent
+	events chan Event
+	audio  chan []byte
+	done   chan struct{}
+	closed atomic.Bool
 
-	// Lifecycle
-	ctx       context.Context
-	cancel    context.CancelFunc
-	done      chan struct{}
-	closeOnce sync.Once
-	closed    atomic.Bool
+	// Context for cancellation
+	ctx         context.Context
+	cancel      context.CancelFunc
+	agentCancel context.CancelFunc
 
-	// WebSocket write mutex
-	writeMu sync.Mutex
+	// Debug logging
+	debugEnabled bool
 }
 
-// LiveSessionConfig configures a new LiveSession.
-type LiveSessionConfig struct {
-	Connection       *websocket.Conn
-	RunStreamCreator RunStreamCreator
-	STTFactory       STTStreamFactory
-	TTSFactory       TTSFactory
-	LLMFunc          LLMFunc
-	SessionID        string
-}
-
-// NewLiveSession creates a new live session.
-func NewLiveSession(cfg LiveSessionConfig) *LiveSession {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	id := cfg.SessionID
-	if id == "" {
-		id = generateSessionID()
+// NewSession creates a new live session.
+func NewSession(
+	config SessionConfig,
+	llmClient LLMClient,
+	ttsClient TTSClient,
+	sttClient STTClient,
+) *Session {
+	audioConfig := AudioConfig{
+		SampleRate:    config.SampleRate,
+		Channels:      config.Channels,
+		BitsPerSample: 16,
+	}
+	if audioConfig.SampleRate == 0 {
+		audioConfig.SampleRate = 24000
+	}
+	if audioConfig.Channels == 0 {
+		audioConfig.Channels = 1
 	}
 
-	return &LiveSession{
-		id:               id,
-		conn:             cfg.Connection,
-		runStreamCreator: cfg.RunStreamCreator,
-		sttFactory:       cfg.STTFactory,
-		ttsFactory:       cfg.TTSFactory,
-		llmFunc:          cfg.LLMFunc,
-		state:            StateConfiguring,
-		turnReady:        make(chan string, 1),
-		incomingAudio:    make(chan []byte, 100),
-		incomingText:     make(chan string, 10),
-		outgoingEvents:   make(chan SessionEvent, 100),
-		ctx:              ctx,
-		cancel:           cancel,
-		done:             make(chan struct{}),
+	s := &Session{
+		config:      config,
+		audioConfig: audioConfig,
+		llmClient:   llmClient,
+		ttsClient:   ttsClient,
+		sttClient:   sttClient,
+		state:       StateConfiguring,
+		sessionID:   generateSessionID(),
+		messages:    make([]types.Message, 0),
+		events:      make(chan Event, 100),
+		audio:       make(chan []byte, 100),
+		done:        make(chan struct{}),
 	}
+
+	// Copy initial messages if provided
+	if len(config.Messages) > 0 {
+		s.messages = append(s.messages, config.Messages...)
+	}
+
+	return s
 }
 
-// ID returns the session identifier.
-func (s *LiveSession) ID() string {
-	return s.id
+// EnableDebug enables debug event emission.
+func (s *Session) EnableDebug() {
+	s.debugEnabled = true
+}
+
+// SessionID returns the session identifier.
+func (s *Session) SessionID() string {
+	return s.sessionID
 }
 
 // State returns the current session state.
-func (s *LiveSession) State() SessionState {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
+func (s *Session) State() SessionState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.state
 }
 
-func (s *LiveSession) setState(state SessionState) {
-	s.stateMu.Lock()
-	s.state = state
-	s.stateMu.Unlock()
+// Events returns the channel for receiving session events.
+func (s *Session) Events() <-chan Event {
+	return s.events
 }
 
-// Configure applies session configuration.
-func (s *LiveSession) Configure(cfg *SessionConfig) error {
-	s.stateMu.Lock()
-	if s.state != StateConfiguring && s.state != StateListening {
-		s.stateMu.Unlock()
-		return fmt.Errorf("cannot configure in state %v", s.state)
+// Start begins the live session.
+func (s *Session) Start(ctx context.Context) error {
+	s.mu.Lock()
+	if s.state != StateConfiguring {
+		s.mu.Unlock()
+		return fmt.Errorf("session already started")
 	}
-	s.stateMu.Unlock()
+	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.mu.Unlock()
 
-	cfg.ApplyDefaults()
-
-	s.configMu.Lock()
-	s.config = cfg
-	s.configMu.Unlock()
-
-	// Initialize VAD
-	var vadConfig VADConfig
-	if cfg.Voice.VAD != nil {
-		vadConfig = *cfg.Voice.VAD
-	}
-	s.vad = NewHybridVAD(vadConfig)
-
-	// Set up semantic checker for VAD
-	if s.llmFunc != nil {
-		semanticChecker := NewLLMSemanticChecker(s.llmFunc, LLMSemanticCheckerConfig{
-			Model:   vadConfig.Model,
-			Timeout: 500 * time.Millisecond,
-		})
-		s.vad.SetSemanticChecker(semanticChecker)
+	// Initialize components
+	if err := s.initComponents(); err != nil {
+		return fmt.Errorf("init components: %w", err)
 	}
 
-	// Initialize TTS pipeline
-	ttsFormat := "pcm"
-	sampleRate := 24000
-	if cfg.Voice.Output != nil {
-		if cfg.Voice.Output.SampleRate > 0 {
-			sampleRate = cfg.Voice.Output.SampleRate
-		}
-		if cfg.Voice.Output.Format != "" {
-			ttsFormat = cfg.Voice.Output.Format
-		}
-	}
-	s.tts = NewTTSPipeline(TTSPipelineConfig{
-		SampleRate: sampleRate,
-		Format:     ttsFormat,
-	})
-
-	// Initialize interrupt handler
-	if s.llmFunc != nil && cfg.Voice.Interrupt != nil {
-		s.interruptDetector = NewInterruptDetector(s.llmFunc, *cfg.Voice.Interrupt)
+	// Start STT session
+	if err := s.startSTT(); err != nil {
+		return fmt.Errorf("start STT: %w", err)
 	}
 
-	// Initialize audio buffer
-	s.audioBuffer = NewAudioBuffer(DefaultAudioFormat(), 3*time.Second)
+	// Start processing loops
+	go s.audioLoop()
+	go s.sttLoop()
 
-	// Initialize STT
-	if s.sttFactory != nil {
-		stt, err := s.sttFactory(s.ctx, cfg.Voice.Input)
-		if err != nil {
-			return fmt.Errorf("failed to initialize STT: %w", err)
-		}
-		s.sttMu.Lock()
-		s.stt = stt
-		s.sttMu.Unlock()
-	}
-
+	// Transition to listening state
 	s.setState(StateListening)
 
-	// Emit session.created after successful configuration.
-	s.sendEvent(SessionCreatedEvent{
-		SessionID: s.id,
-		Config: SessionInfoConfig{
-			Model:      s.getModel(),
-			SampleRate: s.getSampleRate(),
-			Channels:   1,
-		},
+	// Emit session created event
+	s.emit(&SessionCreatedEvent{
+		SessionID:  s.sessionID,
+		Config:     &s.config,
+		SampleRate: s.audioConfig.SampleRate,
+		Channels:   s.audioConfig.Channels,
 	})
+
 	return nil
 }
 
-// Start begins processing the session.
-func (s *LiveSession) Start() {
-	if s.conn != nil {
-		go s.readLoop()
-		go s.writeLoop()
-	}
-	go s.processLoop()
-	go s.ttsForwardLoop()
-	go s.runStreamLoop() // Single loop for RunStream lifetime
-}
-
-func (s *LiveSession) getModel() string {
-	s.configMu.RLock()
-	defer s.configMu.RUnlock()
-	if s.config != nil {
-		return s.config.Model
-	}
-	return ""
-}
-
-func (s *LiveSession) getSampleRate() int {
-	s.configMu.RLock()
-	defer s.configMu.RUnlock()
-
-	if s.config != nil && s.config.Voice != nil && s.config.Voice.Output != nil && s.config.Voice.Output.SampleRate > 0 {
-		return s.config.Voice.Output.SampleRate
-	}
-	return 24000
-}
-
-// Events returns server-side session events. This is intended for in-process (direct) sessions
-// where no WebSocket connection is attached.
-func (s *LiveSession) Events() <-chan SessionEvent {
-	return s.outgoingEvents
-}
-
-// EnqueueAudio injects an audio frame into the session (for in-process/direct mode).
-func (s *LiveSession) EnqueueAudio(pcm []byte) error {
-	select {
-	case s.incomingAudio <- pcm:
-		return nil
-	case <-s.done:
-		return fmt.Errorf("session closed")
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	}
-}
-
-// EnqueueText injects text into the session (for in-process/direct mode).
-func (s *LiveSession) EnqueueText(text string) error {
-	select {
-	case s.incomingText <- text:
-		return nil
-	case <-s.done:
-		return fmt.Errorf("session closed")
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	}
-}
-
-// ForceCommit forces end-of-turn (push-to-talk).
-func (s *LiveSession) ForceCommit() { s.commitTurn() }
-
-// ForceInterrupt forces an interrupt, skipping semantic check.
-func (s *LiveSession) ForceInterrupt(transcript string) { s.forceInterruptAndCommitText(transcript) }
-
-// readLoop reads messages from the WebSocket.
-func (s *LiveSession) readLoop() {
-	defer s.Close()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-s.done:
-			return
-		default:
-		}
-
-		messageType, data, err := s.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return
-			}
-			s.sendEvent(ErrorEvent{Code: "read_error", Message: err.Error()})
-			return
-		}
-
-		switch messageType {
-		case websocket.BinaryMessage:
-			select {
-			case s.incomingAudio <- data:
-			case <-s.done:
-				return
-			}
-		case websocket.TextMessage:
-			s.handleJSONMessage(data)
-		}
-	}
-}
-
-func (s *LiveSession) handleJSONMessage(data []byte) {
-	var msg struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(data, &msg); err != nil {
-		s.sendEvent(ErrorEvent{Code: "parse_error", Message: "invalid JSON"})
-		return
-	}
-
-	switch msg.Type {
-	case EventTypeSessionConfigure:
-		var configMsg SessionConfigureMessage
-		if err := json.Unmarshal(data, &configMsg); err != nil {
-			s.sendEvent(ErrorEvent{Code: "parse_error", Message: err.Error()})
-			return
-		}
-		if err := s.Configure(configMsg.Config); err != nil {
-			s.sendEvent(ErrorEvent{Code: "config_error", Message: err.Error()})
-			return
-		}
-
-	case EventTypeSessionUpdate:
-		var updateMsg SessionUpdateMessage
-		if err := json.Unmarshal(data, &updateMsg); err != nil {
-			s.sendEvent(ErrorEvent{Code: "parse_error", Message: err.Error()})
-			return
-		}
-		if err := s.UpdateConfig(updateMsg.Config); err != nil {
-			s.sendEvent(ErrorEvent{Code: "config_error", Message: err.Error()})
-		}
-
-	case EventTypeInputText:
-		var textMsg InputTextMessage
-		if err := json.Unmarshal(data, &textMsg); err != nil {
-			s.sendEvent(ErrorEvent{Code: "parse_error", Message: err.Error()})
-			return
-		}
-		select {
-		case s.incomingText <- textMsg.Text:
-		case <-s.done:
-		}
-
-	case EventTypeInputCommit:
-		s.commitTurn()
-
-	case EventTypeInputInterrupt:
-		var intMsg InputInterruptMessage
-		if err := json.Unmarshal(data, &intMsg); err != nil {
-			s.sendEvent(ErrorEvent{Code: "parse_error", Message: err.Error()})
-			return
-		}
-		s.forceInterruptAndCommitText(intMsg.Transcript)
-
-	default:
-		s.sendEvent(ErrorEvent{Code: "unknown_message", Message: "unknown type: " + msg.Type})
-	}
-}
-
-// writeLoop writes events to the WebSocket.
-func (s *LiveSession) writeLoop() {
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-s.done:
-			return
-		case event := <-s.outgoingEvents:
-			s.writeEvent(event)
-		}
-	}
-}
-
-func (s *LiveSession) writeEvent(event SessionEvent) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if audioEvent, ok := event.(AudioDeltaEvent); ok {
-		return s.conn.WriteMessage(websocket.BinaryMessage, audioEvent.Data)
-	}
-
-	msg := map[string]any{"type": event.sessionEventType()}
-	eventData, _ := json.Marshal(event)
-	json.Unmarshal(eventData, &msg)
-	return s.conn.WriteJSON(msg)
-}
-
-// processLoop handles incoming audio and text.
-func (s *LiveSession) processLoop() {
-	defer s.cleanup()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-s.done:
-			return
-		case chunk := <-s.incomingAudio:
-			s.handleAudioInput(chunk)
-		case text := <-s.incomingText:
-			s.handleTextInput(text)
-		}
-	}
-}
-
-func (s *LiveSession) handleAudioInput(chunk []byte) {
-	state := s.State()
-	s.audioBuffer.Write(chunk)
-
-	// Track user speech start based on the VAD energy threshold.
-	now := time.Now()
-	energy := CalculateEnergy(chunk)
-	speechStarted := s.updateUserSpeechState(now, energy)
-
-	// Feed to STT
-	s.sttMu.Lock()
-	stt := s.stt
-	s.sttMu.Unlock()
-
-	var transcriptDelta string
-	if stt != nil {
-		if err := stt.Write(chunk); err == nil {
-			transcriptDelta = stt.TranscriptDelta()
-			if transcriptDelta != "" {
-				s.sendEvent(TranscriptDeltaEvent{Delta: transcriptDelta})
-			}
-		}
-	}
-
-	// Grace period: if we committed a user turn but they start talking again within
-	// 5 seconds of their last speech, cancel the in-flight response and treat the
-	// user as continuing the same utterance.
-	if speechStarted && (state == StateProcessing || state == StateSpeaking) {
-		if prefix, ok := s.graceTranscriptIfActive(now); ok {
-			s.cancelForGrace(prefix)
-			// Process this chunk as normal listening input (continue accumulating transcript).
-			_ = s.vad.ProcessAudio(chunk, transcriptDelta)
-			return
-		}
-	}
-
-	switch state {
-	case StateListening:
-		result := s.vad.ProcessAudio(chunk, transcriptDelta)
-		if result == VADCommit {
-			s.commitTurn()
-		}
-
-	case StateProcessing, StateSpeaking:
-		s.maybeBeginInterruptCheck(now, energy)
-
-	case StateInterruptCheck:
-		// During interrupt checks, we keep feeding STT (above) but don't advance VAD.
-	}
-}
-
-func (s *LiveSession) vadEnergyThreshold() float64 {
-	s.configMu.RLock()
-	defer s.configMu.RUnlock()
-
-	if s.config != nil && s.config.Voice != nil && s.config.Voice.VAD != nil && s.config.Voice.VAD.EnergyThreshold > 0 {
-		return s.config.Voice.VAD.EnergyThreshold
-	}
-	return DefaultVADConfig().EnergyThreshold
-}
-
-func (s *LiveSession) updateUserSpeechState(now time.Time, energy float64) (speechStarted bool) {
-	threshold := s.vadEnergyThreshold()
-	isSpeech := energy >= threshold
-
-	s.speechMu.Lock()
-	defer s.speechMu.Unlock()
-
-	speechStarted = isSpeech && !s.userWasSpeaking
-	s.userWasSpeaking = isSpeech
-	if isSpeech {
-		s.lastUserSpeechAt = now
-	}
-	return speechStarted
-}
-
-func (s *LiveSession) graceTranscriptIfActive(now time.Time) (string, bool) {
-	s.graceMu.Lock()
-	defer s.graceMu.Unlock()
-
-	if !s.graceActive {
-		return "", false
-	}
-	if !s.graceDeadline.IsZero() && now.After(s.graceDeadline) {
-		s.graceActive = false
-		s.graceDeadline = time.Time{}
-		s.graceCommittedTranscript = ""
-		return "", false
-	}
-	if s.graceCommittedTranscript == "" {
-		return "", false
-	}
-	return s.graceCommittedTranscript, true
-}
-
-func (s *LiveSession) cancelForGrace(prefix string) {
-	// Clear grace state first so we don't re-enter.
-	s.graceMu.Lock()
-	s.graceActive = false
-	s.graceDeadline = time.Time{}
-	s.graceCommittedTranscript = ""
-	s.graceMu.Unlock()
-
-	// Drain any pending "turn ready" signal to avoid starting a response for the canceled turn.
-	select {
-	case <-s.turnReady:
-	default:
-	}
-
-	// Stop any in-flight response without saving partial output.
-	s.setNextStopReason("grace_cancelled")
-	s.runStreamMu.Lock()
-	runStream := s.runStream
-	s.runStreamMu.Unlock()
-	if runStream != nil {
-		_ = runStream.StopResponse("", InterruptDiscard)
-	}
-
-	if s.tts != nil {
-		s.tts.Cancel()
-	}
-
-	s.partialTextMu.Lock()
-	s.partialText.Reset()
-	s.partialTextMu.Unlock()
-
-	// Reset VAD and restore the committed transcript so the user can continue seamlessly.
-	prefix = strings.TrimSpace(prefix)
-	s.vad.Reset()
-	if prefix != "" {
-		s.vad.AddTranscript(prefix + " ")
-	}
-
-	s.setState(StateListening)
-}
-
-func (s *LiveSession) handleTextInput(text string) {
-	state := s.State()
-	switch state {
-	case StateListening:
-		s.vad.AddTranscript(text)
-		s.commitTurn()
-	case StateSpeaking, StateProcessing, StateInterruptCheck:
-		s.forceInterruptAndCommitText(text)
-	}
-}
-
-func (s *LiveSession) maybeBeginInterruptCheck(now time.Time, energy float64) {
-	state := s.State()
-	if state != StateProcessing && state != StateSpeaking {
-		return
-	}
-
-	s.configMu.RLock()
-	interruptCfg := (*InterruptConfig)(nil)
-	if s.config != nil && s.config.Voice != nil {
-		interruptCfg = s.config.Voice.Interrupt
-	}
-	s.configMu.RUnlock()
-
-	mode := InterruptModeAuto
-	threshold := DefaultInterruptConfig().EnergyThreshold
-	if interruptCfg != nil {
-		mode = interruptCfg.Mode
-		if interruptCfg.EnergyThreshold > 0 {
-			threshold = interruptCfg.EnergyThreshold
-		}
-	}
-
-	if mode != InterruptModeAuto {
-		return
-	}
-	if energy < threshold {
-		return
-	}
-
-	s.beginInterruptCheck(state)
-}
-
-func (s *LiveSession) beginInterruptCheck(prevState SessionState) {
-	s.interruptMu.Lock()
-	// Only one interrupt check at a time.
-	if s.State() == StateInterruptCheck {
-		s.interruptMu.Unlock()
-		return
-	}
-	s.interruptCheckID++
-	id := s.interruptCheckID
-	s.interruptPrevState = prevState
-
-	s.partialTextMu.Lock()
-	s.interruptPartialAtPause = s.partialText.String()
-	s.partialTextMu.Unlock()
-
-	audioPos := int64(0)
-	if s.tts != nil {
-		audioPos = s.tts.Pause()
-	}
-	s.interruptAudioPosMs = audioPos
-	s.interruptMu.Unlock()
-
-	s.setOutputPaused(true)
-	s.setState(StateInterruptCheck)
-
-	go s.finishInterruptCheck(id)
-}
-
-func (s *LiveSession) finishInterruptCheck(id uint64) {
-	select {
-	case <-s.ctx.Done():
-		return
-	case <-s.done:
-		return
-	case <-time.After(600 * time.Millisecond):
-	}
-
-	s.interruptMu.Lock()
-	if s.interruptCheckID != id || s.State() != StateInterruptCheck {
-		s.interruptMu.Unlock()
-		return
-	}
-	prevState := s.interruptPrevState
-	audioPos := s.interruptAudioPosMs
-	partialAtPause := s.interruptPartialAtPause
-	s.interruptMu.Unlock()
-
-	interruptTranscript := s.currentSTTTranscript()
-	interruptTranscript = strings.TrimSpace(interruptTranscript)
-	if interruptTranscript == "" {
-		s.dismissInterruptCheck("", "no_transcription", prevState)
-		return
-	}
-
-	// Notify client that we're semantically classifying.
-	s.sendEvent(InterruptDetectingEvent{Transcript: interruptTranscript})
-
-	isInterrupt := true
-	reason := "interrupt"
-	if s.interruptDetector != nil {
-		result := s.interruptDetector.CheckInterrupt(s.ctx, interruptTranscript)
-		isInterrupt = result.IsInterrupt
-		reason = result.Reason
-	}
-
-	if !isInterrupt {
-		s.dismissInterruptCheck(interruptTranscript, reason, prevState)
-		return
-	}
-
-	s.confirmAudioInterrupt(interruptTranscript, partialAtPause, audioPos)
-}
-
-func (s *LiveSession) dismissInterruptCheck(transcript string, reason string, prevState SessionState) {
-	// Clear STT transcript so future interrupts only consider new speech.
-	s.sttMu.Lock()
-	if s.stt != nil {
-		s.stt.Reset()
-	}
-	s.sttMu.Unlock()
-
-	s.setState(prevState)
-	s.setOutputPaused(false)
-	s.flushOutputBuffer()
-
-	if s.tts != nil {
-		s.tts.Resume()
-	}
-
-	if strings.TrimSpace(transcript) != "" {
-		s.sendEvent(InterruptDismissedEvent{Transcript: transcript, Reason: reason})
-	}
-}
-
-func (s *LiveSession) confirmAudioInterrupt(interruptTranscript string, partialAtPause string, audioPosMs int64) {
-	// Stop the in-flight response and persist partial assistant output per config.
-	behavior := s.interruptBehavior()
-	s.setNextStopReason("interrupted")
-
-	s.runStreamMu.Lock()
-	runStream := s.runStream
-	s.runStreamMu.Unlock()
-	if runStream != nil {
-		_ = runStream.StopResponse(partialAtPause, behavior)
-	}
-
-	// Cancel audio output and discard any buffered chunks.
-	if s.tts != nil {
-		s.tts.Cancel()
-	}
-
-	// Drop any buffered assistant events produced while paused.
-	s.clearOutputBuffer()
-
-	s.sendEvent(ResponseInterruptedEvent{
-		PartialText:         partialAtPause,
-		InterruptTranscript: interruptTranscript,
-		AudioPositionMs:     int(audioPosMs),
+// initComponents initializes VAD, grace period, and interrupt detector.
+func (s *Session) initComponents() error {
+	// Create semantic checker for VAD
+	vadChecker := NewDefaultSemanticChecker(func(ctx context.Context, transcript string) (bool, error) {
+		return s.checkTurnComplete(ctx, transcript)
 	})
 
-	// Reset grace state and resume listening for the user's full interrupt utterance.
-	s.graceMu.Lock()
-	s.graceActive = false
-	s.graceDeadline = time.Time{}
-	s.graceCommittedTranscript = ""
-	s.graceMu.Unlock()
+	// Create VAD
+	s.vad = NewHybridVAD(s.config.VAD, s.audioConfig, vadChecker)
+	s.vad.SetCallbacks(
+		nil, // onSilence - not used in punctuation-based VAD
+		func(transcript string) { s.emit(&VADAnalyzingEvent{Transcript: transcript}) },
+		func(transcript string, forced bool) { s.onVADCommit(transcript, forced) },
+		func(category, message string) { s.debug(category, message) },
+	)
+	// Start VAD timeout checker goroutine
+	s.vad.Start(s.ctx)
 
-	s.vad.Reset()
-	if strings.TrimSpace(interruptTranscript) != "" {
-		s.vad.AddTranscript(strings.TrimSpace(interruptTranscript) + " ")
-	}
+	// Create grace period manager
+	s.gracePeriod = NewGracePeriodManager(s.config.GracePeriod)
+	s.gracePeriod.SetCallbacks(
+		func(transcript string) { s.onGracePeriodExpired(transcript) },
+		func(combined string) { s.onGracePeriodContinuation(combined) },
+		func(category, message string) { s.debug(category, message) },
+	)
 
-	s.setOutputPaused(false)
-	s.setState(StateListening)
-}
-
-func (s *LiveSession) forceInterruptAndCommitText(transcript string) {
-	transcript = strings.TrimSpace(transcript)
-
-	s.partialTextMu.Lock()
-	partialText := s.partialText.String()
-	s.partialTextMu.Unlock()
-
-	audioPos := int64(0)
-	if s.tts != nil {
-		audioPos = s.tts.Cancel()
-	}
-
-	s.setNextStopReason("interrupted")
-
-	s.runStreamMu.Lock()
-	runStream := s.runStream
-	s.runStreamMu.Unlock()
-	if runStream != nil {
-		_ = runStream.StopResponse(partialText, s.interruptBehavior())
-	}
-
-	s.clearOutputBuffer()
-	s.setOutputPaused(false)
-
-	s.sendEvent(ResponseInterruptedEvent{
-		PartialText:         partialText,
-		InterruptTranscript: transcript,
-		AudioPositionMs:     int(audioPos),
+	// Create interrupt checker
+	interruptChecker := NewDefaultInterruptChecker(func(ctx context.Context, transcript string) (bool, error) {
+		return s.checkInterrupt(ctx, transcript)
 	})
 
-	s.sttMu.Lock()
-	if s.stt != nil {
-		s.stt.Reset()
-	}
-	s.sttMu.Unlock()
+	// Create interrupt detector
+	s.interrupt = NewInterruptDetector(s.config.Interrupt, s.audioConfig, interruptChecker)
+	s.interrupt.SetCallbacks(
+		func() { s.emit(&InterruptDetectingEvent{}) },
+		func(transcript string) { s.emit(&InterruptCapturedEvent{Transcript: transcript}) },
+		func(transcript, reason string) { s.onInterruptDismissed(transcript, reason) },
+		func(transcript string) { s.onInterruptConfirmed(transcript) },
+		func(category, message string) { s.debug(category, message) },
+	)
 
-	s.vad.Reset()
-	if transcript != "" {
-		s.vad.AddTranscript(transcript)
-	}
-
-	s.setState(StateListening)
-
-	if transcript != "" {
-		s.commitTurn()
-	}
+	return nil
 }
 
-func (s *LiveSession) currentSTTTranscript() string {
+// startSTT starts the STT streaming session.
+func (s *Session) startSTT() error {
 	s.sttMu.Lock()
 	defer s.sttMu.Unlock()
-	if s.stt == nil {
-		return ""
+
+	opts := stt.TranscribeOptions{
+		Model:      "ink-whisper",
+		Language:   "en",
+		Format:     "pcm_s16le",
+		SampleRate: s.audioConfig.SampleRate,
 	}
-	return s.stt.Transcript()
+
+	if s.config.Voice != nil && s.config.Voice.Input != nil {
+		if s.config.Voice.Input.Language != "" {
+			opts.Language = s.config.Voice.Input.Language
+		}
+		if s.config.Voice.Input.Model != "" {
+			opts.Model = s.config.Voice.Input.Model
+		}
+	}
+
+	session, err := s.sttClient.NewStreamingSTT(s.ctx, opts)
+	if err != nil {
+		return err
+	}
+
+	s.sttSession = session
+	return nil
 }
 
-func (s *LiveSession) interruptBehavior() InterruptBehavior {
-	s.configMu.RLock()
-	defer s.configMu.RUnlock()
-
-	if s.config == nil || s.config.Voice == nil || s.config.Voice.Interrupt == nil {
-		return InterruptSaveMarked
+// SendAudio sends audio data to the session for processing.
+func (s *Session) SendAudio(data []byte) error {
+	if s.closed.Load() {
+		return fmt.Errorf("session closed")
 	}
-	switch s.config.Voice.Interrupt.SavePartial {
-	case SaveBehaviorDiscard:
-		return InterruptDiscard
-	case SaveBehaviorSave:
-		return InterruptSavePartial
-	case SaveBehaviorMarked:
-		return InterruptSaveMarked
+
+	select {
+	case s.audio <- data:
+		return nil
+	case <-s.done:
+		return fmt.Errorf("session closed")
 	default:
-		return InterruptSaveMarked
+		// Buffer full, drop audio
+		s.debug("AUDIO", "Buffer full, dropping audio chunk")
+		return nil
 	}
 }
 
-func (s *LiveSession) setOutputPaused(paused bool) {
-	s.outputMu.Lock()
-	defer s.outputMu.Unlock()
-	s.outputPaused = paused
-	if paused {
-		s.outputBuffer = s.outputBuffer[:0]
+// Commit forces the VAD to commit the current turn.
+// Useful for push-to-talk style interaction.
+func (s *Session) Commit() error {
+	s.mu.Lock()
+	state := s.state
+	s.mu.Unlock()
+
+	if state != StateListening {
+		return fmt.Errorf("not in listening state")
 	}
+
+	transcript := s.vad.GetTranscript()
+	if transcript == "" {
+		return fmt.Errorf("no transcript to commit")
+	}
+
+	s.onVADCommit(transcript, false)
+	return nil
 }
 
-func (s *LiveSession) clearOutputBuffer() {
-	s.outputMu.Lock()
-	s.outputBuffer = s.outputBuffer[:0]
-	s.outputPaused = false
-	s.outputMu.Unlock()
+// Interrupt forces an interrupt of the current response.
+func (s *Session) Interrupt(transcript string) error {
+	s.mu.Lock()
+	state := s.state
+	s.mu.Unlock()
+
+	if state != StateSpeaking && state != StateProcessing {
+		return fmt.Errorf("nothing to interrupt")
+	}
+
+	s.onInterruptConfirmed(transcript)
+	return nil
 }
 
-func (s *LiveSession) flushOutputBuffer() {
-	s.outputMu.Lock()
-	buf := make([]SessionEvent, len(s.outputBuffer))
-	copy(buf, s.outputBuffer)
-	s.outputBuffer = s.outputBuffer[:0]
-	s.outputMu.Unlock()
-
-	for _, evt := range buf {
-		s.sendEvent(evt)
+// Close shuts down the session.
+func (s *Session) Close() error {
+	if s.closed.Swap(true) {
+		return nil // Already closed
 	}
-}
 
-// commitTurn commits the current turn.
-func (s *LiveSession) commitTurn() {
-	s.stateMu.Lock()
-	if s.state != StateListening {
-		s.stateMu.Unlock()
-		return
+	s.debug("SESSION", "Closing session")
+
+	// Cancel context
+	if s.cancel != nil {
+		s.cancel()
 	}
-	s.state = StateProcessing
-	s.stateMu.Unlock()
 
-	transcript := strings.TrimSpace(s.vad.GetTranscript())
+	// Stop VAD timeout checker
+	if s.vad != nil {
+		s.vad.Stop()
+	}
 
+	// Cancel agent if running
+	if s.agentCancel != nil {
+		s.agentCancel()
+	}
+
+	// Close STT session
 	s.sttMu.Lock()
-	if transcript == "" && s.stt != nil {
-		transcript = strings.TrimSpace(s.stt.Transcript())
-	}
-	if s.stt != nil {
-		s.stt.Reset()
+	if s.sttSession != nil {
+		s.sttSession.Close()
 	}
 	s.sttMu.Unlock()
 
-	if transcript == "" {
-		s.setState(StateListening)
-		return
+	// Close TTS context
+	s.ttsMu.Lock()
+	if s.ttsContext != nil {
+		s.ttsContext.Close()
 	}
+	s.ttsMu.Unlock()
 
-	// Start a user grace window anchored to the last detected user speech.
-	s.speechMu.Lock()
-	lastSpeech := s.lastUserSpeechAt
-	s.speechMu.Unlock()
+	// Close done channel
+	close(s.done)
 
-	if !lastSpeech.IsZero() {
-		s.graceMu.Lock()
-		s.graceActive = true
-		s.graceDeadline = lastSpeech.Add(userGracePeriod)
-		s.graceCommittedTranscript = transcript
-		s.graceMu.Unlock()
-	}
+	// Set state
+	s.setState(StateClosed)
 
-	s.vad.Reset()
-	s.sendEvent(InputCommittedEvent{Transcript: transcript})
+	// Emit close event
+	s.emit(&SessionClosedEvent{Reason: "closed"})
 
-	// Signal the runStreamLoop
-	select {
-	case s.turnReady <- transcript:
-	default:
-		// If channel is full, the previous turn is still processing
-	}
+	// Close events channel
+	close(s.events)
+
+	return nil
 }
 
-// runStreamLoop manages the RunStream for the session lifetime.
-// First turn: create RunStream
-// Subsequent turns: use Interrupt() to inject new messages
-func (s *LiveSession) runStreamLoop() {
+// audioLoop processes incoming audio chunks.
+func (s *Session) audioLoop() {
 	for {
 		select {
-		case <-s.ctx.Done():
-			return
 		case <-s.done:
 			return
-		case transcript := <-s.turnReady:
-			s.processTurn(transcript)
+		case <-s.ctx.Done():
+			return
+		case data := <-s.audio:
+			s.processAudio(data)
 		}
 	}
 }
 
-func (s *LiveSession) processTurn(transcript string) {
-	s.runStreamMu.Lock()
-	runStream := s.runStream
-	s.runStreamMu.Unlock()
+// processAudio handles a single audio chunk based on current state.
+func (s *Session) processAudio(data []byte) {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
 
-	if runStream == nil {
-		// First turn: create RunStream
-		if s.runStreamCreator == nil {
-			s.setState(StateListening)
-			s.sendEvent(ErrorEvent{Code: "no_run_stream", Message: "RunStreamCreator not configured"})
+	switch state {
+	case StateListening:
+		// Send audio to STT for transcription
+		// Note: Cartesia's min_volume setting handles silence filtering server-side
+		s.sttMu.Lock()
+		if s.sttSession != nil {
+			s.sttSession.SendAudio(data)
+		}
+		s.sttMu.Unlock()
+
+		// Note: VAD turn detection is now handled via punctuation triggers in processTranscriptDelta
+		// No need to call vad.ProcessAudio - the timeout checker runs in background
+
+	case StateGracePeriod:
+		// Detect user speech immediately via energy - cancel agent before it generates more
+		energy := CalculateRMSEnergy(data)
+		if energy > s.config.VAD.EnergyThreshold {
+			// Check if we haven't already cancelled the agent
+			if s.agentCancel != nil {
+				s.debug("GRACE", "User speech detected (energy) during GRACE_PERIOD, cancelling agent")
+				s.cancelAgent()
+				// Also cancel TTS if it somehow started
+				s.cancelTTS()
+				s.emit(&AudioFlushEvent{})
+			}
+		}
+
+		// Send audio to STT during grace period to capture user continuation
+		s.sttMu.Lock()
+		if s.sttSession != nil {
+			s.sttSession.SendAudio(data)
+		}
+		s.sttMu.Unlock()
+
+	case StateSpeaking:
+		// Check if grace period is still active - if so, user speech is continuation, not interrupt
+		if s.gracePeriod.IsActive() {
+			// Detect user speech immediately via energy - don't wait for STT
+			energy := CalculateRMSEnergy(data)
+
+			// Check if TTS is still running (not already cancelled)
+			s.ttsMu.Lock()
+			ttsRunning := s.ttsContext != nil
+			s.ttsMu.Unlock()
+
+			if energy > s.config.VAD.EnergyThreshold && ttsRunning {
+				// User is speaking! Cancel TTS immediately, don't wait for transcript
+				s.debug("GRACE", "User speech detected (energy), cancelling TTS immediately")
+				s.cancelAgent()
+				s.cancelTTS()
+				s.emit(&AudioFlushEvent{})
+			}
+
+			// Send audio to STT to capture the transcript
+			s.sttMu.Lock()
+			if s.sttSession != nil {
+				s.sttSession.SendAudio(data)
+			}
+			s.sttMu.Unlock()
 			return
 		}
 
-		s.configMu.RLock()
-		config := s.config
-		s.configMu.RUnlock()
-
-		stream, err := s.runStreamCreator(s.ctx, config, transcript)
-		if err != nil {
-			s.setState(StateListening)
-			s.sendEvent(ErrorEvent{Code: "run_stream_error", Message: err.Error()})
-			return
+		// Grace period expired - check for potential interrupt using energy detection
+		energy := CalculateRMSEnergy(data)
+		if energy > s.config.Interrupt.EnergyThreshold {
+			s.handlePotentialInterrupt(data)
 		}
 
-		s.runStreamMu.Lock()
-		s.runStream = stream
-		s.runStreamMu.Unlock()
+	case StateInterruptCapturing:
+		// Add to interrupt buffer
+		s.interrupt.AddAudio(data)
+		// Also send to STT for transcription
+		s.sttMu.Lock()
+		if s.sttSession != nil {
+			s.sttSession.SendAudio(data)
+		}
+		s.sttMu.Unlock()
 
-		// Start processing events from this stream
-		go s.processRunStreamEvents(stream)
-	} else {
-		// Subsequent turn: inject via Interrupt
-		err := runStream.Interrupt(UserMessage{Role: "user", Content: transcript}, InterruptDiscard)
-		if err != nil {
-			// RunStream may have closed, try creating a new one
-			s.runStreamMu.Lock()
-			s.runStream = nil
-			s.runStreamMu.Unlock()
-			s.processTurn(transcript) // Retry with new stream
+		// Check if capture is complete
+		if s.interrupt.CaptureComplete() {
+			result := s.interrupt.Analyze(s.ctx)
+			s.handleInterruptResult(result)
 		}
 	}
 }
 
-// processRunStreamEvents processes events from the RunStream.
-// This runs for the lifetime of the RunStream.
-func (s *LiveSession) processRunStreamEvents(stream RunStreamInterface) {
-	defer func() {
-		s.runStreamMu.Lock()
-		if s.runStream == stream {
-			s.runStream = nil
-		}
-		s.runStreamMu.Unlock()
-	}()
-
-	s.partialTextMu.Lock()
-	s.partialText.Reset()
-	s.partialTextMu.Unlock()
-
-	if s.tts != nil {
-		s.tts.Reset()
-	}
-
-	for event := range stream.Events() {
+// sttLoop processes transcription events from STT.
+func (s *Session) sttLoop() {
+	for {
 		select {
-		case <-s.ctx.Done():
-			stream.Close()
-			return
 		case <-s.done:
-			stream.Close()
+			return
+		case <-s.ctx.Done():
 			return
 		default:
 		}
 
-		s.forwardRunStreamEvent(event)
-	}
+		s.sttMu.Lock()
+		session := s.sttSession
+		s.sttMu.Unlock()
 
-	// Stream ended
-	s.setState(StateListening)
-
-	if s.tts != nil {
-		s.tts.Flush()
-	}
-
-	s.sendEvent(MessageStopEvent{StopReason: "end_turn"})
-	s.sendEvent(VADListeningEvent{})
-}
-
-// forwardRunStreamEvent forwards events from RunStream to client and TTS.
-func (s *LiveSession) forwardRunStreamEvent(event RunStreamEvent) {
-	eventType := event.runStreamEventType()
-
-	switch eventType {
-	case "stream_event":
-		// Unwrap and process underlying stream event
-		if wrapper, ok := event.(interface{ Event() any }); ok {
-			s.processStreamEvent(wrapper.Event())
-		}
-
-	case "step_start":
-		// New assistant turn.
-		s.partialTextMu.Lock()
-		s.partialText.Reset()
-		s.partialTextMu.Unlock()
-		s.setNextStopReason("")
-
-		// Start a new TTS streaming context for this assistant turn (if configured).
-		s.startTTSTurn()
-		s.sendAssistantEvent(ContentBlockStartEvent{Index: 0, ContentBlock: map[string]any{"type": "text", "text": ""}})
-
-	case "step_complete":
-		s.sendAssistantEvent(ContentBlockStopEvent{Index: 0})
-
-		stopReason := s.consumeNextStopReason("end_turn")
-		if s.tts != nil && stopReason == "end_turn" {
-			s.tts.Flush()
-		}
-
-		s.sendAssistantEvent(MessageStopEvent{StopReason: stopReason})
-		s.sendAssistantEvent(VADListeningEvent{})
-		if s.State() != StateListening {
-			s.setState(StateListening)
-		}
-
-	case "tool_call_start":
-		if tc, ok := event.(interface {
-			ToolID() string
-			ToolName() string
-			ToolInput() map[string]any
-		}); ok {
-			s.sendAssistantEvent(ToolUseEvent{
-				ID:    tc.ToolID(),
-				Name:  tc.ToolName(),
-				Input: tc.ToolInput(),
-			})
-		}
-
-	case "interrupted":
-		// RunStream was interrupted, clear partial and reset TTS
-		s.partialTextMu.Lock()
-		s.partialText.Reset()
-		s.partialTextMu.Unlock()
-		if s.tts != nil {
-			s.tts.Reset()
-		}
-
-	case "run_complete":
-		// Will be handled by the for loop ending
-	}
-}
-
-func (s *LiveSession) sendAssistantEvent(event SessionEvent) {
-	s.outputMu.Lock()
-	paused := s.outputPaused
-	if paused {
-		s.outputBuffer = append(s.outputBuffer, event)
-		s.outputMu.Unlock()
-		return
-	}
-	s.outputMu.Unlock()
-	s.sendEvent(event)
-}
-
-func (s *LiveSession) setNextStopReason(reason string) {
-	s.stopMu.Lock()
-	s.nextStopReason = reason
-	s.stopMu.Unlock()
-}
-
-func (s *LiveSession) consumeNextStopReason(defaultReason string) string {
-	s.stopMu.Lock()
-	defer s.stopMu.Unlock()
-	if s.nextStopReason == "" {
-		return defaultReason
-	}
-	reason := s.nextStopReason
-	s.nextStopReason = ""
-	return reason
-}
-
-func (s *LiveSession) startTTSTurn() {
-	s.configMu.RLock()
-	outputCfg := (*VoiceOutputConfig)(nil)
-	if s.config != nil && s.config.Voice != nil {
-		outputCfg = s.config.Voice.Output
-	}
-	s.configMu.RUnlock()
-
-	if outputCfg == nil || s.ttsFactory == nil || s.tts == nil {
-		return
-	}
-
-	ttsCtx, err := s.ttsFactory(s.ctx, outputCfg)
-	if err != nil {
-		s.sendEvent(ErrorEvent{Code: "tts_init_error", Message: err.Error()})
-		return
-	}
-	s.tts.SetTTSContext(ttsCtx)
-}
-
-// processStreamEvent handles underlying stream events (text deltas, etc.)
-func (s *LiveSession) processStreamEvent(event any) {
-	text := ""
-
-	// Primary path: RunStream emits core streaming events.
-	switch e := event.(type) {
-	case coretypes.ContentBlockDeltaEvent:
-		switch d := e.Delta.(type) {
-		case coretypes.TextDelta:
-			text = d.Text
-		case *coretypes.TextDelta:
-			if d != nil {
-				text = d.Text
-			}
-		}
-	}
-
-	// Compatibility path: adapters may emit a lightweight interface.
-	if text == "" {
-		if delta, ok := event.(interface{ TextDelta() (string, bool) }); ok {
-			if t, hasText := delta.TextDelta(); hasText {
-				text = t
-			}
-		}
-	}
-
-	if strings.TrimSpace(text) == "" {
-		return
-	}
-
-	s.partialTextMu.Lock()
-	s.partialText.WriteString(text)
-	s.partialTextMu.Unlock()
-
-	if s.State() == StateProcessing {
-		s.setState(StateSpeaking)
-	}
-
-	if s.tts != nil {
-		s.tts.SendText(text)
-	}
-
-	s.sendAssistantEvent(ContentBlockDeltaEvent{
-		Index: 0,
-		Delta: map[string]any{"type": "text_delta", "text": text},
-	})
-}
-
-// ttsForwardLoop forwards TTS audio to the client.
-func (s *LiveSession) ttsForwardLoop() {
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-s.done:
-			return
-		default:
-		}
-
-		if s.tts == nil {
+		if session == nil {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
 		select {
-		case chunk, ok := <-s.tts.Audio():
-			if !ok {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			s.sendEvent(AudioDeltaEvent{Data: chunk})
-		case <-s.ctx.Done():
-			return
 		case <-s.done:
 			return
+		case <-s.ctx.Done():
+			return
+		case delta, ok := <-session.Transcripts():
+			if !ok {
+				// STT session closed, try to restart
+				s.debug("STT", "Session closed, attempting restart")
+				if err := s.startSTT(); err != nil {
+					s.debug("STT", "Failed to restart: "+err.Error())
+				}
+				continue
+			}
+			s.processTranscriptDelta(delta)
 		}
 	}
 }
 
-// UpdateConfig updates session configuration mid-session.
-func (s *LiveSession) UpdateConfig(cfg *SessionConfig) error {
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
+// processTranscriptDelta handles incoming transcription.
+func (s *Session) processTranscriptDelta(delta stt.TranscriptDelta) {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
 
-	if s.config == nil {
-		return fmt.Errorf("session not configured")
-	}
+	// Emit transcript delta event
+	s.emit(&TranscriptDeltaEvent{
+		Delta:   delta.Text,
+		IsFinal: delta.IsFinal,
+	})
 
-	if cfg.Model != "" {
-		s.config.Model = cfg.Model
-	}
-	if cfg.System != "" {
-		s.config.System = cfg.System
-	}
-	if cfg.Tools != nil {
-		s.config.Tools = cfg.Tools
-	}
-	if cfg.Voice != nil {
-		if cfg.Voice.VAD != nil && s.vad != nil {
-			s.vad.UpdateConfig(*cfg.Voice.VAD)
-		}
-		if cfg.Voice.Output != nil {
-			s.config.Voice.Output = cfg.Voice.Output
-		}
-		if cfg.Voice.Interrupt != nil {
-			s.config.Voice.Interrupt = cfg.Voice.Interrupt
-		}
-	}
+	s.debug("STT", fmt.Sprintf("Transcribed: %q (final: %v)", delta.Text, delta.IsFinal))
 
-	return nil
+	switch state {
+	case StateListening:
+		// Check if grace period is still active (e.g., TTS finished but grace window still open)
+		// If so, this is a continuation, not a new turn
+		if s.gracePeriod.IsActive() && delta.Text != "" {
+			s.gracePeriod.HandleUserSpeech(delta.Text)
+			return
+		}
+		// Process through VAD
+		// Note: We don't have the raw audio here, so we pass empty chunk
+		// The VAD should get energy from the actual audio in processAudio
+		s.vad.AddTranscript(delta.Text)
+
+	case StateGracePeriod:
+		// User is continuing during grace period
+		if delta.Text != "" {
+			s.gracePeriod.HandleUserSpeech(delta.Text)
+		}
+
+	case StateSpeaking:
+		// If grace period is still active, user speech is continuation
+		if s.gracePeriod.IsActive() && delta.Text != "" {
+			s.gracePeriod.HandleUserSpeech(delta.Text)
+		}
+		// Otherwise, transcript deltas during speaking are handled by interrupt flow
+
+	case StateInterruptCapturing:
+		// Add to interrupt transcript
+		s.interrupt.AddTranscript(delta.Text)
+	}
 }
 
-func (s *LiveSession) sendEvent(event SessionEvent) {
-	if s.closed.Load() {
+// handlePotentialInterrupt starts the interrupt capture flow.
+func (s *Session) handlePotentialInterrupt(audioData []byte) {
+	s.debug("INTERRUPT", "Audio detected during bot speech, pausing TTS")
+
+	// Pause TTS
+	s.pauseTTS()
+
+	// Start capture
+	s.interrupt.StartCapture()
+	s.interrupt.AddAudio(audioData)
+
+	// Transition to capturing state
+	s.setState(StateInterruptCapturing)
+}
+
+// handleInterruptResult processes the result of interrupt analysis.
+func (s *Session) handleInterruptResult(result InterruptResult) {
+	switch result {
+	case InterruptNone, InterruptBackchannel:
+		// Resume TTS
+		s.debug("INTERRUPT", "Resuming TTS after "+result.String())
+		s.resumeTTS()
+		s.setState(StateSpeaking)
+
+	case InterruptReal:
+		// Cancel everything and go to listening
+		s.debug("INTERRUPT", "Real interrupt confirmed, canceling agent")
+		s.cancelAgent()
+		s.cancelTTS()
+		// Signal client to flush audio buffers immediately
+		s.emit(&AudioFlushEvent{})
+		s.setState(StateListening)
+		s.emit(&VADListeningEvent{})
+	}
+}
+
+// onVADCommit is called when VAD commits a turn.
+func (s *Session) onVADCommit(transcript string, forced bool) {
+	// Note: Don't debug log here - VADCommittedEvent conveys the same info
+
+	s.emit(&VADCommittedEvent{
+		Transcript: transcript,
+		Forced:     forced,
+	})
+
+	s.mu.Lock()
+	s.currentTranscript = transcript
+	s.mu.Unlock()
+
+	// Start agent processing immediately - don't wait for grace period to expire
+	// The grace period runs in parallel as a cancellation window
+	s.startAgentProcessing(transcript)
+
+	// Start grace period if enabled - this is a cancellation window, not a blocker
+	// We stay in StateGracePeriod to continue capturing audio in case user continues
+	// If user speaks during this window, we cancel the in-flight agent request and flush audio
+	if s.config.GracePeriod.Enabled {
+		s.setState(StateGracePeriod)
+		s.gracePeriod.Start(transcript)
+		s.emit(&GracePeriodStartedEvent{
+			Transcript: transcript,
+			DurationMs: s.config.GracePeriod.DurationMs,
+			ExpiresAt:  s.gracePeriod.ExpiresAt(),
+		})
+	}
+}
+
+// onGracePeriodExpired is called when grace period ends.
+func (s *Session) onGracePeriodExpired(transcript string) {
+	// Note: Don't debug log here - GracePeriodExpiredEvent conveys the same info
+
+	s.emit(&GracePeriodExpiredEvent{Transcript: transcript})
+
+	// Agent is already running (started immediately on VAD commit)
+	// Nothing else to do - the grace period was just a cancellation window
+}
+
+// onGracePeriodContinuation is called when user speaks during grace period.
+func (s *Session) onGracePeriodContinuation(combined string) {
+	s.debug("GRACE", "User continued, combined: "+combined)
+
+	// Cancel any pending agent request
+	s.cancelAgent()
+
+	// Cancel TTS if it's running
+	s.cancelTTS()
+
+	// Signal client to flush audio buffers immediately
+	// This ensures any audio already sent to the speaker is discarded
+	s.emit(&AudioFlushEvent{})
+
+	s.emit(&GracePeriodExtendedEvent{
+		PreviousTranscript: s.currentTranscript,
+		NewTranscript:      combined,
+		DurationMs:         s.config.GracePeriod.DurationMs,
+		ExpiresAt:          time.Now().Add(time.Duration(s.config.GracePeriod.DurationMs) * time.Millisecond),
+	})
+
+	// Update transcript and restart VAD/grace
+	s.mu.Lock()
+	s.currentTranscript = combined
+	s.mu.Unlock()
+
+	s.vad.SetTranscript(combined)
+	s.setState(StateListening)
+}
+
+// onInterruptDismissed is called when interrupt is dismissed.
+func (s *Session) onInterruptDismissed(transcript, reason string) {
+	s.emit(&InterruptDismissedEvent{
+		Transcript: transcript,
+		Reason:     reason,
+	})
+}
+
+// onInterruptConfirmed is called when a real interrupt is confirmed.
+func (s *Session) onInterruptConfirmed(transcript string) {
+	s.mu.Lock()
+	partial := s.partialResponse
+	s.mu.Unlock()
+
+	s.emit(&ResponseInterruptedEvent{
+		PartialText:         partial,
+		InterruptTranscript: transcript,
+		AudioPositionMs:     s.ttsPosition,
+	})
+
+	// Set the interrupt transcript as the new input
+	s.vad.SetTranscript(transcript)
+}
+
+// startAgentProcessing begins the agent response generation.
+func (s *Session) startAgentProcessing(transcript string) {
+	s.setState(StateProcessing)
+
+	s.emit(&InputCommittedEvent{Transcript: transcript})
+
+	// Add user message
+	s.mu.Lock()
+	s.messages = append(s.messages, types.Message{
+		Role:    "user",
+		Content: transcript,
+	})
+	messages := make([]types.Message, len(s.messages))
+	copy(messages, s.messages)
+	s.mu.Unlock()
+
+	// Create agent context
+	agentCtx, agentCancel := context.WithCancel(s.ctx)
+	s.agentCancel = agentCancel
+
+	go s.runAgent(agentCtx, messages)
+}
+
+// runAgent executes the agent with streaming and pipes to TTS incrementally.
+func (s *Session) runAgent(ctx context.Context, messages []types.Message) {
+	s.debug("LLM", "Sending to "+s.config.Model+" (streaming)")
+
+	req := &types.MessageRequest{
+		Model:     s.config.Model,
+		Messages:  messages,
+		MaxTokens: s.config.MaxTokens,
+	}
+
+	if s.config.System != "" {
+		req.System = s.config.System
+	}
+	if len(s.config.Tools) > 0 {
+		req.Tools = s.config.Tools
+	}
+	if s.config.Temperature != nil {
+		req.Temperature = s.config.Temperature
+	}
+
+	// Start streaming LLM request
+	stream, err := s.llmClient.StreamMessage(ctx, req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		s.emit(&ErrorEvent{Code: "llm_error", Message: err.Error()})
+		s.setState(StateListening)
 		return
 	}
+	defer stream.Close()
+
+	// Create TTS context upfront for streaming
+	ttsCtx, err := s.createTTSContext(ctx)
+	if err != nil {
+		s.debug("TTS", "Failed to create context: "+err.Error())
+		s.emit(&ErrorEvent{Code: "tts_error", Message: err.Error()})
+		s.setState(StateListening)
+		return
+	}
+
+	// Start audio streaming in background
+	go s.streamTTSAudio(ctx, ttsCtx)
+
+	// Process LLM stream and pipe to TTS via buffer
+	buffer := NewTTSBuffer()
+	var fullText strings.Builder
+	firstChunk := true
+
+	for {
+		event, err := stream.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				s.debug("LLM", "Stream cancelled")
+				buffer.Reset()
+				return
+			}
+			s.debug("LLM", "Stream error: "+err.Error())
+			break
+		}
+
+		// Handle content block delta events (check both value and pointer types)
+		var textDelta types.TextDelta
+		var deltaIndex int
+		var hasTextDelta bool
+
+		switch e := event.(type) {
+		case types.ContentBlockDeltaEvent:
+			deltaIndex = e.Index
+			if td, ok := e.Delta.(types.TextDelta); ok {
+				textDelta = td
+				hasTextDelta = true
+			}
+		case *types.ContentBlockDeltaEvent:
+			deltaIndex = e.Index
+			if td, ok := e.Delta.(types.TextDelta); ok {
+				textDelta = td
+				hasTextDelta = true
+			}
+		}
+
+		if hasTextDelta {
+			text := textDelta.Text
+			fullText.WriteString(text)
+
+			// Emit delta event
+			s.emit(&ContentBlockDeltaEvent{Index: deltaIndex, Delta: text})
+
+			// Log first chunk for latency tracking
+			if firstChunk {
+				s.debug("LLM", "First token received")
+				firstChunk = false
+				s.setState(StateSpeaking)
+			}
+
+			// Buffer and send to TTS when ready
+			if chunk := buffer.Add(text); chunk != "" {
+				s.debug("TTS", "Sending chunk: "+chunk)
+				if err := ttsCtx.SendText(chunk, false); err != nil {
+					s.debug("TTS", "Send error: "+err.Error())
+				}
+			}
+		}
+	}
+
+	// Flush remaining text to TTS
+	if remaining := buffer.Flush(); remaining != "" {
+		s.debug("TTS", "Sending final chunk: "+remaining)
+		if err := ttsCtx.SendText(remaining, true); err != nil {
+			s.debug("TTS", "Final send error: "+err.Error())
+		}
+	} else {
+		// No remaining text, just flush TTS
+		ttsCtx.Flush()
+	}
+
+	// Update conversation history
+	finalText := fullText.String()
+	if finalText != "" {
+		s.mu.Lock()
+		s.partialResponse = finalText
+		s.messages = append(s.messages, types.Message{
+			Role:    "assistant",
+			Content: finalText,
+		})
+		s.mu.Unlock()
+	}
+
+	s.debug("LLM", "Stream complete")
+	s.emit(&MessageStopEvent{})
+}
+
+// createTTSContext creates a TTS streaming context.
+func (s *Session) createTTSContext(ctx context.Context) (*tts.StreamingContext, error) {
+	opts := tts.StreamingContextOptions{
+		SampleRate: s.audioConfig.SampleRate,
+		Format:     "pcm",
+	}
+	if s.config.Voice != nil && s.config.Voice.Output != nil {
+		opts.Voice = s.config.Voice.Output.Voice
+		opts.Speed = s.config.Voice.Output.Speed
+		opts.Volume = s.config.Voice.Output.Volume
+		if s.config.Voice.Output.Format != "" {
+			opts.Format = s.config.Voice.Output.Format
+		}
+		if s.config.Voice.Output.SampleRate > 0 {
+			opts.SampleRate = s.config.Voice.Output.SampleRate
+		}
+	}
+
+	if opts.Voice == "" {
+		s.debug("TTS", "No voice ID configured, using default")
+		opts.Voice = "98a34ef2-2140-4c28-9c71-663dc4dd7022"
+	}
+
+	s.debug("TTS", fmt.Sprintf("Creating TTS context (voice: %s, rate: %d, format: %s)", opts.Voice, opts.SampleRate, opts.Format))
+
+	s.ttsMu.Lock()
+	defer s.ttsMu.Unlock()
+
+	ttsCtx, err := s.ttsClient.NewStreamingContext(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	s.ttsContext = ttsCtx
+	s.ttsPaused = false
+	s.ttsPosition = 0
+
+	return ttsCtx, nil
+}
+
+// startTTS begins text-to-speech synthesis.
+func (s *Session) startTTS(ctx context.Context, text string) {
+	s.setState(StateSpeaking)
+	s.debug("TTS", "Synthesizing: "+text)
+
+	// Build TTS options with sensible defaults
+	opts := tts.StreamingContextOptions{
+		SampleRate: s.audioConfig.SampleRate,
+		Format:     "pcm", // Raw PCM for lowest latency
+	}
+	if s.config.Voice != nil && s.config.Voice.Output != nil {
+		opts.Voice = s.config.Voice.Output.Voice
+		opts.Speed = s.config.Voice.Output.Speed
+		opts.Volume = s.config.Voice.Output.Volume
+		if s.config.Voice.Output.Format != "" {
+			opts.Format = s.config.Voice.Output.Format
+		}
+		if s.config.Voice.Output.SampleRate > 0 {
+			opts.SampleRate = s.config.Voice.Output.SampleRate
+		}
+	}
+
+	// Ensure we have a voice ID
+	if opts.Voice == "" {
+		s.debug("TTS", "No voice ID configured, using default")
+		opts.Voice = "98a34ef2-2140-4c28-9c71-663dc4dd7022" // Sonic default
+	}
+
+	s.debug("TTS", fmt.Sprintf("Creating TTS context (voice: %s, rate: %d, format: %s)", opts.Voice, opts.SampleRate, opts.Format))
+
+	s.ttsMu.Lock()
+	ttsCtx, err := s.ttsClient.NewStreamingContext(ctx, opts)
+	if err != nil {
+		s.ttsMu.Unlock()
+		s.debug("TTS", "Failed to start: "+err.Error())
+		s.emit(&ErrorEvent{Code: "tts_error", Message: err.Error()})
+		s.setState(StateListening)
+		s.emit(&VADListeningEvent{})
+		return
+	}
+	s.ttsContext = ttsCtx
+	s.ttsPaused = false
+	s.ttsPosition = 0
+	s.ttsMu.Unlock()
+
+	// Check if we were cancelled during context creation (e.g., grace period continuation)
+	if ctx.Err() != nil {
+		s.debug("TTS", "Context cancelled before sending text")
+		s.ttsMu.Lock()
+		if s.ttsContext == ttsCtx {
+			s.ttsContext.Close()
+			s.ttsContext = nil
+		}
+		s.ttsMu.Unlock()
+		return
+	}
+
+	s.debug("TTS", "TTS context created, sending text...")
+
+	// Send text to TTS
+	if err := ttsCtx.SendText(text, true); err != nil {
+		s.debug("TTS", "Failed to send text: "+err.Error())
+		s.emit(&ErrorEvent{Code: "tts_send_error", Message: err.Error()})
+		s.setState(StateListening)
+		s.emit(&VADListeningEvent{})
+		return
+	}
+
+	s.debug("TTS", "Text sent, streaming audio...")
+
+	// Stream audio to client
+	go s.streamTTSAudio(ctx, ttsCtx)
+}
+
+// streamTTSAudio streams audio from TTS to the client.
+func (s *Session) streamTTSAudio(ctx context.Context, ttsCtx *tts.StreamingContext) {
+	s.debug("TTS", "Starting audio stream loop...")
+	audioChunks := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.debug("TTS", "Context cancelled")
+			return
+		case <-s.done:
+			s.debug("TTS", "Session done")
+			return
+		case audioData, ok := <-ttsCtx.Audio():
+			if !ok {
+				// TTS complete - check for errors
+				if err := ttsCtx.Err(); err != nil {
+					s.debug("TTS", "TTS error: "+err.Error())
+					s.emit(&ErrorEvent{Code: "tts_stream_error", Message: err.Error()})
+				}
+				s.debug("TTS", fmt.Sprintf("Synthesis complete (%d chunks, %dms)", audioChunks, s.ttsPosition))
+				s.emit(&AudioCommittedEvent{DurationMs: s.ttsPosition})
+
+				s.setState(StateListening)
+				s.emit(&VADListeningEvent{})
+				s.vad.Reset()
+				return
+			}
+
+			audioChunks++
+			s.debug("TTS", fmt.Sprintf("Audio chunk %d: %d bytes", audioChunks, len(audioData)))
+
+			// Check if paused
+			s.ttsMu.Lock()
+			paused := s.ttsPaused
+			s.ttsMu.Unlock()
+
+			if paused {
+				// Buffer audio while paused
+				continue
+			}
+
+			// Emit audio
+			s.emit(&AudioDeltaEvent{
+				Data:   audioData,
+				Format: "pcm_s16le",
+			})
+
+			// Update position
+			s.ttsMu.Lock()
+			s.ttsPosition += s.audioConfig.DurationMs(len(audioData))
+			s.ttsMu.Unlock()
+		}
+	}
+}
+
+// pauseTTS pauses TTS output.
+func (s *Session) pauseTTS() {
+	s.ttsMu.Lock()
+	defer s.ttsMu.Unlock()
+
+	if s.ttsContext != nil && !s.ttsPaused {
+		s.ttsPaused = true
+		s.emit(&TTSPausedEvent{PositionMs: s.ttsPosition})
+	}
+}
+
+// resumeTTS resumes TTS output.
+func (s *Session) resumeTTS() {
+	s.ttsMu.Lock()
+	defer s.ttsMu.Unlock()
+
+	if s.ttsContext != nil && s.ttsPaused {
+		s.ttsPaused = false
+		s.emit(&TTSResumedEvent{PositionMs: s.ttsPosition})
+	}
+}
+
+// cancelTTS cancels TTS output.
+func (s *Session) cancelTTS() {
+	s.ttsMu.Lock()
+	defer s.ttsMu.Unlock()
+
+	if s.ttsContext != nil {
+		s.ttsContext.Close()
+		s.ttsContext = nil
+		s.emit(&TTSCancelledEvent{PositionMs: s.ttsPosition})
+	}
+}
+
+// cancelAgent cancels the current agent request.
+func (s *Session) cancelAgent() {
+	if s.agentCancel != nil {
+		s.agentCancel()
+		s.agentCancel = nil
+	}
+}
+
+// checkTurnComplete performs semantic turn completion check.
+func (s *Session) checkTurnComplete(ctx context.Context, transcript string) (bool, error) {
+	prompt := fmt.Sprintf(TurnCompletePrompt, transcript)
+
+	// Use VAD-specific model or fall back to main model
+	model := s.config.VAD.Model
+	if model == "" {
+		model = s.config.Model
+	}
+
+	req := &types.MessageRequest{
+		Model: model,
+		Messages: []types.Message{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: 5,
+	}
+
+	resp, err := s.llmClient.CreateMessage(ctx, req)
+	if err != nil {
+		return false, err
+	}
+
+	return ParseTurnCompleteResponse(resp.TextContent()), nil
+}
+
+// checkInterrupt performs semantic interrupt check.
+func (s *Session) checkInterrupt(ctx context.Context, transcript string) (bool, error) {
+	prompt := fmt.Sprintf(InterruptCheckPrompt, transcript)
+
+	// Use interrupt-specific model or fall back to main model
+	model := s.config.Interrupt.SemanticModel
+	if model == "" {
+		model = s.config.Model
+	}
+
+	req := &types.MessageRequest{
+		Model: model,
+		Messages: []types.Message{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: 10,
+	}
+
+	resp, err := s.llmClient.CreateMessage(ctx, req)
+	if err != nil {
+		return false, err
+	}
+
+	return ParseInterruptCheckResponse(resp.TextContent()), nil
+}
+
+// setState updates the session state and emits an event.
+func (s *Session) setState(newState SessionState) {
+	s.mu.Lock()
+	oldState := s.state
+	s.state = newState
+	s.mu.Unlock()
+
+	if oldState != newState {
+		s.debug("SESSION", fmt.Sprintf("State: %s -> %s", oldState, newState))
+		s.emit(&StateChangedEvent{From: oldState, To: newState})
+	}
+}
+
+// emit sends an event to the events channel.
+func (s *Session) emit(event Event) {
 	select {
-	case s.outgoingEvents <- event:
+	case s.events <- event:
 	case <-s.done:
 	default:
+		// Channel full, drop event
 	}
 }
 
-func (s *LiveSession) cleanup() {
-	s.runStreamMu.Lock()
-	if s.runStream != nil {
-		s.runStream.Close()
-		s.runStream = nil
-	}
-	s.runStreamMu.Unlock()
+// debug logs a debug message if debug mode is enabled.
+// Logs are printed to stderr with timestamps for visibility.
+func (s *Session) debug(category, message string) {
+	if s.debugEnabled {
+		// Print to stderr with timestamp for developer visibility
+		timestamp := time.Now().Format("15:04:05.000")
+		fmt.Fprintf(os.Stderr, "\033[90m%s\033[0m [\033[36m%-10s\033[0m] %s\n", timestamp, category, message)
 
-	s.sttMu.Lock()
-	if s.stt != nil {
-		s.stt.Close()
-		s.stt = nil
-	}
-	s.sttMu.Unlock()
-
-	if s.tts != nil {
-		s.tts.Close()
+		// Also emit event for programmatic access
+		s.emit(&DebugEvent{Category: category, Message: message})
 	}
 }
 
-// Close closes the session.
-func (s *LiveSession) Close() error {
-	s.closeOnce.Do(func() {
-		s.closed.Store(true)
-		s.cancel()
-		close(s.done)
-		s.cleanup()
-		if s.conn != nil {
-			s.conn.Close()
-		}
-		s.setState(StateClosed)
-	})
-	return nil
-}
-
-// Done returns a channel that's closed when the session is done.
-func (s *LiveSession) Done() <-chan struct{} {
-	return s.done
-}
-
-var sessionCounter atomic.Uint64
-
+// generateSessionID creates a unique session identifier.
 func generateSessionID() string {
-	return fmt.Sprintf("live_%d_%d", time.Now().UnixNano(), sessionCounter.Add(1))
+	return fmt.Sprintf("live_%d", time.Now().UnixNano())
 }

@@ -1,6 +1,8 @@
 package live
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -10,352 +12,342 @@ import (
 type VADResult int
 
 const (
-	// VADContinue means keep buffering, turn not complete.
+	// VADContinue means keep listening for more audio.
 	VADContinue VADResult = iota
-
-	// VADCommit means turn is complete, trigger agent.
+	// VADCommit means the user turn is complete.
 	VADCommit
-
-	// VADPendingSemantic means energy check passed, waiting for semantic check.
-	// This is used when semantic checking is enabled.
-	VADPendingSemantic
 )
 
-// VADState represents the current state of the VAD.
-type VADState int
-
-const (
-	// VADStateListening indicates actively listening for speech.
-	VADStateListening VADState = iota
-
-	// VADStateSpeech indicates speech has been detected.
-	VADStateSpeech
-
-	// VADStateSilence indicates silence detected after speech.
-	VADStateSilence
-
-	// VADStateAnalyzing indicates semantic analysis in progress.
-	VADStateAnalyzing
-)
-
-// String returns a string representation of the VAD state.
-func (s VADState) String() string {
-	switch s {
-	case VADStateListening:
-		return "listening"
-	case VADStateSpeech:
-		return "speech"
-	case VADStateSilence:
-		return "silence"
-	case VADStateAnalyzing:
-		return "analyzing"
+// String returns a human-readable VAD result.
+func (r VADResult) String() string {
+	switch r {
+	case VADContinue:
+		return "CONTINUE"
+	case VADCommit:
+		return "COMMIT"
 	default:
-		return "unknown"
+		return "UNKNOWN"
 	}
 }
 
-// SemanticChecker is an interface for semantic turn completion checking.
-// This will be implemented in Phase 7.2.
+// SemanticChecker is an interface for performing semantic turn completion checks.
+// This is injected into the VAD to allow flexible LLM integration.
 type SemanticChecker interface {
-	// CheckTurnComplete checks if the transcript represents a complete turn.
-	// Returns true if the speaker is done, false if they might continue.
-	CheckTurnComplete(transcript string) (bool, error)
+	// CheckTurnComplete asks the LLM if the given transcript appears complete.
+	// Returns true if the user appears to be done speaking.
+	CheckTurnComplete(ctx context.Context, transcript string) (bool, error)
 }
 
-// HybridVAD implements hybrid voice activity detection combining
-// energy-based silence detection with optional semantic analysis.
+// HybridVAD implements punctuation-based voice activity detection:
+// 1. Punctuation triggers (. ! ?) → immediate semantic check
+// 2. Timeout fallback (3 seconds no activity) → force semantic check
+// 3. Semantic check confirms turn completion before commit
 type HybridVAD struct {
-	config VADConfig
+	config        VADConfig
+	semanticCheck SemanticChecker
+	audioConfig   AudioConfig
 
-	// Optional semantic checker (Phase 7.2)
-	semanticChecker SemanticChecker
+	mu                       sync.Mutex
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	transcript               strings.Builder
+	lastTranscriptTime       time.Time
+	pendingCheck             bool
+	committed                bool // Prevents double commits before Reset is called
+	lastCheckedTranscriptLen int  // Prevents re-checking same transcript on timeout
 
-	// State
-	mu           sync.Mutex
-	state        VADState
-	transcript   strings.Builder
-	silenceStart time.Time
-	speechStart  time.Time
-
-	// Energy tracking
-	lastEnergy float64
-
-	// Callback for state changes
-	onStateChange func(VADState)
+	// Callbacks for events
+	onSilence   func(durationMs int) // Kept for API compatibility
+	onAnalyzing func(transcript string)
+	onCommit    func(transcript string, forced bool)
+	onDebug     func(category, message string)
 }
 
 // NewHybridVAD creates a new hybrid VAD with the given configuration.
-func NewHybridVAD(config VADConfig) *HybridVAD {
-	// Apply defaults
-	if config.EnergyThreshold == 0 {
-		config.EnergyThreshold = DefaultVADConfig().EnergyThreshold
-	}
-	if config.SilenceDurationMs == 0 {
-		config.SilenceDurationMs = DefaultVADConfig().SilenceDurationMs
-	}
-	if config.MaxSilenceMs == 0 {
-		config.MaxSilenceMs = DefaultVADConfig().MaxSilenceMs
-	}
-	if config.MinWordsForCheck == 0 {
-		config.MinWordsForCheck = DefaultVADConfig().MinWordsForCheck
-	}
-	if config.SemanticCheck == nil {
-		config.SemanticCheck = DefaultVADConfig().SemanticCheck
-	}
-
+func NewHybridVAD(config VADConfig, audioConfig AudioConfig, checker SemanticChecker) *HybridVAD {
 	return &HybridVAD{
-		config: config,
-		state:  VADStateListening,
+		config:        config,
+		audioConfig:   audioConfig,
+		semanticCheck: checker,
 	}
 }
 
-// NewHybridVADWithSemantics creates a VAD with a semantic checker.
-func NewHybridVADWithSemantics(config VADConfig, checker SemanticChecker) *HybridVAD {
-	vad := NewHybridVAD(config)
-	vad.semanticChecker = checker
-	return vad
-}
-
-// SetSemanticChecker sets the semantic checker for turn completion.
-func (v *HybridVAD) SetSemanticChecker(checker SemanticChecker) {
+// SetCallbacks sets the event callbacks for the VAD.
+func (v *HybridVAD) SetCallbacks(
+	onSilence func(durationMs int),
+	onAnalyzing func(transcript string),
+	onCommit func(transcript string, forced bool),
+	onDebug func(category, message string),
+) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.semanticChecker = checker
+	v.onSilence = onSilence
+	v.onAnalyzing = onAnalyzing
+	v.onCommit = onCommit
+	v.onDebug = onDebug
 }
 
-// SetOnStateChange sets a callback for state changes.
-func (v *HybridVAD) SetOnStateChange(fn func(VADState)) {
+// Start begins the VAD timeout checker goroutine.
+// Must be called before adding transcripts.
+func (v *HybridVAD) Start(ctx context.Context) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.onStateChange = fn
+	v.ctx, v.cancel = context.WithCancel(ctx)
+	v.mu.Unlock()
+
+	go v.timeoutLoop()
 }
 
-// ProcessAudio processes an audio chunk and updates VAD state.
-// transcriptDelta is the incremental transcript from STT (if available).
-// Returns the VAD result indicating whether to continue or commit.
-func (v *HybridVAD) ProcessAudio(chunk []byte, transcriptDelta string) VADResult {
+// Stop stops the VAD timeout checker goroutine.
+func (v *HybridVAD) Stop() {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	now := time.Now()
-
-	// Accumulate transcript
-	if transcriptDelta != "" {
-		v.transcript.WriteString(transcriptDelta)
+	if v.cancel != nil {
+		v.cancel()
 	}
-
-	// Calculate energy
-	energy := calculateRMSEnergy(chunk)
-	v.lastEnergy = energy
-
-	// Stage 1: Energy-based detection
-	isSpeech := energy >= v.config.EnergyThreshold
-
-	switch v.state {
-	case VADStateListening:
-		if isSpeech {
-			// Speech started
-			v.speechStart = now
-			v.setState(VADStateSpeech)
-		}
-		return VADContinue
-
-	case VADStateSpeech:
-		if !isSpeech {
-			// Silence started
-			v.silenceStart = now
-			v.setState(VADStateSilence)
-		}
-		return VADContinue
-
-	case VADStateSilence:
-		if isSpeech {
-			// Speech resumed, cancel silence timer
-			v.setState(VADStateSpeech)
-			return VADContinue
-		}
-
-		silenceDuration := now.Sub(v.silenceStart)
-
-		// Force commit after max silence (prevent infinite wait)
-		maxSilence := time.Duration(v.config.MaxSilenceMs) * time.Millisecond
-		if silenceDuration >= maxSilence {
-			return VADCommit
-		}
-
-		// Check if we've hit the silence threshold
-		silenceThreshold := time.Duration(v.config.SilenceDurationMs) * time.Millisecond
-		if silenceDuration >= silenceThreshold {
-			// In Phase 7.1, we do energy-only detection
-			// Semantic check will be added in Phase 7.2
-			if v.shouldDoSemanticCheck() {
-				return v.doSemanticCheck()
-			}
-			return VADCommit
-		}
-
-		return VADContinue
-
-	case VADStateAnalyzing:
-		// Semantic check in progress (Phase 7.2)
-		// For now, just return continue
-		return VADContinue
-	}
-
-	return VADContinue
+	v.mu.Unlock()
 }
 
-// shouldDoSemanticCheck returns true if semantic checking should be performed.
-func (v *HybridVAD) shouldDoSemanticCheck() bool {
-	// Skip if semantic check disabled
-	if v.config.SemanticCheck != nil && !*v.config.SemanticCheck {
-		return false
+// timeoutLoop checks for transcript inactivity and triggers semantic check.
+func (v *HybridVAD) timeoutLoop() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-v.ctx.Done():
+			return
+		case <-ticker.C:
+			v.checkTimeout()
+		}
+	}
+}
+
+// checkTimeout triggers semantic check or force commit if no new transcript for NoActivityTimeoutMs.
+func (v *HybridVAD) checkTimeout() {
+	v.mu.Lock()
+
+	// Skip if already committed, pending check, or no transcript
+	if v.committed || v.pendingCheck || v.transcript.Len() == 0 {
+		v.mu.Unlock()
+		return
 	}
 
-	// Skip if no semantic checker configured
-	if v.semanticChecker == nil {
-		return false
+	// Skip if no transcript time set yet
+	if v.lastTranscriptTime.IsZero() {
+		v.mu.Unlock()
+		return
 	}
 
-	// Skip for very short utterances
-	text := v.transcript.String()
-	words := strings.Fields(text)
+	// Check if timeout exceeded
+	timeout := time.Duration(v.config.NoActivityTimeoutMs) * time.Millisecond
+	if time.Since(v.lastTranscriptTime) < timeout {
+		v.mu.Unlock()
+		return
+	}
+
+	transcript := v.transcript.String()
+	transcriptLen := len(transcript)
+	words := strings.Fields(transcript)
+
+	// Check minimum word count
 	if len(words) < v.config.MinWordsForCheck {
-		return false
+		v.mu.Unlock()
+		return
 	}
 
-	return true
+	// If we already checked this transcript (semantic returned INCOMPLETE),
+	// force commit now instead of re-checking
+	if transcriptLen <= v.lastCheckedTranscriptLen {
+		v.committed = true
+		v.mu.Unlock()
+		v.debug("VAD", fmt.Sprintf("Timeout reached (%dms), force committing after previous INCOMPLETE", v.config.NoActivityTimeoutMs))
+		if v.onCommit != nil {
+			go v.onCommit(transcript, true)
+		}
+		return
+	}
+
+	v.debug("VAD", fmt.Sprintf("Timeout reached (%dms), triggering semantic check", v.config.NoActivityTimeoutMs))
+
+	// Release lock during semantic check to not block AddTranscript
+	v.pendingCheck = true
+	v.mu.Unlock()
+
+	v.triggerSemanticCheck(transcript, true)
 }
 
-// doSemanticCheck performs the semantic turn completion check.
-func (v *HybridVAD) doSemanticCheck() VADResult {
-	if v.semanticChecker == nil {
-		return VADCommit
+// AddTranscript adds text to the accumulated transcript and checks for punctuation triggers.
+// This is the primary method for turn detection - call it with each STT transcript delta.
+func (v *HybridVAD) AddTranscript(text string) {
+	if text == "" {
+		return
 	}
 
-	v.setState(VADStateAnalyzing)
+	v.mu.Lock()
 
-	text := v.transcript.String()
-	complete, err := v.semanticChecker.CheckTurnComplete(text)
+	// Skip if already committed
+	if v.committed {
+		v.mu.Unlock()
+		return
+	}
+
+	// Add text and update timestamp
+	v.transcript.WriteString(text)
+	v.lastTranscriptTime = time.Now()
+	fullText := v.transcript.String()
+
+	v.debug("VAD", fmt.Sprintf("Transcript updated: %q", fullText))
+
+	// Check for punctuation trigger
+	if v.endsWithPunctuation(fullText) {
+		words := strings.Fields(fullText)
+
+		// Check minimum word count
+		if len(words) >= v.config.MinWordsForCheck && !v.pendingCheck {
+			v.debug("VAD", fmt.Sprintf("Punctuation detected in %q, triggering semantic check", fullText))
+			v.pendingCheck = true
+			v.mu.Unlock()
+			v.triggerSemanticCheck(fullText, false)
+			return
+		}
+	}
+
+	v.mu.Unlock()
+}
+
+// endsWithPunctuation checks if text ends with a trigger punctuation mark.
+func (v *HybridVAD) endsWithPunctuation(text string) bool {
+	text = strings.TrimSpace(text)
+	if len(text) == 0 {
+		return false
+	}
+	lastChar := text[len(text)-1]
+	return strings.ContainsRune(v.config.PunctuationTrigger, rune(lastChar))
+}
+
+// triggerSemanticCheck performs the LLM semantic check.
+// Must be called WITHOUT the mutex held.
+func (v *HybridVAD) triggerSemanticCheck(transcript string, forced bool) {
+	if v.onAnalyzing != nil {
+		go v.onAnalyzing(transcript)
+	}
+
+	// If semantic check is disabled, commit immediately
+	if !v.config.SemanticCheck || v.semanticCheck == nil {
+		v.mu.Lock()
+		v.pendingCheck = false
+		if !v.committed {
+			v.committed = true
+			v.mu.Unlock()
+			v.debug("SEMANTIC", "Semantic check disabled, committing")
+			if v.onCommit != nil {
+				go v.onCommit(transcript, forced)
+			}
+			return
+		}
+		v.mu.Unlock()
+		return
+	}
+
+	// Create a timeout context for the semantic check
+	checkCtx, cancel := context.WithTimeout(v.ctx, 1200*time.Millisecond)
+	defer cancel()
+
+	complete, err := v.semanticCheck.CheckTurnComplete(checkCtx, transcript)
 	if err != nil {
-		// On error, fail open (commit the turn)
-		return VADCommit
+		v.debug("SEMANTIC", fmt.Sprintf("Check failed: %v, treating as complete", err))
+		complete = true
+	}
+
+	v.mu.Lock()
+	v.pendingCheck = false
+
+	// Track what we checked to prevent infinite retry loops
+	v.lastCheckedTranscriptLen = len(transcript)
+
+	// Check if we were committed/reset while checking
+	if v.committed {
+		v.mu.Unlock()
+		return
 	}
 
 	if complete {
-		return VADCommit
-	}
-
-	// Not complete, extend silence window and keep listening
-	v.silenceStart = time.Now()
-	v.setState(VADStateSilence)
-	return VADContinue
-}
-
-// setState updates the VAD state and triggers callback.
-func (v *HybridVAD) setState(state VADState) {
-	if v.state != state {
-		v.state = state
-		if v.onStateChange != nil {
-			// Call async to avoid holding lock
-			fn := v.onStateChange
-			go fn(state)
+		v.committed = true
+		v.mu.Unlock()
+		v.debug("SEMANTIC", fmt.Sprintf("Transcript %q is COMPLETE", transcript))
+		if v.onCommit != nil {
+			go v.onCommit(transcript, forced)
 		}
+		return
 	}
+
+	v.debug("SEMANTIC", fmt.Sprintf("Transcript %q is INCOMPLETE, waiting for more input...", transcript))
+	v.mu.Unlock()
 }
 
-// Reset resets the VAD state for a new turn.
+// Reset clears the VAD state for a new turn.
 func (v *HybridVAD) Reset() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-
 	v.transcript.Reset()
-	v.state = VADStateListening
-	v.silenceStart = time.Time{}
-	v.speechStart = time.Time{}
-	v.lastEnergy = 0
+	v.lastTranscriptTime = time.Time{}
+	v.pendingCheck = false
+	v.committed = false
+	v.lastCheckedTranscriptLen = 0
 }
 
-// GetTranscript returns the accumulated transcript.
+// GetTranscript returns the current accumulated transcript.
 func (v *HybridVAD) GetTranscript() string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.transcript.String()
 }
 
-// AddTranscript adds text to the transcript (used when recovering from interrupt).
-func (v *HybridVAD) AddTranscript(text string) {
+// SetTranscript sets the transcript (used for grace period continuation).
+// This also resets the committed flag to allow new commits.
+func (v *HybridVAD) SetTranscript(text string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.transcript.Reset()
 	v.transcript.WriteString(text)
+	v.lastTranscriptTime = time.Now()
+	v.committed = false
+	v.pendingCheck = false
+	v.lastCheckedTranscriptLen = 0
 }
 
-// State returns the current VAD state.
-func (v *HybridVAD) State() VADState {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.state
+func (v *HybridVAD) debug(category, message string) {
+	if v.onDebug != nil {
+		go v.onDebug(category, message)
+	}
 }
 
-// LastEnergy returns the most recent energy level.
-func (v *HybridVAD) LastEnergy() float64 {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.lastEnergy
+// DefaultSemanticChecker is a simple implementation using a callback function.
+type DefaultSemanticChecker struct {
+	checkFunc func(ctx context.Context, transcript string) (bool, error)
 }
 
-// SilenceDuration returns how long the VAD has been in silence state.
-// Returns 0 if not in silence state.
-func (v *HybridVAD) SilenceDuration() time.Duration {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	if v.state != VADStateSilence {
-		return 0
-	}
-	return time.Since(v.silenceStart)
+// NewDefaultSemanticChecker creates a semantic checker from a callback function.
+func NewDefaultSemanticChecker(checkFunc func(ctx context.Context, transcript string) (bool, error)) *DefaultSemanticChecker {
+	return &DefaultSemanticChecker{checkFunc: checkFunc}
 }
 
-// SpeechDuration returns how long since speech was first detected.
-// Returns 0 if no speech detected yet.
-func (v *HybridVAD) SpeechDuration() time.Duration {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	if v.speechStart.IsZero() {
-		return 0
-	}
-	return time.Since(v.speechStart)
+// CheckTurnComplete implements SemanticChecker.
+func (c *DefaultSemanticChecker) CheckTurnComplete(ctx context.Context, transcript string) (bool, error) {
+	return c.checkFunc(ctx, transcript)
 }
 
-// Config returns the VAD configuration.
-func (v *HybridVAD) Config() VADConfig {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.config
-}
+// TurnCompletePrompt is the prompt template for semantic turn completion checks.
+const TurnCompletePrompt = `Voice transcript: "%s"
 
-// UpdateConfig updates the VAD configuration.
-func (v *HybridVAD) UpdateConfig(config VADConfig) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+You are part of a live mode voice AI agent. Your job is to look at the transcription of the what the user has said so far since the agent last spoke and determine if the user is done talking and therefore the agent should respond. Or if the user is not done talking and the agent should wait.
 
-	if config.Model != "" {
-		v.config.Model = config.Model
-	}
-	if config.EnergyThreshold != 0 {
-		v.config.EnergyThreshold = config.EnergyThreshold
-	}
-	if config.SilenceDurationMs != 0 {
-		v.config.SilenceDurationMs = config.SilenceDurationMs
-	}
-	if config.SemanticCheck != nil {
-		v.config.SemanticCheck = config.SemanticCheck
-	}
-	if config.MinWordsForCheck != 0 {
-		v.config.MinWordsForCheck = config.MinWordsForCheck
-	}
-	if config.MaxSilenceMs != 0 {
-		v.config.MaxSilenceMs = config.MaxSilenceMs
-	}
+YES = The user is done talking
+NO = The user is not done talking
+
+Reply only: YES or NO`
+
+// ParseTurnCompleteResponse parses the LLM response to determine if turn is complete.
+func ParseTurnCompleteResponse(response string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(response))
+	return strings.Contains(upper, "YES")
 }

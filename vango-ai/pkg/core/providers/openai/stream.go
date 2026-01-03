@@ -19,6 +19,7 @@ type eventStream struct {
 	accumulator streamAccumulator
 	started     bool
 	finished    bool
+	pending     []types.StreamEvent // Queue for buffered events
 }
 
 // streamAccumulator accumulates streamed data.
@@ -87,6 +88,13 @@ func newEventStream(body io.ReadCloser) *eventStream {
 func (s *eventStream) Next() (types.StreamEvent, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+
+	// Return pending events first
+	if len(s.pending) > 0 {
+		event := s.pending[0]
+		s.pending = s.pending[1:]
+		return event, nil
 	}
 
 	if s.finished {
@@ -171,9 +179,19 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 
 		// Handle text delta
 		if choice.Delta.Content != "" {
-			// If this is the first text content, emit content_block_start
+			// If this is the first text content, emit content_block_start AND delta
 			if s.accumulator.textContent.Len() == 0 {
 				s.accumulator.textContent.WriteString(choice.Delta.Content)
+				// Queue the delta event for the next call
+				s.pending = append(s.pending, types.ContentBlockDeltaEvent{
+					Type:  "content_block_delta",
+					Index: 0,
+					Delta: types.TextDelta{
+						Type: "text_delta",
+						Text: choice.Delta.Content,
+					},
+				})
+				// Return the start event now
 				return types.ContentBlockStartEvent{
 					Type:         "content_block_start",
 					Index:        0,

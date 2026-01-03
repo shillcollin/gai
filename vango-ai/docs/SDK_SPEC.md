@@ -296,15 +296,18 @@ func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (*Str
 func (s *MessagesService) Run(ctx context.Context, req *MessageRequest, opts ...RunOption) (*RunResult, error)
 
 // Tool execution loop (streaming)
+// Also supports real-time voice via WithLive() option
 func (s *MessagesService) RunStream(ctx context.Context, req *MessageRequest, opts ...RunOption) (*RunStream, error)
-
-// Real-time bidirectional session
-func (s *MessagesService) Live(ctx context.Context, cfg *LiveConfig) (*LiveSession, error)
 
 // Structured Data Extraction
 // Automatically generates schema from dest, executes request, and unmarshals result.
 func (s *MessagesService) Extract(ctx context.Context, req *MessageRequest, dest any) (*Response, error)
 ```
+
+**Mode Selection:**
+- Normal text: `Run()` or `RunStream()` with text messages
+- Audio file: `RunStream()` with audio content blocks + voice config
+- Live voice: `RunStream()` with `WithLive()` option
 
 ---
 
@@ -724,6 +727,9 @@ func WithOnStop(fn func(*RunResult)) RunOption
 // Behavior
 func WithParallelTools(enabled bool) RunOption
 func WithToolTimeout(d time.Duration) RunOption
+
+// Live Mode (enables real-time bidirectional voice)
+func WithLive(cfg *LiveConfig) RunOption
 ```
 
 ### 9.3 Usage Examples
@@ -1098,68 +1104,108 @@ playAudio(resp.AudioContent().Data())
 
 ## 13. Live Sessions
 
-Live Sessions provide real-time bidirectional voice communication using Vango's Universal Voice Pipeline. The same agent definition (model, tools, system prompt) works identically whether you use `Messages.Create()` with audio content blocks or `Messages.Live()` for real-time voice.
+Live Sessions provide real-time bidirectional voice communication. The key insight: **Live mode is just `RunStream()` with a live configuration**. The same agent definition (model, tools, system prompt) works identically across normal, audio, and live modes.
 
-### 13.1 Configuration Types
+### 13.1 Unified Agent Architecture
 
 ```go
-// LiveConfig defines the full agent configuration for a live session.
+// The SAME request works across all three modes:
+req := &vango.MessageRequest{
+    Model:  "anthropic/claude-sonnet-4-20250514",
+    System: "You are a helpful travel assistant.",
+    Tools:  []vango.Tool{searchFlights},
+    Voice: &vango.VoiceConfig{
+        Input:  &vango.VoiceInputConfig{Provider: "cartesia"},
+        Output: &vango.VoiceOutputConfig{Provider: "cartesia", Voice: "sonic-english"},
+    },
+}
+
+// Mode 1: Normal text chat
+result, _ := client.Messages.Run(ctx, req)
+
+// Mode 2: Audio file input/output
+req.Messages = []vango.Message{{Role: "user", Content: vango.Audio(audioData, "audio/wav")}}
+stream, _ := client.Messages.RunStream(ctx, req)
+
+// Mode 3: Real-time live voice
+stream, _ := client.Messages.RunStream(ctx, req, vango.WithLive(liveConfig))
+```
+
+### 13.2 Configuration Types
+
+```go
+// LiveConfig enables real-time voice mode on RunStream.
 type LiveConfig struct {
-    Model   string       `json:"model"`
-    System  string       `json:"system"`
-    Tools   []Tool       `json:"tools"`
-    Voice   *VoiceConfig `json:"voice"`
+    // Audio settings
+    SampleRate int `json:"sample_rate"` // 16000, 24000, or 48000 (default: 24000)
+
+    // Connection (SDK manages WebSocket internally)
+    Endpoint string `json:"endpoint,omitempty"` // Override for self-hosted proxy
 }
 
-// VoiceConfig contains all voice-related settings.
+// VoiceConfig contains all voice-related settings (used in MessageRequest).
 type VoiceConfig struct {
-    Input     *VoiceInputConfig  `json:"input"`
-    Output    *VoiceOutputConfig `json:"output"`
-    VAD       *VADConfig         `json:"vad"`
-    Interrupt *InterruptConfig   `json:"interrupt"`
+    Input       *VoiceInputConfig   `json:"input"`
+    Output      *VoiceOutputConfig  `json:"output"`
+    VAD         *VADConfig          `json:"vad"`
+    GracePeriod *GracePeriodConfig  `json:"grace_period"`
+    Interrupt   *InterruptConfig    `json:"interrupt"`
 }
 
-// VADConfig controls the hybrid voice activity detection.
+// VADConfig controls hybrid voice activity detection.
 type VADConfig struct {
-    Model             string  `json:"model"`              // Fast LLM for semantic check (default: "anthropic/claude-haiku-4-5-20251001")
-    EnergyThreshold   float64 `json:"energy_threshold"`   // RMS threshold (default: 0.02)
+    Model             string  `json:"model"`               // Fast LLM for semantic check (default: "cerebras/llama-3.1-8b")
+    EnergyThreshold   float64 `json:"energy_threshold"`    // RMS threshold (default: 0.02)
     SilenceDurationMs int     `json:"silence_duration_ms"` // Silence before check (default: 600)
-    SemanticCheck     bool    `json:"semantic_check"`     // Enable semantic analysis (default: true)
+    SemanticCheck     bool    `json:"semantic_check"`      // Enable semantic analysis (default: true)
     MinWordsForCheck  int     `json:"min_words_for_check"` // Minimum words (default: 2)
-    MaxSilenceMs      int     `json:"max_silence_ms"`     // Force commit timeout (default: 3000)
+    MaxSilenceMs      int     `json:"max_silence_ms"`      // Force commit timeout (default: 3000)
+}
+
+// GracePeriodConfig controls the window for user continuation after VAD commits.
+type GracePeriodConfig struct {
+    Enabled    bool `json:"enabled"`     // Enable grace period (default: true)
+    DurationMs int  `json:"duration_ms"` // Window duration (default: 5000)
 }
 
 // InterruptConfig controls barge-in detection.
 type InterruptConfig struct {
-    Mode           string  `json:"mode"`            // "auto", "manual", "disabled" (default: "auto")
-    EnergyThreshold float64 `json:"energy_threshold"` // Higher than VAD (default: 0.05)
-    DebounceMs      int     `json:"debounce_ms"`     // Minimum sustained speech (default: 100)
-    SemanticCheck   bool    `json:"semantic_check"`  // Distinguish interrupts from backchannels (default: true)
-    SemanticModel   string  `json:"semantic_model"`  // Fast LLM (default: "anthropic/claude-haiku-4-5-20251001")
-    SavePartial     string  `json:"save_partial"`    // "discard", "save", "marked" (default: "marked")
+    Mode              string  `json:"mode"`                // "auto", "manual", "disabled" (default: "auto")
+    EnergyThreshold   float64 `json:"energy_threshold"`    // Higher than VAD (default: 0.05)
+    CaptureDurationMs int     `json:"capture_duration_ms"` // Audio capture window (default: 600)
+    SemanticCheck     bool    `json:"semantic_check"`      // Distinguish interrupts from backchannels (default: true)
+    SemanticModel     string  `json:"semantic_model"`      // Fast LLM (default: "cerebras/llama-3.1-8b")
+    SavePartial       string  `json:"save_partial"`        // "discard", "save", "marked" (default: "marked")
 }
 ```
 
-### 13.2 LiveStream
+### 13.3 RunStream with Live Mode
 
 ```go
-type LiveStream struct {
-    // Send methods
+// RunStream gains live-specific methods when WithLive is used
+type RunStream struct {
+    // Existing methods (work in all modes)
+    Events() <-chan StreamEvent
+    Result() *RunResult
+    Close() error
+    Interrupt(msg Message, behavior InterruptBehavior) error
+
+    // Live-specific methods (only available with WithLive)
     SendAudio(pcm []byte) error           // Send raw PCM audio (16-bit, mono)
     SendText(text string) error           // Send text directly (for testing)
-    Interrupt(transcript string) error    // Force interrupt (skip semantic check)
-    Commit() error                        // Force end-of-turn (push-to-talk)
-    UpdateConfig(cfg *LiveConfig) error   // Update model/voice/tools mid-session
+    ForceInterrupt(transcript string) error // Force interrupt (skip semantic check)
+    ForceCommit() error                   // Force end-of-turn (push-to-talk)
+    UpdateConfig(cfg *MessageRequest) error // Update model/voice/tools mid-session
 
-    // Receive
-    Events() <-chan LiveEvent
-
-    // Lifecycle
-    Close() error
+    // Live state
+    IsLive() bool
+    SessionID() string
 }
 ```
 
-### 13.3 Live Events
+### 13.4 Live Events
+
+Live mode emits additional events beyond standard streaming:
 
 ```go
 // Session lifecycle
@@ -1184,19 +1230,36 @@ type InputCommittedEvent struct {
     Transcript string `json:"transcript"`
 }
 
+// Grace period events
+type GracePeriodStartedEvent struct {
+    Transcript string `json:"transcript"`
+    DurationMs int    `json:"duration_ms"`
+}
+
+type GracePeriodExtendedEvent struct {
+    PreviousTranscript string `json:"previous_transcript"`
+    NewTranscript      string `json:"new_transcript"`
+}
+
+type GracePeriodExpiredEvent struct {
+    Transcript string `json:"transcript"`
+}
+
 // Audio output
 type AudioChunkEvent struct {
     Data []byte // Raw PCM audio
 }
 
 // Interrupt events
-type InterruptDetectingEvent struct {
+type InterruptDetectingEvent struct{}
+
+type InterruptCapturedEvent struct {
     Transcript string `json:"transcript"`
 }
 
 type InterruptDismissedEvent struct {
     Transcript string `json:"transcript"`
-    Reason     string `json:"reason"` // "backchannel", "noise", etc.
+    Reason     string `json:"reason"` // "backchannel", "no_speech"
 }
 
 type ResponseInterruptedEvent struct {
@@ -1205,23 +1268,19 @@ type ResponseInterruptedEvent struct {
     AudioPositionMs     int    `json:"audio_position_ms"`
 }
 
-// Standard streaming events (reused from Messages.Stream)
+// Standard streaming events (same as non-live RunStream)
 type ContentBlockStartEvent struct { ... }
 type ContentBlockDeltaEvent struct { ... }
 type ContentBlockStopEvent struct { ... }
 type MessageStopEvent struct { ... }
-
-// Error
-type ErrorEvent struct {
-    Code    string `json:"code"`
-    Message string `json:"message"`
-}
+type ErrorEvent struct { ... }
 ```
 
-### 13.4 Live Usage Example
+### 13.5 Live Usage Example
 
 ```go
-session, err := client.Messages.Live(ctx, &vango.LiveConfig{
+// Define the agent (same config works for normal/audio/live)
+req := &vango.MessageRequest{
     Model:  "anthropic/claude-sonnet-4-20250514",
     System: "You are a helpful voice assistant.",
     Tools:  []vango.Tool{vango.WebSearch()},
@@ -1229,25 +1288,38 @@ session, err := client.Messages.Live(ctx, &vango.LiveConfig{
         Input:  &vango.VoiceInputConfig{Provider: "cartesia", Language: "en"},
         Output: &vango.VoiceOutputConfig{Provider: "cartesia", Voice: "a0e99841-438c-4a64-b679-ae501e7d6091"},
         VAD: &vango.VADConfig{
-            Model:             "anthropic/claude-haiku-4-5-20251001",
+            Model:             "cerebras/llama-3.1-8b",
             SilenceDurationMs: 600,
             SemanticCheck:     true,
+        },
+        GracePeriod: &vango.GracePeriodConfig{
+            Enabled:    true,
+            DurationMs: 5000,
         },
         Interrupt: &vango.InterruptConfig{
             Mode:          "auto",
             SemanticCheck: true,
         },
     },
-})
+}
+
+// Enable live mode
+stream, err := client.Messages.RunStream(ctx, req,
+    vango.WithLive(&vango.LiveConfig{SampleRate: 24000}),
+    vango.WithMaxToolCalls(10),
+)
 if err != nil {
     return err
 }
-defer session.Close()
+defer stream.Close()
 
 // Handle events
 go func() {
-    for event := range session.Events() {
+    for event := range stream.Events() {
         switch e := event.(type) {
+        case *vango.SessionCreatedEvent:
+            fmt.Printf("[Session] %s\n", e.SessionID)
+
         case *vango.VADStatusEvent:
             fmt.Printf("[VAD] %s\n", e.Type)
 
@@ -1256,6 +1328,12 @@ go func() {
 
         case *vango.InputCommittedEvent:
             fmt.Printf("\n[Committed] %s\n", e.Transcript)
+
+        case *vango.GracePeriodStartedEvent:
+            fmt.Printf("[Grace Period] Started: %dms\n", e.DurationMs)
+
+        case *vango.GracePeriodExtendedEvent:
+            fmt.Printf("[Grace Period] Extended: %s\n", e.NewTranscript)
 
         case *vango.ContentBlockDeltaEvent:
             if text, ok := e.Delta.(*vango.TextDelta); ok {
@@ -1266,7 +1344,7 @@ go func() {
             speaker.Write(e.Data)
 
         case *vango.InterruptDetectingEvent:
-            fmt.Printf("[Interrupt?] %s\n", e.Transcript)
+            fmt.Printf("[Interrupt?] Detecting...\n")
 
         case *vango.InterruptDismissedEvent:
             fmt.Printf("[Backchannel] %s (%s)\n", e.Transcript, e.Reason)
@@ -1282,20 +1360,55 @@ go func() {
 
 // Send audio from microphone
 for chunk := range microphone.Chunks() {
-    session.SendAudio(chunk)
+    stream.SendAudio(chunk)
 }
 ```
 
-### 13.5 Mid-Session Configuration Updates
+### 13.6 Mode Switching
+
+The same agent can be used in different modes based on user preference:
+
+```go
+// Define agent once
+agent := &vango.MessageRequest{
+    Model:  "anthropic/claude-sonnet-4-20250514",
+    System: "You are a helpful assistant.",
+    Tools:  []vango.Tool{searchTool, bookingTool},
+    Voice: &vango.VoiceConfig{
+        Input:  &vango.VoiceInputConfig{Provider: "cartesia"},
+        Output: &vango.VoiceOutputConfig{Provider: "cartesia", Voice: "sonic-english"},
+    },
+}
+
+// User chooses mode at runtime
+switch userPreference {
+case "text":
+    // Normal text mode
+    agent.Messages = []vango.Message{{Role: "user", Content: vango.Text(userInput)}}
+    result, _ := client.Messages.Run(ctx, agent)
+
+case "audio":
+    // Audio file mode (voice message)
+    agent.Messages = []vango.Message{{Role: "user", Content: vango.Audio(audioFile, "audio/wav")}}
+    stream, _ := client.Messages.RunStream(ctx, agent)
+
+case "live":
+    // Real-time live mode
+    stream, _ := client.Messages.RunStream(ctx, agent, vango.WithLive(nil))
+    // ... handle bidirectional audio
+}
+```
+
+### 13.7 Mid-Session Configuration Updates
 
 ```go
 // Switch to a different model mid-conversation
-session.UpdateConfig(&vango.LiveConfig{
+stream.UpdateConfig(&vango.MessageRequest{
     Model: "openai/gpt-4o",
 })
 
 // Change voice settings
-session.UpdateConfig(&vango.LiveConfig{
+stream.UpdateConfig(&vango.MessageRequest{
     Voice: &vango.VoiceConfig{
         Output: &vango.VoiceOutputConfig{
             Voice: "different-voice-id",
@@ -1304,8 +1417,8 @@ session.UpdateConfig(&vango.LiveConfig{
     },
 })
 
-// Add new tools
-session.UpdateConfig(&vango.LiveConfig{
+// Add new tools dynamically
+stream.UpdateConfig(&vango.MessageRequest{
     Tools: []vango.Tool{
         vango.WebSearch(),
         newCustomTool,
@@ -1313,25 +1426,7 @@ session.UpdateConfig(&vango.LiveConfig{
 })
 ```
 
-### 13.6 RunStream Integration
-
-Live mode internally uses `RunStream` for agent execution, leveraging its existing interrupt support:
-
-```go
-// RunStream's Interrupt method is used when user interrupts during bot speech
-func (rs *RunStream) Interrupt(msg Message, behavior InterruptBehavior) error
-
-type InterruptBehavior int
-const (
-    InterruptDiscard    InterruptBehavior = iota // Don't save partial response
-    InterruptSavePartial                          // Save as-is
-    InterruptSaveMarked                           // Save with [interrupted] marker
-)
-```
-
-This means the same tool execution loop, multi-turn state management, and interrupt handling works identically whether you're using `Messages.Run()` or `Messages.Live()`.
-
-### 13.7 Audio Format Requirements
+### 13.8 Audio Format Requirements
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|

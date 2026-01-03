@@ -438,14 +438,17 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 
 		req := baseReq
 		req.Transcript = text
+
+		// Continue=true means more text is coming.
+		// Continue=false tells Cartesia this is the final chunk and closes the context.
+		// We must keep Continue=true until isFinal, otherwise Cartesia closes the context
+		// and rejects subsequent chunks with "Context has closed" error.
 		req.Continue = !isFinal
-		// Don't set flush here - only use it for explicit flush requests
 
 		if isFinal && text == "" {
 			// No text to send - signal end of stream
 			req.Transcript = ""
 			req.Continue = false
-			req.Flush = false
 			return conn.WriteJSON(req)
 		}
 

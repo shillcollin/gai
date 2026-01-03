@@ -21,6 +21,8 @@
 package vango
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -189,4 +191,40 @@ func (c *Client) IsProxyMode() bool {
 // Engine returns the core engine (only available in Direct Mode).
 func (c *Client) Engine() *core.Engine {
 	return c.core
+}
+
+// Live creates a new live voice conversation session.
+// This enables real-time bidirectional voice conversations with automatic
+// turn detection, interruption handling, and text-to-speech.
+//
+// Direct Mode only. Requires CARTESIA_API_KEY for STT/TTS.
+func (c *Client) Live(ctx context.Context, config LiveConfig) (*LiveSession, error) {
+	if c.mode != modeDirect {
+		return nil, fmt.Errorf("live sessions only supported in direct mode")
+	}
+
+	// Get STT provider
+	sttProvider := c.getSTTProvider()
+	if sttProvider == nil {
+		return nil, fmt.Errorf("STT provider not available - ensure CARTESIA_API_KEY is set")
+	}
+
+	// Get TTS provider
+	ttsProvider := c.getTTSProvider()
+	if ttsProvider == nil {
+		return nil, fmt.Errorf("TTS provider not available - ensure CARTESIA_API_KEY is set")
+	}
+
+	// Create adapters
+	llmAdapter := &llmClientAdapter{client: c}
+	ttsAdapter := &ttsClientAdapter{provider: ttsProvider}
+	sttAdapter := &sttClientAdapter{provider: sttProvider}
+
+	// Create and start session
+	session := newLiveSession(config, llmAdapter, ttsAdapter, sttAdapter)
+	if err := session.Start(ctx); err != nil {
+		return nil, fmt.Errorf("start live session: %w", err)
+	}
+
+	return session, nil
 }

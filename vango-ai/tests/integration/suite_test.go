@@ -185,6 +185,12 @@ func requireOpenAIKey(t *testing.T) {
 	}
 }
 
+func requireGroqKey(t *testing.T) {
+	if os.Getenv("GROQ_API_KEY") == "" {
+		t.Skip("GROQ_API_KEY not set")
+	}
+}
+
 func requireAllVoiceKeys(t *testing.T) {
 	requireAnthropicKey(t)
 	requireCartesiaKey(t)

@@ -17,6 +17,10 @@ type Provider interface {
 	// TranscribeStream transcribes streaming audio.
 	// Returns a channel that emits transcript updates.
 	TranscribeStream(ctx context.Context, audio io.Reader, opts TranscribeOptions) (<-chan TranscriptDelta, error)
+
+	// NewStreamingSTT creates a new streaming STT session via WebSocket.
+	// This provides more control over the streaming process than TranscribeStream.
+	NewStreamingSTT(ctx context.Context, opts TranscribeOptions) (*StreamingSTT, error)
 }
 
 // TranscribeOptions configures transcription.

@@ -8,13 +8,11 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/vango-ai/vango/pkg/core"
-	"github.com/vango-ai/vango/pkg/core/live"
 	"github.com/vango-ai/vango/pkg/core/providers/anthropic"
 	"github.com/vango-ai/vango/pkg/core/types"
 	"github.com/vango-ai/vango/pkg/core/voice"
@@ -34,19 +32,14 @@ type Server struct {
 	mux        *http.ServeMux
 
 	// Middleware
-	auth       *AuthMiddleware
+	auth        *AuthMiddleware
 	rateLimiter *RateLimiter
-	logging    *LoggingMiddleware
-	recovery   *RecoveryMiddleware
-	cors       *CORSMiddleware
+	logging     *LoggingMiddleware
+	recovery    *RecoveryMiddleware
+	cors        *CORSMiddleware
 
 	// Metrics
 	metrics *Metrics
-
-	// Live session management
-	liveSessions   map[string]*live.LiveSession
-	liveSessionsMu sync.RWMutex
-	sessionCount   atomic.Int64
 
 	// WebSocket upgrader
 	upgrader websocket.Upgrader
@@ -102,7 +95,6 @@ func NewServer(opts ...ConfigOption) (*Server, error) {
 		engine:        engine,
 		voicePipeline: voicePipeline,
 		metrics:       metrics,
-		liveSessions:  make(map[string]*live.LiveSession),
 		done:          make(chan struct{}),
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
@@ -155,7 +147,7 @@ func (s *Server) setupRoutes() {
 	s.mux.Handle("/v1/", apiHandler)
 
 	// WebSocket endpoint for live sessions
-	s.mux.HandleFunc("GET /v1/messages/live", s.handleLive)
+	//s.mux.HandleFunc("GET /v1/messages/live", s.handleLive)
 }
 
 // withMiddleware wraps a handler with all middleware.
@@ -208,14 +200,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	s.logger.Info("server shutting down")
 
-	// Close all live sessions
-	s.liveSessionsMu.Lock()
-	for _, session := range s.liveSessions {
-		session.Close()
-	}
-	s.liveSessions = make(map[string]*live.LiveSession)
-	s.liveSessionsMu.Unlock()
-
 	// Shutdown HTTP server if started
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
@@ -234,20 +218,6 @@ func (s *Server) cleanupLoop() {
 			return
 		case <-ticker.C:
 			s.rateLimiter.Cleanup()
-			s.cleanupStaleSessions()
-		}
-	}
-}
-
-// cleanupStaleSessions removes sessions that have been idle too long.
-func (s *Server) cleanupStaleSessions() {
-	s.liveSessionsMu.Lock()
-	defer s.liveSessionsMu.Unlock()
-
-	for id, session := range s.liveSessions {
-		if session.State() == live.StateClosed {
-			delete(s.liveSessions, id)
-			s.sessionCount.Add(-1)
 		}
 	}
 }
@@ -268,11 +238,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		health["voice"] = map[string]any{
 			"status": "available",
 		}
-	}
-
-	health["live_sessions"] = map[string]any{
-		"active": s.sessionCount.Load(),
-		"limit":  s.config.RateLimit.MaxConcurrentSessions,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

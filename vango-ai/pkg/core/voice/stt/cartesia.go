@@ -264,9 +264,10 @@ func (c *CartesiaProvider) NewStreamingSTT(ctx context.Context, opts TranscribeO
 	}
 	q.Set("sample_rate", fmt.Sprintf("%d", sampleRate))
 
-	// VAD settings (required per Cartesia docs)
-	q.Set("min_volume", "0.01")               // Low threshold to catch quiet speech
-	q.Set("max_silence_duration_secs", "1.5") // 1.5 seconds of silence triggers endpointing
+	// We do our own VAD with semantic checks, so don't set max_silence_duration_secs.
+	// This makes Cartesia stream interim transcripts continuously without waiting for silence.
+	// min_volume is still useful to filter out background noise.
+	q.Set("min_volume", "0.01") // Low threshold to catch quiet speech
 
 	// API key can be passed as query param (useful for browser) or header
 	// We'll use both for maximum compatibility

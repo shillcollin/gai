@@ -199,7 +199,7 @@ func streamWithVoice(ctx context.Context, client *vango.Client, messages []vango
 	// Process stream with callbacks
 	// Note: In raw mode, use \r\n for proper line breaks
 	text, err := stream.Process(vango.StreamCallbacks{
-		OnTextDelta:  func(t string) { fmt.Print(strings.ReplaceAll(t, "\n", "\r\n")) },
+		OnTextDelta:  func(t string) { fmt.Printf("%q\r\n", t) },
 		OnAudioChunk: func(data []byte) { player.Write(data) },
 		OnToolCallStart: func(id, name string, input map[string]any) {
 			fmt.Printf("\r\n[🔧 %s", name)

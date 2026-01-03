@@ -158,29 +158,6 @@ func (s *MessagesService) RunStream(ctx context.Context, req *MessageRequest, op
 	return s.runStreamLoop(ctx, req, &cfg), nil
 }
 
-// Live creates a real-time bidirectional session.
-// In Proxy Mode, this connects to the proxy's WebSocket endpoint.
-// In Direct Mode, this runs the voice pipeline directly in-process.
-func (s *MessagesService) Live(ctx context.Context, cfg *LiveConfig, opts ...LiveStreamOption) (*LiveStream, error) {
-	if s.client.mode == modeDirect {
-		return newLiveSessionDirect(ctx, cfg, s.client, opts...)
-	}
-
-	// Proxy mode - WebSocket connection
-	wsURL, err := s.client.buildLiveURL()
-	if err != nil {
-		return nil, err
-	}
-
-	return newLiveStream(ctx, wsURL, cfg, opts...)
-}
-
-// LiveWithEndpoint creates a live session with a custom WebSocket endpoint.
-// Use this when you need to connect to a specific server URL with custom headers.
-func (s *MessagesService) LiveWithEndpoint(ctx context.Context, endpoint LiveEndpoint, cfg *LiveConfig, opts ...LiveStreamOption) (*LiveStream, error) {
-	return newLiveStreamWithEndpoint(ctx, endpoint, cfg, opts...)
-}
-
 // Extract executes a request and unmarshals the structured output into dest.
 // It automatically generates a JSON schema from the dest type.
 func (s *MessagesService) Extract(ctx context.Context, req *MessageRequest, dest any) (*Response, error) {

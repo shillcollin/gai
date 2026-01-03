@@ -3,7 +3,10 @@ module github.com/vango-ai/vango
 go 1.24.7
 
 require (
+	github.com/ebitengine/oto/v3 v3.4.0
+	github.com/gen2brain/malgo v0.11.24
 	github.com/gorilla/websocket v1.5.3
+	github.com/joho/godotenv v1.5.1
 	github.com/prometheus/client_golang v1.23.2
 	go.opentelemetry.io/otel/trace v1.39.0
 	golang.org/x/term v0.38.0
@@ -12,7 +15,6 @@ require (
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/ebitengine/oto/v3 v3.4.0 // indirect
 	github.com/ebitengine/purego v0.9.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect

@@ -564,112 +564,6 @@ func TestInterruptedEvent_Structure(t *testing.T) {
 	}
 }
 
-// TestWithLive verifies the WithLive RunOption enables live mode.
-func TestWithLive(t *testing.T) {
-	cfg := defaultRunConfig()
-
-	if cfg.live {
-		t.Error("live should be false by default")
-	}
-
-	WithLive()(&cfg)
-
-	if !cfg.live {
-		t.Error("live should be true after WithLive()")
-	}
-}
-
-// TestWithLiveConfig verifies the WithLiveConfig RunOption.
-func TestWithLiveConfig(t *testing.T) {
-	cfg := defaultRunConfig()
-
-	liveCfg := &LiveConfig{
-		Model:  "anthropic/claude-sonnet-4-20250514",
-		System: "You are a voice assistant.",
-	}
-
-	WithLiveConfig(liveCfg)(&cfg)
-
-	if !cfg.live {
-		t.Error("live should be enabled when WithLiveConfig is used")
-	}
-	if cfg.liveConfig != liveCfg {
-		t.Error("liveConfig should be set")
-	}
-	if cfg.liveConfig.Model != "anthropic/claude-sonnet-4-20250514" {
-		t.Errorf("Model = %q, want %q", cfg.liveConfig.Model, "anthropic/claude-sonnet-4-20250514")
-	}
-}
-
-// TestWithLiveOptions verifies the WithLiveOptions RunOption.
-func TestWithLiveOptions(t *testing.T) {
-	cfg := defaultRunConfig()
-
-	opt := func(ls *LiveStream) {
-		// This option would configure the live stream
-	}
-
-	// WithLiveOptions is a supplementary option that adds to live mode
-	// but doesn't enable it by itself - use with WithLive() or WithLiveConfig()
-	WithLiveOptions(opt)(&cfg)
-
-	if len(cfg.liveOptions) != 1 {
-		t.Errorf("len(liveOptions) = %d, want 1", len(cfg.liveOptions))
-	}
-
-	// Verify it works with WithLive()
-	cfg2 := defaultRunConfig()
-	WithLive()(&cfg2)
-	WithLiveOptions(opt)(&cfg2)
-
-	if !cfg2.live {
-		t.Error("live should be enabled when WithLive() is used")
-	}
-	if len(cfg2.liveOptions) != 1 {
-		t.Errorf("len(liveOptions) = %d, want 1", len(cfg2.liveOptions))
-	}
-}
-
-// TestWithVoiceOutput verifies the WithVoiceOutput RunOption.
-func TestWithVoiceOutput(t *testing.T) {
-	cfg := defaultRunConfig()
-
-	voiceCfg := LiveVoiceOutput{
-		Voice:  "alloy",
-		Speed:  1.2,
-		Format: "pcm",
-	}
-
-	// WithVoiceOutput configures voice but doesn't enable live mode by itself
-	// Use with WithLive() or WithLiveConfig()
-	WithVoiceOutput(voiceCfg)(&cfg)
-
-	if cfg.voiceOutput == nil {
-		t.Fatal("voiceOutput should be set")
-	}
-	if cfg.voiceOutput.Voice != "alloy" {
-		t.Errorf("Voice = %q, want %q", cfg.voiceOutput.Voice, "alloy")
-	}
-	if cfg.voiceOutput.Speed != 1.2 {
-		t.Errorf("Speed = %v, want 1.2", cfg.voiceOutput.Speed)
-	}
-	if cfg.voiceOutput.Format != "pcm" {
-		t.Errorf("Format = %q, want %q", cfg.voiceOutput.Format, "pcm")
-	}
-
-	// Verify it works with WithLive()
-	cfg2 := defaultRunConfig()
-	WithLive()(&cfg2)
-	WithVoiceOutput(voiceCfg)(&cfg2)
-
-	if !cfg2.live {
-		t.Error("live should be enabled when WithLive() is used")
-	}
-	if cfg2.voiceOutput == nil {
-		t.Fatal("voiceOutput should be set")
-	}
-}
-
 // TestWithInterruptConfig verifies the WithInterruptConfig RunOption.
 func TestWithInterruptConfig(t *testing.T) {
 	cfg := defaultRunConfig()
@@ -712,12 +606,8 @@ func TestWithInterruptConfig(t *testing.T) {
 
 	// Verify it works with WithLive()
 	cfg2 := defaultRunConfig()
-	WithLive()(&cfg2)
 	WithInterruptConfig(interruptCfg)(&cfg2)
 
-	if !cfg2.live {
-		t.Error("live should be enabled when WithLive() is used")
-	}
 	if cfg2.interruptConfig == nil {
 		t.Fatal("interruptConfig should be set")
 	}

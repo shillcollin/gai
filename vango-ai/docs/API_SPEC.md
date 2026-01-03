@@ -1071,13 +1071,40 @@ This provides low-latency audio while maintaining natural speech patterns.
 
 Real-time bidirectional voice communication using Vango's Universal Voice Pipeline. This endpoint works with **any text-based LLM** (Claude, GPT-4, Llama, Mistral) by orchestrating STT → LLM → TTS in real-time.
 
+### 11.1 Unified Agent Architecture
+
+**Core Principle:** The same agent definition works across all three modes:
+
+| Mode | Transport | Input | Output | Use Case |
+|------|-----------|-------|--------|----------|
+| **Normal** | HTTP POST | Text | Text/Streaming | Chat, APIs |
+| **Audio** | HTTP POST | Audio file | Audio + Text | Voice messages |
+| **Live** | WebSocket | Real-time audio | Real-time audio | Conversations |
+
+```json
+{
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "system": "You are a helpful travel assistant.",
+  "tools": [{"name": "search_flights", ...}],
+  "voice": {
+    "input": {"provider": "cartesia"},
+    "output": {"provider": "cartesia", "voice": "sonic-english"}
+  }
+}
+```
+
+This same config works for:
+- `POST /v1/messages` with text → text response
+- `POST /v1/messages` with audio content block → audio response
+- `WS /v1/messages/live` → real-time bidirectional voice
+
 **Key Features:**
 - Hybrid VAD: Energy detection + semantic analysis for intelligent turn-taking
+- User Grace Period: 5-second window to continue speaking after VAD commits
 - Smart interruption: Semantic barge-in detection distinguishes real interrupts from backchannels
 - Mid-session configuration: Change model, tools, or voice settings without reconnecting
-- Unified agent definition: Same config works for HTTP and WebSocket
 
-### 11.1 Connection
+### 11.2 Connection
 
 ```javascript
 const ws = new WebSocket('wss://api.vango.dev/v1/messages/live', {
@@ -1087,9 +1114,9 @@ const ws = new WebSocket('wss://api.vango.dev/v1/messages/live', {
 });
 ```
 
-### 11.2 Session Configuration
+### 11.3 Session Configuration
 
-The first message **must** be `session.configure` with the full agent definition:
+The first message **must** be `session.configure` with the agent definition:
 
 ```json
 {
@@ -1109,19 +1136,23 @@ The first message **must** be `session.configure` with the full agent definition
         "speed": 1.0
       },
       "vad": {
-        "model": "anthropic/claude-haiku-4-5-20251001",
+        "model": "cerebras/llama-3.1-8b",
         "energy_threshold": 0.02,
         "silence_duration_ms": 600,
         "semantic_check": true,
         "min_words_for_check": 2,
         "max_silence_ms": 3000
       },
+      "grace_period": {
+        "enabled": true,
+        "duration_ms": 5000
+      },
       "interrupt": {
         "mode": "auto",
         "energy_threshold": 0.05,
-        "debounce_ms": 100,
+        "capture_duration_ms": 600,
         "semantic_check": true,
-        "semantic_model": "anthropic/claude-haiku-4-5-20251001",
+        "semantic_model": "cerebras/llama-3.1-8b",
         "save_partial": "marked"
       }
     }
@@ -1129,26 +1160,35 @@ The first message **must** be `session.configure` with the full agent definition
 }
 ```
 
-### 11.3 VAD Configuration
+### 11.4 Voice Configuration Reference
+
+#### VAD Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | `anthropic/claude-haiku-4-5-20251001` | Fast LLM for semantic turn completion |
+| `model` | string | `cerebras/llama-3.1-8b` | Fast LLM for semantic turn completion |
 | `energy_threshold` | float | `0.02` | RMS energy level for silence detection |
 | `silence_duration_ms` | int | `600` | Silence duration before semantic check |
 | `semantic_check` | bool | `true` | Enable semantic turn completion analysis |
 | `min_words_for_check` | int | `2` | Minimum words before semantic check |
 | `max_silence_ms` | int | `3000` | Force commit after this silence |
 
-### 11.4 Interrupt Configuration
+#### Grace Period Configuration
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable grace period for user continuation |
+| `duration_ms` | int | `5000` | Window to continue speaking after VAD commits |
+
+#### Interrupt Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `mode` | string | `auto` | `auto`, `manual`, or `disabled` |
 | `energy_threshold` | float | `0.05` | RMS threshold (higher than VAD) |
-| `debounce_ms` | int | `100` | Minimum sustained speech before check |
+| `capture_duration_ms` | int | `600` | Audio capture window before semantic check |
 | `semantic_check` | bool | `true` | Distinguish interrupts from backchannels |
-| `semantic_model` | string | `anthropic/claude-haiku-4-5-20251001` | Fast LLM for interrupt detection |
+| `semantic_model` | string | `cerebras/llama-3.1-8b` | Fast LLM for interrupt detection |
 | `save_partial` | string | `marked` | `discard`, `save`, or `marked` |
 
 ### 11.5 Client → Server Messages
@@ -1244,11 +1284,37 @@ Raw PCM audio: 16-bit signed integer, configurable sample rate (16kHz/24kHz/48kH
 }
 ```
 
-#### input.committed (Turn complete, processing starts)
+#### input.committed (Turn complete, grace period starts)
 ```json
 {
   "type": "input.committed",
   "transcript": "Book me a flight to Paris tomorrow"
+}
+```
+
+#### grace_period.started
+```json
+{
+  "type": "grace_period.started",
+  "transcript": "Hello.",
+  "duration_ms": 5000
+}
+```
+
+#### grace_period.extended (User continued speaking)
+```json
+{
+  "type": "grace_period.extended",
+  "previous_transcript": "Hello.",
+  "new_transcript": "Hello. How are you?"
+}
+```
+
+#### grace_period.expired
+```json
+{
+  "type": "grace_period.expired",
+  "transcript": "Hello. How are you?"
 }
 ```
 
@@ -1264,10 +1330,17 @@ Standard Vango streaming events, identical to HTTP streaming.
 ```
 Or sent as raw binary WebSocket frame.
 
-#### interrupt.detecting (TTS paused, checking if real interrupt)
+#### interrupt.detecting (TTS paused, capturing audio)
 ```json
 {
-  "type": "interrupt.detecting",
+  "type": "interrupt.detecting"
+}
+```
+
+#### interrupt.captured (Capture complete, checking semantic)
+```json
+{
+  "type": "interrupt.captured",
   "transcript": "uh huh"
 }
 ```
@@ -1322,19 +1395,20 @@ Client                                          Server
    │──────── Binary Audio Frames ─────────────────▶│
    │                                               │
    │◀─────── vad.listening (JSON) ────────────────│
-   │                                               │
    │◀─────── transcript.delta (JSON) ─────────────│
-   │                                               │
-   │◀─────── vad.analyzing (JSON) ────────────────│
-   │                                               │
    │◀─────── input.committed (JSON) ──────────────│
+   │◀─────── grace_period.started (JSON) ─────────│
    │                                               │
+   │──────── Binary Audio (user continues) ───────▶│
+   │◀─────── grace_period.extended (JSON) ────────│
+   │                                               │
+   │◀─────── grace_period.expired (JSON) ─────────│
    │◀─────── content_block_delta (JSON) ──────────│
    │◀─────── Binary Audio Frame ──────────────────│
    │                                               │
    │──────── Binary Audio (user interrupts) ──────▶│
-   │                                               │
    │◀─────── interrupt.detecting (JSON) ──────────│
+   │◀─────── interrupt.captured (JSON) ───────────│
    │◀─────── response.interrupted (JSON) ─────────│
    │                                               │
 ```
@@ -1350,7 +1424,12 @@ Client                                          Server
 
 ### 11.9 Implementation Note
 
-Unlike proprietary realtime APIs, Vango's Live endpoint uses a **Universal Voice Pipeline** that works with any text-based LLM. The same agent definition (model, tools, system prompt) works identically across HTTP `/v1/messages` (with audio content blocks) and WebSocket `/v1/messages/live`.
+Unlike proprietary realtime APIs, Vango's Live endpoint uses a **Universal Voice Pipeline** that works with any text-based LLM. The same agent definition (model, tools, system prompt) works identically across:
+
+- `POST /v1/messages` — Text or audio file input
+- `WS /v1/messages/live` — Real-time bidirectional voice
+
+This allows developers to build agents that users can seamlessly switch between text chat, voice messages, and live conversations.
 
 ---
 

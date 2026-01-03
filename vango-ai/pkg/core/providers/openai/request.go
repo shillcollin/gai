@@ -97,7 +97,7 @@ type streamOptions struct {
 // buildRequest converts a Vango request to an OpenAI request.
 func (p *Provider) buildRequest(req *types.MessageRequest) *chatRequest {
 	openaiReq := &chatRequest{
-		Model:       stripProviderPrefix(req.Model),
+		Model:       req.Model, // Engine already stripped provider prefix
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
 		Stop:        req.StopSequences,
