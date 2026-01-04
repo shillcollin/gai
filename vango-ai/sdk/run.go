@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vango-ai/vango/pkg/core/live"
 	"github.com/vango-ai/vango/pkg/core/types"
 	"github.com/vango-ai/vango/pkg/core/voice/tts"
 )
@@ -83,6 +84,7 @@ type runConfig struct {
 	// Live mode configuration
 	voiceOutput     *LiveVoiceOutput
 	interruptConfig *LiveInterrupt
+	liveConfig      *LiveConfig // Non-nil enables live mode
 }
 
 // defaultRunConfig returns the default run configuration.
@@ -271,6 +273,33 @@ func WithVoiceOutput(cfg LiveVoiceOutput) RunOption {
 func WithInterruptConfig(cfg LiveInterrupt) RunOption {
 	return func(c *runConfig) {
 		c.interruptConfig = &cfg
+	}
+}
+
+// WithLive enables real-time bidirectional voice mode.
+// When enabled, RunStream gains SendAudio(), ForceCommit(), and AudioOutput() methods.
+//
+// The same MessageRequest works in all modes - live mode just changes how you interact
+// with the stream (sending audio input, receiving audio output in real-time).
+//
+// Example:
+//
+//	stream, err := client.Messages.RunStream(ctx, &vango.MessageRequest{
+//	    Model:  "anthropic/claude-haiku-4-5-20251001",
+//	    System: "You are a helpful assistant.",
+//	}, vango.WithLive(&vango.LiveConfig{SampleRate: 24000}))
+//
+//	// Send audio from microphone
+//	stream.SendAudio(pcmData)
+//
+//	// Play audio output
+//	stream.AudioOutput().HandleAudio(playFunc, flushFunc)
+func WithLive(cfg *LiveConfig) RunOption {
+	return func(c *runConfig) {
+		if cfg == nil {
+			cfg = &LiveConfig{SampleRate: 24000}
+		}
+		c.liveConfig = cfg
 	}
 }
 
@@ -630,6 +659,7 @@ type interruptRequest struct {
 }
 
 // RunStream wraps a streaming tool execution loop with interrupt support.
+// When created with WithLive(), it provides real-time bidirectional voice capabilities.
 type RunStream struct {
 	// State protected by mutex
 	mu             sync.RWMutex
@@ -647,6 +677,12 @@ type RunStream struct {
 	err       error
 	closed    atomic.Bool
 	closeOnce sync.Once
+
+	// Live mode state (only populated when WithLive is used)
+	isLive      bool
+	liveSession *live.Session
+	audioOutput *AudioOutput
+	liveConfig  *LiveConfig
 }
 
 // RunStreamEvent is an event from the RunStream.
@@ -931,7 +967,14 @@ func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest
 		done:      make(chan struct{}),
 	}
 
-	go rs.run(ctx, s, req, cfg)
+	// Check if live mode is enabled
+	if cfg.liveConfig != nil {
+		rs.isLive = true
+		rs.liveConfig = cfg.liveConfig
+		go rs.runLive(ctx, s, req, cfg)
+	} else {
+		go rs.run(ctx, s, req, cfg)
+	}
 	return rs
 }
 
@@ -1377,10 +1420,415 @@ func (rs *RunStream) Close() error {
 	if rs.closed.Swap(true) {
 		return nil
 	}
+
+	// Close live session if in live mode
+	if rs.isLive && rs.liveSession != nil {
+		rs.liveSession.Close()
+	}
+
+	// Close audio output if present
+	if rs.audioOutput != nil {
+		rs.audioOutput.Close()
+	}
+
 	// Only close done channel once; the closeOnce ensures this
 	// Note: done might already be closed by run() goroutine via closeOnce
 	rs.closeOnce.Do(func() {
 		close(rs.done)
 	})
 	return nil
+}
+
+// --- Live Mode Methods ---
+// These methods are only available when RunStream is created with WithLive().
+// They will return errors if called on a non-live stream.
+
+// IsLive returns true if this stream is in live voice mode.
+func (rs *RunStream) IsLive() bool {
+	return rs.isLive
+}
+
+// SessionID returns the live session identifier.
+// Returns empty string if not in live mode.
+func (rs *RunStream) SessionID() string {
+	if !rs.isLive || rs.liveSession == nil {
+		return ""
+	}
+	return rs.liveSession.SessionID()
+}
+
+// SendAudio sends audio data to the live session for processing.
+// Audio should be 16-bit PCM, mono, at the configured sample rate.
+// Returns error if not in live mode.
+func (rs *RunStream) SendAudio(data []byte) error {
+	if !rs.isLive {
+		return fmt.Errorf("SendAudio: not in live mode (use WithLive option)")
+	}
+	if rs.liveSession == nil {
+		return fmt.Errorf("SendAudio: live session not initialized")
+	}
+	return rs.liveSession.SendAudio(data)
+}
+
+// ForceCommit forces the VAD to commit the current turn immediately.
+// Useful for push-to-talk style interaction.
+// Returns error if not in live mode.
+func (rs *RunStream) ForceCommit() error {
+	if !rs.isLive {
+		return fmt.Errorf("ForceCommit: not in live mode (use WithLive option)")
+	}
+	if rs.liveSession == nil {
+		return fmt.Errorf("ForceCommit: live session not initialized")
+	}
+	return rs.liveSession.Commit()
+}
+
+// ForceInterrupt forces an interrupt of the current response.
+// Returns error if not in live mode.
+func (rs *RunStream) ForceInterrupt(transcript string) error {
+	if !rs.isLive {
+		return fmt.Errorf("ForceInterrupt: not in live mode (use WithLive option)")
+	}
+	if rs.liveSession == nil {
+		return fmt.Errorf("ForceInterrupt: live session not initialized")
+	}
+	return rs.liveSession.Interrupt(transcript)
+}
+
+// AudioOutput returns the audio output manager for playing TTS audio.
+// Returns nil if not in live mode.
+// Provides buffered audio chunks and flush signals for smooth playback.
+//
+// Example:
+//
+//	stream.AudioOutput().HandleAudio(
+//	    func(data []byte) { speaker.Write(data) },
+//	    func() { speaker.Flush() },
+//	)
+func (rs *RunStream) AudioOutput() *AudioOutput {
+	if !rs.isLive {
+		return nil
+	}
+	return rs.audioOutput
+}
+
+// State returns the current live session state as a string.
+// Returns empty string if not in live mode.
+func (rs *RunStream) State() string {
+	if !rs.isLive || rs.liveSession == nil {
+		return ""
+	}
+	return rs.liveSession.State().String()
+}
+
+// SendText sends a discrete text message to the live session.
+// This bypasses VAD and grace period - the text is processed as a complete user turn.
+// If the session is speaking or processing, it waits for the response to complete.
+// Returns error if not in live mode.
+func (rs *RunStream) SendText(text string) error {
+	if !rs.isLive {
+		return fmt.Errorf("SendText: not in live mode (use WithLive option)")
+	}
+	if rs.liveSession == nil {
+		return fmt.Errorf("SendText: live session not initialized")
+	}
+	return rs.liveSession.SendText(text)
+}
+
+// SendContent sends discrete content blocks (text, image, video) to the live session.
+// This bypasses VAD and grace period - the content is processed as a complete user turn.
+// If the session is speaking or processing, it waits for the response to complete.
+// Returns error if not in live mode.
+//
+// Example:
+//
+//	// Send an image
+//	stream.SendContent([]types.ContentBlock{
+//	    vango.Image(imageData, "image/png"),
+//	})
+//
+//	// Send text with an image
+//	stream.SendContent([]types.ContentBlock{
+//	    vango.Text("What's in this image?"),
+//	    vango.Image(imageData, "image/jpeg"),
+//	})
+func (rs *RunStream) SendContent(content []types.ContentBlock) error {
+	if !rs.isLive {
+		return fmt.Errorf("SendContent: not in live mode (use WithLive option)")
+	}
+	if rs.liveSession == nil {
+		return fmt.Errorf("SendContent: live session not initialized")
+	}
+	return rs.liveSession.SendContent(content)
+}
+
+// --- Live Mode Implementation ---
+
+// runLive executes the live voice session loop.
+func (rs *RunStream) runLive(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig) {
+	defer rs.closeOnce.Do(func() {
+		close(rs.events)
+		close(rs.done)
+	})
+
+	// Validate we're in direct mode
+	if svc.client.mode != modeDirect {
+		rs.send(LiveErrorEvent{Code: "mode_error", Message: "live sessions only supported in direct mode"})
+		return
+	}
+
+	// Get STT provider
+	sttProvider := svc.client.getSTTProvider()
+	if sttProvider == nil {
+		rs.send(LiveErrorEvent{Code: "stt_error", Message: "STT provider not available - ensure CARTESIA_API_KEY is set"})
+		return
+	}
+
+	// Get TTS provider
+	ttsProvider := svc.client.getTTSProvider()
+	if ttsProvider == nil {
+		rs.send(LiveErrorEvent{Code: "tts_error", Message: "TTS provider not available - ensure CARTESIA_API_KEY is set"})
+		return
+	}
+
+	// Build core live config from MessageRequest and LiveConfig
+	liveConfig := rs.buildLiveConfig(req, cfg)
+
+	// Create adapters
+	llmAdapter := &llmClientAdapter{client: svc.client}
+	ttsAdapter := &ttsClientAdapter{provider: ttsProvider}
+	sttAdapter := &sttClientAdapter{provider: sttProvider}
+
+	// Create core live session
+	coreSession := live.NewSession(liveConfig, llmAdapter, ttsAdapter, sttAdapter)
+	if cfg.liveConfig.Debug {
+		coreSession.EnableDebug()
+	}
+
+	// Create audio output with buffering
+	audioOutputConfig := DefaultAudioOutputConfig()
+	if cfg.liveConfig.AudioOutput != nil {
+		audioOutputConfig = *cfg.liveConfig.AudioOutput
+	}
+	rs.audioOutput = NewAudioOutput(liveConfig.SampleRate, audioOutputConfig)
+
+	// Store live session reference
+	rs.liveSession = coreSession
+
+	// Start the session
+	if err := coreSession.Start(ctx); err != nil {
+		rs.send(LiveErrorEvent{Code: "start_error", Message: err.Error()})
+		return
+	}
+
+	// Start event translation goroutine
+	rs.translateLiveEvents(coreSession)
+}
+
+// buildLiveConfig converts MessageRequest and LiveConfig to core live.SessionConfig.
+func (rs *RunStream) buildLiveConfig(req *MessageRequest, cfg *runConfig) live.SessionConfig {
+	liveConfig := live.SessionConfig{
+		Model:      req.Model,
+		System:     systemToString(req.System),
+		Tools:      req.Tools,
+		Messages:   req.Messages,
+		Voice:      req.Voice,
+		SampleRate: cfg.liveConfig.SampleRate,
+		Channels:   cfg.liveConfig.Channels,
+		MaxTokens:  req.MaxTokens,
+	}
+
+	if req.Temperature != nil {
+		liveConfig.Temperature = req.Temperature
+	}
+
+	// Apply sample rate defaults
+	if liveConfig.SampleRate == 0 {
+		liveConfig.SampleRate = 24000
+	}
+	if liveConfig.Channels == 0 {
+		liveConfig.Channels = 1
+	}
+
+	// Apply VAD config
+	if cfg.liveConfig.VAD != nil {
+		liveConfig.VAD = live.VADConfig{
+			Model:               cfg.liveConfig.VAD.Model,
+			PunctuationTrigger:  cfg.liveConfig.VAD.PunctuationTrigger,
+			NoActivityTimeoutMs: cfg.liveConfig.VAD.NoActivityTimeoutMs,
+			SemanticCheck:       cfg.liveConfig.VAD.SemanticCheck,
+			MinWordsForCheck:    cfg.liveConfig.VAD.MinWordsForCheck,
+			EnergyThreshold:     cfg.liveConfig.VAD.EnergyThreshold,
+		}
+	} else {
+		liveConfig.VAD = live.DefaultVADConfig()
+	}
+
+	// Apply grace period config
+	if cfg.liveConfig.GracePeriod != nil {
+		liveConfig.GracePeriod = live.GracePeriodConfig{
+			Enabled:    cfg.liveConfig.GracePeriod.Enabled,
+			DurationMs: cfg.liveConfig.GracePeriod.DurationMs,
+		}
+	} else {
+		liveConfig.GracePeriod = live.DefaultGracePeriodConfig()
+	}
+
+	// Apply interrupt config
+	if cfg.liveConfig.Interrupt != nil {
+		mode := live.InterruptModeAuto
+		switch cfg.liveConfig.Interrupt.Mode {
+		case "always":
+			mode = live.InterruptModeAlways
+		case "never":
+			mode = live.InterruptModeNever
+		}
+
+		savePartial := live.PartialSaveMarked
+		switch cfg.liveConfig.Interrupt.SavePartial {
+		case "none":
+			savePartial = live.PartialSaveNone
+		case "full":
+			savePartial = live.PartialSaveFull
+		}
+
+		liveConfig.Interrupt = live.InterruptConfig{
+			Mode:              mode,
+			EnergyThreshold:   cfg.liveConfig.Interrupt.EnergyThreshold,
+			CaptureDurationMs: cfg.liveConfig.Interrupt.CaptureDurationMs,
+			SemanticCheck:     cfg.liveConfig.Interrupt.SemanticCheck,
+			SemanticModel:     cfg.liveConfig.Interrupt.SemanticModel,
+			SavePartial:       savePartial,
+		}
+	} else {
+		liveConfig.Interrupt = live.DefaultInterruptConfig()
+	}
+
+	return liveConfig
+}
+
+// translateLiveEvents reads events from the core session and translates them to SDK events.
+func (rs *RunStream) translateLiveEvents(coreSession *live.Session) {
+	coreEvents := coreSession.Events()
+
+	for {
+		select {
+		case <-rs.done:
+			return
+		case event, ok := <-coreEvents:
+			if !ok {
+				return
+			}
+			if sdkEvent := rs.convertLiveEvent(event); sdkEvent != nil {
+				rs.send(sdkEvent)
+			}
+		}
+	}
+}
+
+// convertLiveEvent maps a core live.Event to a RunStreamEvent.
+func (rs *RunStream) convertLiveEvent(event live.Event) RunStreamEvent {
+	switch e := event.(type) {
+	case *live.SessionCreatedEvent:
+		return LiveSessionCreatedEvent{
+			SessionID:  e.SessionID,
+			SampleRate: e.SampleRate,
+			Channels:   e.Channels,
+		}
+	case *live.StateChangedEvent:
+		return LiveStateChangedEvent{
+			From: e.From.String(),
+			To:   e.To.String(),
+		}
+	case *live.TranscriptDeltaEvent:
+		return LiveTranscriptDeltaEvent{
+			Delta:   e.Delta,
+			IsFinal: e.IsFinal,
+		}
+	case *live.VADCommittedEvent:
+		return LiveVADCommittedEvent{
+			Transcript: e.Transcript,
+			Forced:     e.Forced,
+		}
+	case *live.InputCommittedEvent:
+		return LiveInputCommittedEvent{
+			Transcript: e.Transcript,
+		}
+	case *live.DiscreteInputReceivedEvent:
+		return LiveDiscreteInputEvent{
+			Content: e.Content,
+		}
+	case *live.MessageStartEvent:
+		return StepStartEvent{Index: 0}
+	case *live.ContentBlockDeltaEvent:
+		return StreamEventWrapper{Event: types.ContentBlockDeltaEvent{
+			Index: e.Index,
+			Delta: types.TextDelta{Type: "text_delta", Text: e.Delta},
+		}}
+	case *live.MessageStopEvent:
+		return StepCompleteEvent{Index: 0, Response: nil}
+	case *live.AudioDeltaEvent:
+		// Push to AudioOutput for buffered playback
+		if rs.audioOutput != nil {
+			rs.audioOutput.pushAudio(e.Data)
+		}
+		return LiveAudioDeltaEvent{
+			Data:   e.Data,
+			Format: e.Format,
+		}
+	case *live.AudioCommittedEvent:
+		return AudioChunkEvent{Data: nil, Format: "done"}
+	case *live.AudioFlushEvent:
+		// Flush AudioOutput buffer
+		if rs.audioOutput != nil {
+			rs.audioOutput.doFlush()
+		}
+		return LiveAudioFlushEvent{}
+	case *live.GracePeriodStartedEvent:
+		return LiveGracePeriodStartedEvent{
+			Transcript: e.Transcript,
+			DurationMs: e.DurationMs,
+			ExpiresAt:  e.ExpiresAt,
+		}
+	case *live.GracePeriodExtendedEvent:
+		return LiveGracePeriodExtendedEvent{
+			PreviousTranscript: e.PreviousTranscript,
+			NewTranscript:      e.NewTranscript,
+		}
+	case *live.GracePeriodExpiredEvent:
+		return LiveGracePeriodExpiredEvent{
+			Transcript: e.Transcript,
+		}
+	case *live.InterruptDetectingEvent:
+		return LiveInterruptDetectingEvent{}
+	case *live.InterruptCapturedEvent:
+		return InterruptedEvent{PartialText: e.Transcript, Behavior: InterruptSaveMarked}
+	case *live.InterruptDismissedEvent:
+		return LiveInterruptDismissedEvent{
+			Transcript: e.Transcript,
+			Reason:     e.Reason,
+		}
+	case *live.ResponseInterruptedEvent:
+		return LiveResponseInterruptedEvent{
+			PartialText:         e.PartialText,
+			InterruptTranscript: e.InterruptTranscript,
+			AudioPositionMs:     e.AudioPositionMs,
+		}
+	case *live.ErrorEvent:
+		return LiveErrorEvent{
+			Code:    e.Code,
+			Message: e.Message,
+		}
+	case *live.SessionClosedEvent:
+		return LiveClosedEvent{
+			Reason: e.Reason,
+		}
+	case *live.DebugEvent:
+		return LiveDebugEvent{
+			Category: e.Category,
+			Message:  e.Message,
+		}
+	default:
+		return nil
+	}
 }

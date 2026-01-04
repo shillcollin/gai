@@ -86,6 +86,14 @@ type InputCommittedEvent struct {
 
 func (e *InputCommittedEvent) EventType() string { return "input.committed" }
 
+// DiscreteInputReceivedEvent is emitted when a discrete text/content input is received.
+// Discrete inputs bypass VAD and grace period - they are submitted as complete user turns.
+type DiscreteInputReceivedEvent struct {
+	Content []types.ContentBlock `json:"content"`
+}
+
+func (e *DiscreteInputReceivedEvent) EventType() string { return "input.discrete" }
+
 // GracePeriodStartedEvent is emitted when the grace period begins.
 type GracePeriodStartedEvent struct {
 	Transcript string    `json:"transcript"`

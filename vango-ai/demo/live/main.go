@@ -1,6 +1,7 @@
 // Package main provides a minimal CLI demo for live voice conversations.
 //
-// This demonstrates the intended simple DX for Vango AI live sessions.
+// This demonstrates the intended simple DX for Vango AI live sessions
+// using the unified RunStream API with WithLive option.
 //
 // Usage:
 //
@@ -13,15 +14,20 @@
 //
 // Controls:
 //
-//	q + ENTER - Quit the demo
+//	/t <text>       - Send text message
+//	/image <path>   - Send image file
+//	/video <path>   - Send video file
+//	q               - Quit the demo
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -45,7 +51,12 @@ func main() {
 	fmt.Println("║              Vango AI Live Voice Demo                      ║")
 	fmt.Println("╠════════════════════════════════════════════════════════════╣")
 	fmt.Println("║  Speak naturally - automatic turn detection is enabled.    ║")
-	fmt.Println("║  Press 'q' + ENTER to quit.                                ║")
+	fmt.Println("║                                                            ║")
+	fmt.Println("║  Commands:                                                 ║")
+	fmt.Println("║    /t <text>       Send text message                       ║")
+	fmt.Println("║    /image <path>   Send image file                         ║")
+	fmt.Println("║    /video <path>   Send video file                         ║")
+	fmt.Println("║    q               Quit                                    ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -64,16 +75,23 @@ func main() {
 	// Create Vango client
 	client := vango.NewClient()
 
-	// Start live session with minimal config
-	session, err := client.Live(ctx, vango.LiveConfig{
+	// Create request - same as for regular chat, just add WithLive for voice mode
+	req := &vango.MessageRequest{
 		Model:  "anthropic/claude-haiku-4-5-20251001",
-		System: "You are in live voice mode right now (via STT <> TTS). This means you need to be more conversational in your responses. Sometimes a single word reply (e.g. “okay”, “uh huh?”) is appropriate. If you received the lastest user message, but you’re not sure if they are actually done talking (e.g. they are trying to explain something and paused to think), you can give a short reply to help gauge. (e.g. “ya?”, “uh huh?”, “Are you done explaining? I have some thoughts..”, etc..)",
-		Debug:  true, // Enable debug logs
-	})
+		System: `You are in live voice mode right now (via STT <> TTS). This means you need to be more conversational in your responses. Sometimes a single word reply (e.g. "okay", "uh huh?") is appropriate. If you received the lastest user message, but you're not sure if they are actually done talking (e.g. they are trying to explain something and paused to think), you can give a short reply to help gauge. (e.g. "ya?", "uh huh?", "Are you done explaining? I have some thoughts..", etc..)`,
+	}
+
+	// Start live session via RunStream with WithLive option
+	stream, err := client.Messages.RunStream(ctx, req,
+		vango.WithLive(&vango.LiveConfig{
+			SampleRate: sampleRate,
+			Debug:      true,
+		}),
+	)
 	if err != nil {
 		log.Fatalf("Failed to start live session: %v", err)
 	}
-	defer session.Close()
+	defer stream.Close()
 
 	// Initialize audio I/O
 	mic, speaker, cleanup := initAudio()
@@ -90,37 +108,143 @@ func main() {
 			}
 			n := mic.Read(buf)
 			if n > 0 {
-				session.SendAudio(buf[:n])
+				stream.SendAudio(buf[:n])
 			}
 		}
 	}()
 
-	// Handle session events
+	// Play audio using SDK's AudioOutput (handles pre-buffering and flush automatically)
+	stream.AudioOutput().HandleAudio(
+		func(data []byte) { speaker.Write(data) },
+		func() { speaker.Flush() },
+	)
+
+	// Handle other session events
 	go func() {
-		for event := range session.Events() {
+		for event := range stream.Events() {
 			switch e := event.(type) {
-			case *vango.LiveAudioDeltaEvent:
-				// Play TTS audio
-				speaker.Write(e.Data)
-
-			case *vango.LiveAudioFlushEvent:
-				// User continued speaking during grace period or interrupted
-				// Immediately discard buffered audio
-				speaker.Flush()
-
-			case *vango.LiveErrorEvent:
+			case vango.LiveErrorEvent:
 				fmt.Printf("\n[ERROR] %s: %s\n", e.Code, e.Message)
 			}
 		}
 	}()
 
-	// Wait for quit command
-	fmt.Println("Listening... (press 'q' + ENTER to quit)")
-	var input string
-	for {
-		fmt.Scanln(&input)
-		if strings.ToLower(strings.TrimSpace(input)) == "q" {
+	// Command input loop
+	fmt.Println("Listening... (type commands or 'q' to quit)")
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+
+		// Quit command
+		if strings.ToLower(input) == "q" {
 			break
 		}
+
+		// Text command: /t <text>
+		if strings.HasPrefix(input, "/t ") {
+			text := strings.TrimPrefix(input, "/t ")
+			if err := stream.SendText(text); err != nil {
+				fmt.Printf("[ERROR] Failed to send text: %v\n", err)
+			} else {
+				fmt.Printf("[SENT] Text: %s\n", text)
+			}
+			continue
+		}
+
+		// Image command: /image <path>
+		if strings.HasPrefix(input, "/image ") {
+			path := strings.TrimSpace(strings.TrimPrefix(input, "/image "))
+			if err := sendImage(stream, path); err != nil {
+				fmt.Printf("[ERROR] Failed to send image: %v\n", err)
+			} else {
+				fmt.Printf("[SENT] Image: %s\n", path)
+			}
+			continue
+		}
+
+		// Video command: /video <path>
+		if strings.HasPrefix(input, "/video ") {
+			path := strings.TrimSpace(strings.TrimPrefix(input, "/video "))
+			if err := sendVideo(stream, path); err != nil {
+				fmt.Printf("[ERROR] Failed to send video: %v\n", err)
+			} else {
+				fmt.Printf("[SENT] Video: %s\n", path)
+			}
+			continue
+		}
+
+		// Unknown command
+		fmt.Println("[INFO] Commands: /t <text>, /image <path>, /video <path>, q")
+	}
+}
+
+// sendImage reads an image file and sends it to the session.
+func sendImage(stream *vango.RunStream, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	// Warn for large files
+	if len(data) > 10*1024*1024 {
+		fmt.Printf("[WARN] Large file (%d MB) - this may take a moment\n", len(data)/1024/1024)
+	}
+
+	mediaType := inferImageMediaType(path)
+	content := vango.ContentBlocks(vango.Image(data, mediaType))
+
+	return stream.SendContent(content)
+}
+
+// sendVideo reads a video file and sends it to the session.
+func sendVideo(stream *vango.RunStream, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	// Warn for large files
+	if len(data) > 10*1024*1024 {
+		fmt.Printf("[WARN] Large file (%d MB) - this may take a moment\n", len(data)/1024/1024)
+	}
+
+	mediaType := inferVideoMediaType(path)
+	content := vango.ContentBlocks(vango.Video(data, mediaType))
+
+	return stream.SendContent(content)
+}
+
+// inferImageMediaType infers MIME type from file extension.
+func inferImageMediaType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "image/png"
+	}
+}
+
+// inferVideoMediaType infers MIME type from file extension.
+func inferVideoMediaType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	default:
+		return "video/mp4"
 	}
 }

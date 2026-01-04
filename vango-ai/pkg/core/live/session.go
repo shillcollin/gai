@@ -322,6 +322,153 @@ func (s *Session) Interrupt(transcript string) error {
 	return nil
 }
 
+// SendText sends a discrete text message as a complete user turn.
+// This bypasses VAD and grace period - the text is processed as a complete turn.
+// If the session is speaking or processing, it waits for the response to complete.
+func (s *Session) SendText(text string) error {
+	if s.closed.Load() {
+		return fmt.Errorf("session closed")
+	}
+
+	content := []types.ContentBlock{
+		types.TextBlock{Type: "text", Text: text},
+	}
+	return s.processDiscreteInput(content)
+}
+
+// SendContent sends discrete content blocks (text, image, video) as a complete user turn.
+// This bypasses VAD and grace period - the content is processed as a complete turn.
+// If the session is speaking or processing, it waits for the response to complete.
+func (s *Session) SendContent(content []types.ContentBlock) error {
+	if s.closed.Load() {
+		return fmt.Errorf("session closed")
+	}
+	if len(content) == 0 {
+		return fmt.Errorf("content cannot be empty")
+	}
+	return s.processDiscreteInput(content)
+}
+
+// processDiscreteInput handles a discrete input (text/image/video).
+// It waits for any in-flight response to complete, then processes the input.
+func (s *Session) processDiscreteInput(content []types.ContentBlock) error {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+
+	s.debug("INPUT", fmt.Sprintf("Discrete input received: %d blocks (state: %s)", len(content), state))
+
+	// Emit event
+	s.emit(&DiscreteInputReceivedEvent{Content: content})
+
+	switch state {
+	case StateListening:
+		// Process immediately
+		s.processDiscreteInputNow(content)
+
+	case StateGracePeriod:
+		// Cancel grace period (not an interrupt) and process
+		s.gracePeriod.Cancel()
+		s.cancelAgent()
+		s.cancelTTS()
+		s.emit(&AudioFlushEvent{})
+		s.processDiscreteInputNow(content)
+
+	case StateProcessing, StateSpeaking:
+		// Wait for current response to complete, then process
+		go func() {
+			s.waitForResponseComplete()
+			s.processDiscreteInputNow(content)
+		}()
+
+	case StateInterruptCapturing:
+		// Wait for interrupt resolution, then process
+		go func() {
+			s.waitForResponseComplete()
+			s.processDiscreteInputNow(content)
+		}()
+
+	default:
+		return fmt.Errorf("cannot send input in state: %s", state)
+	}
+
+	return nil
+}
+
+// processDiscreteInputNow immediately processes a discrete input as a user turn.
+func (s *Session) processDiscreteInputNow(content []types.ContentBlock) {
+	s.debug("INPUT", "Processing discrete input")
+
+	// Reset VAD to discard any in-progress audio transcript
+	s.vad.Reset()
+
+	// Add to conversation and trigger agent
+	s.mu.Lock()
+	s.messages = append(s.messages, types.Message{
+		Role:    "user",
+		Content: content,
+	})
+	messages := make([]types.Message, len(s.messages))
+	copy(messages, s.messages)
+	s.mu.Unlock()
+
+	// Create agent context
+	agentCtx, agentCancel := context.WithCancel(s.ctx)
+	s.agentCancel = agentCancel
+
+	s.setState(StateProcessing)
+	s.emit(&InputCommittedEvent{
+		Transcript: contentToString(content),
+	})
+
+	go s.runAgent(agentCtx, messages)
+}
+
+// waitForResponseComplete blocks until current response finishes.
+func (s *Session) waitForResponseComplete() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.mu.RLock()
+			state := s.state
+			s.mu.RUnlock()
+
+			if state == StateListening {
+				return
+			}
+		}
+	}
+}
+
+// contentToString extracts text representation from content blocks for logging/events.
+func contentToString(content []types.ContentBlock) string {
+	var parts []string
+	for _, block := range content {
+		switch b := block.(type) {
+		case types.TextBlock:
+			parts = append(parts, b.Text)
+		case types.ImageBlock:
+			parts = append(parts, "[image]")
+		case types.VideoBlock:
+			parts = append(parts, "[video]")
+		case types.AudioBlock:
+			parts = append(parts, "[audio]")
+		case types.DocumentBlock:
+			parts = append(parts, "[document]")
+		default:
+			parts = append(parts, "[content]")
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 // Close shuts down the session.
 func (s *Session) Close() error {
 	if s.closed.Swap(true) {
@@ -882,6 +1029,13 @@ func (s *Session) createTTSContext(ctx context.Context) (*tts.StreamingContext, 
 	s.ttsMu.Lock()
 	defer s.ttsMu.Unlock()
 
+	// Close any existing TTS context first to prevent concurrent audio streams
+	if s.ttsContext != nil {
+		s.debug("TTS", "Closing previous TTS context before creating new one")
+		s.ttsContext.Close()
+		s.ttsContext = nil
+	}
+
 	ttsCtx, err := s.ttsClient.NewStreamingContext(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -983,7 +1137,18 @@ func (s *Session) streamTTSAudio(ctx context.Context, ttsCtx *tts.StreamingConte
 			return
 		case audioData, ok := <-ttsCtx.Audio():
 			if !ok {
-				// TTS complete - check for errors
+				// TTS complete - check if this is still the active TTS context
+				// If not, another stream has started and we should exit silently
+				s.ttsMu.Lock()
+				isCurrentContext := s.ttsContext == ttsCtx
+				s.ttsMu.Unlock()
+
+				if !isCurrentContext {
+					s.debug("TTS", "TTS context replaced, exiting old stream")
+					return
+				}
+
+				// Check for errors
 				if err := ttsCtx.Err(); err != nil {
 					s.debug("TTS", "TTS error: "+err.Error())
 					s.emit(&ErrorEvent{Code: "tts_stream_error", Message: err.Error()})

@@ -197,6 +197,9 @@ func (c *Client) Engine() *core.Engine {
 // This enables real-time bidirectional voice conversations with automatic
 // turn detection, interruption handling, and text-to-speech.
 //
+// Deprecated: Use client.Messages.RunStream(ctx, req, WithLive(&LiveConfig{})) instead.
+// This method will be removed in a future version.
+//
 // Direct Mode only. Requires CARTESIA_API_KEY for STT/TTS.
 func (c *Client) Live(ctx context.Context, config LiveConfig) (*LiveSession, error) {
 	if c.mode != modeDirect {

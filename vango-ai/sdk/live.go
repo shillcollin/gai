@@ -14,10 +14,11 @@ import (
 // LiveSession represents an active real-time voice conversation session.
 // It wraps the core live.Session and provides a clean SDK interface.
 type LiveSession struct {
-	session *live.Session
-	events  chan LiveEvent
-	done    chan struct{}
-	closed  bool
+	session     *live.Session
+	events      chan LiveEvent
+	done        chan struct{}
+	closed      bool
+	audioOutput *AudioOutput
 }
 
 // LiveConfig contains configuration for a live session.
@@ -58,6 +59,10 @@ type LiveConfig struct {
 
 	// Temperature controls LLM response randomness.
 	Temperature *float64
+
+	// AudioOutput configures audio output buffering.
+	// If nil, uses DefaultAudioOutputConfig().
+	AudioOutput *AudioOutputConfig
 
 	// Debug enables debug event emission.
 	Debug bool
@@ -140,7 +145,8 @@ type LiveSessionCreatedEvent struct {
 	Channels   int
 }
 
-func (*LiveSessionCreatedEvent) liveEvent() {}
+func (*LiveSessionCreatedEvent) liveEvent()                  {}
+func (e LiveSessionCreatedEvent) runStreamEventType() string { return "live_session_created" }
 
 // LiveStateChangedEvent is emitted when session state changes.
 type LiveStateChangedEvent struct {
@@ -148,7 +154,8 @@ type LiveStateChangedEvent struct {
 	To   string
 }
 
-func (*LiveStateChangedEvent) liveEvent() {}
+func (*LiveStateChangedEvent) liveEvent()                  {}
+func (e LiveStateChangedEvent) runStreamEventType() string { return "live_state_changed" }
 
 // LiveTranscriptDeltaEvent is emitted for real-time transcription.
 type LiveTranscriptDeltaEvent struct {
@@ -156,7 +163,8 @@ type LiveTranscriptDeltaEvent struct {
 	IsFinal bool
 }
 
-func (*LiveTranscriptDeltaEvent) liveEvent() {}
+func (*LiveTranscriptDeltaEvent) liveEvent()                  {}
+func (e LiveTranscriptDeltaEvent) runStreamEventType() string { return "live_transcript_delta" }
 
 // LiveVADCommittedEvent is emitted when VAD commits a turn.
 type LiveVADCommittedEvent struct {
@@ -164,31 +172,45 @@ type LiveVADCommittedEvent struct {
 	Forced     bool
 }
 
-func (*LiveVADCommittedEvent) liveEvent() {}
+func (*LiveVADCommittedEvent) liveEvent()                  {}
+func (e LiveVADCommittedEvent) runStreamEventType() string { return "live_vad_committed" }
 
 // LiveInputCommittedEvent is emitted when input is sent to LLM.
 type LiveInputCommittedEvent struct {
 	Transcript string
 }
 
-func (*LiveInputCommittedEvent) liveEvent() {}
+func (*LiveInputCommittedEvent) liveEvent()                  {}
+func (e LiveInputCommittedEvent) runStreamEventType() string { return "live_input_committed" }
+
+// LiveDiscreteInputEvent is emitted when a discrete text/content input is received.
+// Discrete inputs bypass VAD and grace period - they are submitted as complete user turns.
+type LiveDiscreteInputEvent struct {
+	Content []types.ContentBlock
+}
+
+func (*LiveDiscreteInputEvent) liveEvent()                  {}
+func (e LiveDiscreteInputEvent) runStreamEventType() string { return "live_discrete_input" }
 
 // LiveResponseStartEvent is emitted when LLM starts responding.
 type LiveResponseStartEvent struct{}
 
-func (*LiveResponseStartEvent) liveEvent() {}
+func (*LiveResponseStartEvent) liveEvent()                  {}
+func (e LiveResponseStartEvent) runStreamEventType() string { return "live_response_start" }
 
 // LiveResponseDeltaEvent is emitted for streaming LLM text.
 type LiveResponseDeltaEvent struct {
 	Delta string
 }
 
-func (*LiveResponseDeltaEvent) liveEvent() {}
+func (*LiveResponseDeltaEvent) liveEvent()                  {}
+func (e LiveResponseDeltaEvent) runStreamEventType() string { return "live_response_delta" }
 
 // LiveResponseDoneEvent is emitted when LLM response is complete.
 type LiveResponseDoneEvent struct{}
 
-func (*LiveResponseDoneEvent) liveEvent() {}
+func (*LiveResponseDoneEvent) liveEvent()                  {}
+func (e LiveResponseDoneEvent) runStreamEventType() string { return "live_response_done" }
 
 // LiveAudioDeltaEvent is emitted for TTS audio chunks.
 type LiveAudioDeltaEvent struct {
@@ -196,21 +218,24 @@ type LiveAudioDeltaEvent struct {
 	Format string
 }
 
-func (*LiveAudioDeltaEvent) liveEvent() {}
+func (*LiveAudioDeltaEvent) liveEvent()                  {}
+func (e LiveAudioDeltaEvent) runStreamEventType() string { return "live_audio_delta" }
 
 // LiveAudioDoneEvent is emitted when TTS is complete.
 type LiveAudioDoneEvent struct {
 	DurationMs int
 }
 
-func (*LiveAudioDoneEvent) liveEvent() {}
+func (*LiveAudioDoneEvent) liveEvent()                  {}
+func (e LiveAudioDoneEvent) runStreamEventType() string { return "live_audio_done" }
 
 // LiveAudioFlushEvent signals that all pending/buffered audio should be discarded.
 // This is emitted when the user speaks during grace period (extending their turn)
 // or when a real interrupt is confirmed. Clients should clear their audio buffers.
 type LiveAudioFlushEvent struct{}
 
-func (*LiveAudioFlushEvent) liveEvent() {}
+func (*LiveAudioFlushEvent) liveEvent()                  {}
+func (e LiveAudioFlushEvent) runStreamEventType() string { return "live_audio_flush" }
 
 // LiveGracePeriodStartedEvent is emitted when grace period starts.
 type LiveGracePeriodStartedEvent struct {
@@ -219,7 +244,8 @@ type LiveGracePeriodStartedEvent struct {
 	ExpiresAt  time.Time
 }
 
-func (*LiveGracePeriodStartedEvent) liveEvent() {}
+func (*LiveGracePeriodStartedEvent) liveEvent()                  {}
+func (e LiveGracePeriodStartedEvent) runStreamEventType() string { return "live_grace_period_started" }
 
 // LiveGracePeriodExtendedEvent is emitted when user speaks during grace.
 type LiveGracePeriodExtendedEvent struct {
@@ -227,26 +253,30 @@ type LiveGracePeriodExtendedEvent struct {
 	NewTranscript      string
 }
 
-func (*LiveGracePeriodExtendedEvent) liveEvent() {}
+func (*LiveGracePeriodExtendedEvent) liveEvent()                  {}
+func (e LiveGracePeriodExtendedEvent) runStreamEventType() string { return "live_grace_period_extended" }
 
 // LiveGracePeriodExpiredEvent is emitted when grace period expires.
 type LiveGracePeriodExpiredEvent struct {
 	Transcript string
 }
 
-func (*LiveGracePeriodExpiredEvent) liveEvent() {}
+func (*LiveGracePeriodExpiredEvent) liveEvent()                  {}
+func (e LiveGracePeriodExpiredEvent) runStreamEventType() string { return "live_grace_period_expired" }
 
 // LiveInterruptDetectingEvent is emitted when detecting potential interrupt.
 type LiveInterruptDetectingEvent struct{}
 
-func (*LiveInterruptDetectingEvent) liveEvent() {}
+func (*LiveInterruptDetectingEvent) liveEvent()                  {}
+func (e LiveInterruptDetectingEvent) runStreamEventType() string { return "live_interrupt_detecting" }
 
 // LiveInterruptCapturedEvent is emitted when interrupt audio captured.
 type LiveInterruptCapturedEvent struct {
 	Transcript string
 }
 
-func (*LiveInterruptCapturedEvent) liveEvent() {}
+func (*LiveInterruptCapturedEvent) liveEvent()                  {}
+func (e LiveInterruptCapturedEvent) runStreamEventType() string { return "live_interrupt_captured" }
 
 // LiveInterruptDismissedEvent is emitted when interrupt is dismissed.
 type LiveInterruptDismissedEvent struct {
@@ -254,7 +284,8 @@ type LiveInterruptDismissedEvent struct {
 	Reason     string
 }
 
-func (*LiveInterruptDismissedEvent) liveEvent() {}
+func (*LiveInterruptDismissedEvent) liveEvent()                  {}
+func (e LiveInterruptDismissedEvent) runStreamEventType() string { return "live_interrupt_dismissed" }
 
 // LiveResponseInterruptedEvent is emitted when response is interrupted.
 type LiveResponseInterruptedEvent struct {
@@ -263,7 +294,8 @@ type LiveResponseInterruptedEvent struct {
 	AudioPositionMs     int
 }
 
-func (*LiveResponseInterruptedEvent) liveEvent() {}
+func (*LiveResponseInterruptedEvent) liveEvent()                  {}
+func (e LiveResponseInterruptedEvent) runStreamEventType() string { return "live_response_interrupted" }
 
 // LiveErrorEvent is emitted on errors.
 type LiveErrorEvent struct {
@@ -271,14 +303,16 @@ type LiveErrorEvent struct {
 	Message string
 }
 
-func (*LiveErrorEvent) liveEvent() {}
+func (*LiveErrorEvent) liveEvent()                  {}
+func (e LiveErrorEvent) runStreamEventType() string { return "live_error" }
 
 // LiveClosedEvent is emitted when session closes.
 type LiveClosedEvent struct {
 	Reason string
 }
 
-func (*LiveClosedEvent) liveEvent() {}
+func (*LiveClosedEvent) liveEvent()                  {}
+func (e LiveClosedEvent) runStreamEventType() string { return "live_closed" }
 
 // LiveDebugEvent is emitted for debug information.
 type LiveDebugEvent struct {
@@ -286,7 +320,8 @@ type LiveDebugEvent struct {
 	Message  string
 }
 
-func (*LiveDebugEvent) liveEvent() {}
+func (*LiveDebugEvent) liveEvent()                  {}
+func (e LiveDebugEvent) runStreamEventType() string { return "live_debug" }
 
 // newLiveSession creates a new live session from the SDK config.
 func newLiveSession(
@@ -379,10 +414,17 @@ func newLiveSession(
 		session.EnableDebug()
 	}
 
+	// Create audio output with buffering
+	audioOutputConfig := DefaultAudioOutputConfig()
+	if config.AudioOutput != nil {
+		audioOutputConfig = *config.AudioOutput
+	}
+
 	ls := &LiveSession{
-		session: session,
-		events:  make(chan LiveEvent, 100),
-		done:    make(chan struct{}),
+		session:     session,
+		events:      make(chan LiveEvent, 100),
+		done:        make(chan struct{}),
+		audioOutput: NewAudioOutput(coreConfig.SampleRate, audioOutputConfig),
 	}
 
 	return ls
@@ -417,9 +459,52 @@ func (ls *LiveSession) Interrupt(transcript string) error {
 	return ls.session.Interrupt(transcript)
 }
 
+// SendText sends a discrete text message as a complete user turn.
+// This bypasses VAD and grace period - the text is processed as a complete turn.
+// If the session is speaking or processing, it waits for the response to complete.
+func (ls *LiveSession) SendText(text string) error {
+	return ls.session.SendText(text)
+}
+
+// SendContent sends discrete content blocks (text, image, video) as a complete user turn.
+// This bypasses VAD and grace period - the content is processed as a complete turn.
+// If the session is speaking or processing, it waits for the response to complete.
+func (ls *LiveSession) SendContent(content []types.ContentBlock) error {
+	return ls.session.SendContent(content)
+}
+
 // Events returns a channel for receiving session events.
+// Note: If you're using AudioOutput(), you don't need to handle
+// LiveAudioDeltaEvent and LiveAudioFlushEvent from this channel.
 func (ls *LiveSession) Events() <-chan LiveEvent {
 	return ls.events
+}
+
+// AudioOutput returns the audio output manager.
+// This provides a simpler interface for playing audio with built-in buffering
+// and flush handling. Use this instead of manually handling LiveAudioDeltaEvent
+// and LiveAudioFlushEvent from Events().
+//
+// Example:
+//
+//	audio := session.AudioOutput()
+//	for {
+//	    select {
+//	    case chunk := <-audio.Chunks():
+//	        player.Write(chunk)
+//	    case <-audio.Flush():
+//	        player.Clear()
+//	    }
+//	}
+//
+// Or use the convenience method:
+//
+//	session.AudioOutput().HandleAudio(
+//	    func(data []byte) { player.Write(data) },
+//	    func() { player.Clear() },
+//	)
+func (ls *LiveSession) AudioOutput() *AudioOutput {
+	return ls.audioOutput
 }
 
 // SessionID returns the session identifier.
@@ -441,6 +526,9 @@ func (ls *LiveSession) Close() error {
 
 	err := ls.session.Close()
 	close(ls.done)
+	if ls.audioOutput != nil {
+		ls.audioOutput.Close()
+	}
 	return err
 }
 
@@ -499,6 +587,10 @@ func (ls *LiveSession) convertEvent(event live.Event) LiveEvent {
 		return &LiveInputCommittedEvent{
 			Transcript: e.Transcript,
 		}
+	case *live.DiscreteInputReceivedEvent:
+		return &LiveDiscreteInputEvent{
+			Content: e.Content,
+		}
 	case *live.MessageStartEvent:
 		return &LiveResponseStartEvent{}
 	case *live.ContentBlockDeltaEvent:
@@ -508,6 +600,10 @@ func (ls *LiveSession) convertEvent(event live.Event) LiveEvent {
 	case *live.MessageStopEvent:
 		return &LiveResponseDoneEvent{}
 	case *live.AudioDeltaEvent:
+		// Push to AudioOutput for buffered playback
+		if ls.audioOutput != nil {
+			ls.audioOutput.pushAudio(e.Data)
+		}
 		return &LiveAudioDeltaEvent{
 			Data:   e.Data,
 			Format: e.Format,
@@ -517,6 +613,10 @@ func (ls *LiveSession) convertEvent(event live.Event) LiveEvent {
 			DurationMs: e.DurationMs,
 		}
 	case *live.AudioFlushEvent:
+		// Flush AudioOutput buffer
+		if ls.audioOutput != nil {
+			ls.audioOutput.doFlush()
+		}
 		return &LiveAudioFlushEvent{}
 	case *live.GracePeriodStartedEvent:
 		return &LiveGracePeriodStartedEvent{
